@@ -40,7 +40,7 @@ type Strategy struct {
 	// MarketDataStore is a pointer only injection field. public trades, k-lines (candlestick)
 	// and order book updates are maintained in the market data store.
 	// This field will be injected automatically since we defined the Symbol field.
-	*bbgo.MarketDataStore
+	MarketDataStore *bbgo.MarketDataStore
 
 	// StandardIndicatorSet contains the standard indicators of a market (symbol)
 	// This field will be injected automatically since we defined the Symbol field.
@@ -66,13 +66,14 @@ type Strategy struct {
 	// e.g., 0.001, so that your orders will be submitted at price like 0.127, 0.128, 0.129, 0.130
 	GridPips fixedpoint.Value `json:"gridPips"`
 
-	ProfitSpread fixedpoint.Value `json:"profitSpread"`
+	MinProfitSpread fixedpoint.Value `json:"minProfitSpread"`
 
 	// GridNum is the grid number, how many orders you want to post on the orderbook.
 	GridNum int `json:"gridNumber"`
 
-	// Quantity is the quantity you want to submit for each order.
-	Quantity float64 `json:"quantity"`
+	ROCProfitSpreadMultiplier float64 `json:"rocProfitMultiplier"`
+
+	NumOfKLinesROC int `json:"numOfKLinesROC"`
 
 	// activeOrders is the locally maintained active order book of the maker orders.
 	activeOrders *bbgo.LocalActiveOrderBook
@@ -85,6 +86,14 @@ type Strategy struct {
 	boll *indicator.BOLL
 
 	CancelProfitOrdersOnShutdown bool `json: "shutdownCancelProfitOrders"`
+
+	roc float64
+
+	cancelDone chan struct{}
+
+	MinBalanceForOrder float64 `json:"minBalanceForOrder"`
+
+	QuantityUnit float64 `json:"quantityUnit"`
 }
 
 func (s *Strategy) ID() string {
@@ -92,13 +101,9 @@ func (s *Strategy) ID() string {
 }
 
 func (s *Strategy) Validate() error {
-	if s.ProfitSpread <= 0 {
+	if s.MinProfitSpread <= 0 {
 		// If profitSpread is empty or its value is negative
 		return fmt.Errorf("profit spread should bigger than 0")
-	}
-	if s.Quantity <= 0 {
-		// If quantity is empty or its value is negative
-		return fmt.Errorf("quantity should bigger than 0")
 	}
 	return nil
 }
@@ -116,12 +121,34 @@ func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 	}
 }
 
+func (s *Strategy) GetROC() float64 {
+	kLines, e := s.MarketDataStore.KLinesOfInterval(s.Interval)
+	if !e {
+		log.Errorf("cannot find interval")
+		return 0
+	}
+	if len(kLines) == 0 {
+		return 0
+	}
+
+	var kLine types.KLineWindow
+	if len(kLines) < s.NumOfKLinesROC {
+		kLine = kLines
+	} else {
+		kLine = kLines[len(kLines)-s.NumOfKLinesROC:]
+	}
+	s.roc = s.roc*float64(0.5) + kLine.GetMaxChange()/kLine.GetLow()*float64(0.5)
+	return s.roc
+}
+
 func (s *Strategy) generateGridBuyOrders(session *bbgo.ExchangeSession) ([]types.SubmitOrder, error) {
 	balances := session.Account.Balances()
-	quoteBalance := balances[s.Market.QuoteCurrency].Available
+	quote := balances[s.Market.QuoteCurrency]
+	quoteBalance := quote.Available
 	if quoteBalance <= 0 {
 		return nil, fmt.Errorf("quote balance %s is zero: %f", s.Market.QuoteCurrency, quoteBalance.Float64())
 	}
+	gridNum := math.Floor(float64(s.GridNum) * quote.Available.Float64() / (quote.Available.Float64() + quote.Locked.Float64()))
 
 	upBand, downBand := s.boll.LastUpBand(), s.boll.LastDownBand()
 	if upBand <= 0.0 {
@@ -152,28 +179,41 @@ func (s *Strategy) generateGridBuyOrders(session *bbgo.ExchangeSession) ([]types
 	gridSize := priceRange / float64(s.GridNum)
 
 	var orders []types.SubmitOrder
+	gridQuantity := quoteBalance.Float64() / gridNum
+	if gridQuantity < s.MinBalanceForOrder {
+		gridQuantity = s.MinBalanceForOrder
+	}
+
+	quantityUnit := s.QuantityUnit
 	for price := upBand; price >= downBand; price -= gridSize {
 		if price >= currentPrice {
 			continue
 		}
-		// adjust buy quantity using current quote balance
-		quantity := bbgo.AdjustFloatQuantityByMaxAmount(s.Quantity, price, quoteBalance.Float64())
+		newQuantity := math.Floor(gridQuantity*quantityUnit/price) / quantityUnit
 		order := types.SubmitOrder{
 			Symbol:      s.Symbol,
 			Side:        types.SideTypeBuy,
 			Type:        types.OrderTypeLimit,
 			Market:      s.Market,
-			Quantity:    quantity,
+			Quantity:    newQuantity,
 			Price:       price,
 			TimeInForce: "GTC",
 		}
-		quoteQuantity := fixedpoint.NewFromFloat(order.Quantity).MulFloat64(price)
-		if quantity < s.MinQuantity {
-			// don't submit this order if buy quantity is too small
-			log.Infof("quote balance %f is not enough, stop generating buy orders", quoteBalance.Float64())
+		quoteQuantity := fixedpoint.NewFromFloat(newQuantity).MulFloat64(price)
+		if quoteBalance < quoteQuantity {
+			if quoteBalance.Float64() < s.MinBalanceForOrder {
+				log.Infof("quote balance %f is not enough, stop generating buy orders", quoteBalance.Float64())
+				break
+			}
+			newQuantity = math.Floor(quoteBalance.Float64()*quantityUnit/price) / quantityUnit
+			order.Quantity = newQuantity
+			log.Infof("submitting order: %s", order.String())
+			orders = append(orders, order)
+			quoteBalance = quoteBalance.Sub(fixedpoint.NewFromFloat(newQuantity).MulFloat64(price))
 			break
+		} else {
+			quoteBalance = quoteBalance.Sub(quoteQuantity)
 		}
-		quoteBalance = quoteBalance.Sub(quoteQuantity)
 		log.Infof("submitting order: %s", order.String())
 		orders = append(orders, order)
 	}
@@ -182,10 +222,12 @@ func (s *Strategy) generateGridBuyOrders(session *bbgo.ExchangeSession) ([]types
 
 func (s *Strategy) generateGridSellOrders(session *bbgo.ExchangeSession) ([]types.SubmitOrder, error) {
 	balances := session.Account.Balances()
-	baseBalance := balances[s.Market.BaseCurrency].Available
+	base := balances[s.Market.BaseCurrency]
+	baseBalance := base.Available
 	if baseBalance <= 0 {
 		return nil, fmt.Errorf("base balance %s is zero: %+v", s.Market.BaseCurrency, baseBalance.Float64())
 	}
+	gridNum := math.Floor(float64(s.GridNum) * base.Available.Float64() / (base.Available.Float64() + base.Locked.Float64()))
 
 	upBand, downBand := s.boll.LastUpBand(), s.boll.LastDownBand()
 	if upBand <= 0.0 {
@@ -216,28 +258,35 @@ func (s *Strategy) generateGridSellOrders(session *bbgo.ExchangeSession) ([]type
 	gridSize := priceRange / float64(s.GridNum)
 
 	var orders []types.SubmitOrder
+	if baseBalance.Float64() < s.MinBalanceForOrder {
+		log.Errorf("base balance %f is not enough for sending order", baseBalance.Float64())
+		return orders, nil
+	}
+	gridQuantity := (baseBalance.Float64() / gridNum / s.QuantityUnit) * s.QuantityUnit
+	if gridQuantity < s.MinBalanceForOrder {
+		gridQuantity = s.MinBalanceForOrder
+	}
+
 	for price := downBand; price <= upBand; price += gridSize {
 		if price <= currentPrice {
 			continue
 		}
-		// adjust sell quantity using current base balance
-		quantity := math.Min(s.Quantity, baseBalance.Float64())
 		order := types.SubmitOrder{
 			Symbol:      s.Symbol,
 			Side:        types.SideTypeSell,
 			Type:        types.OrderTypeLimit,
 			Market:      s.Market,
-			Quantity:    quantity,
+			Quantity:    gridQuantity,
 			Price:       price,
 			TimeInForce: "GTC",
 		}
-		baseQuantity := fixedpoint.NewFromFloat(order.Quantity)
-		if quantity < s.MinQuantity {
-			// don't submit this order if sell quantity is too small
+		baseQuantity := fixedpoint.NewFromFloat(gridQuantity)
+		if baseBalance < baseQuantity {
 			log.Infof("base balance %f is not enough, stop generating sell orders", baseBalance.Float64())
 			break
+		} else {
+			baseBalance = baseBalance.Sub(baseQuantity)
 		}
-		baseBalance = baseBalance.Sub(baseQuantity)
 		log.Infof("submitting order: %s", order.String())
 		orders = append(orders, order)
 	}
@@ -249,33 +298,55 @@ func (s *Strategy) placeGridOrders(orderExecutor bbgo.OrderExecutor, session *bb
 	if err != nil {
 		log.Warn(err.Error())
 	}
-	createdSellOrders, err := orderExecutor.SubmitOrders(context.Background(), sellOrders...)
-	if err != nil {
-		log.WithError(err).Errorf("can not place sell orders")
-	}
 
 	buyOrders, err := s.generateGridBuyOrders(session)
 	if err != nil {
 		log.Warn(err.Error())
 	}
-	createdBuyOrders, err := orderExecutor.SubmitOrders(context.Background(), buyOrders...)
-	if err != nil {
-		log.WithError(err).Errorf("can not place buy orders")
-	}
 
-	createdOrders := append(createdSellOrders, createdBuyOrders...)
-	s.activeOrders.Add(createdOrders...)
-	s.orders.Add(createdOrders...)
+	allOrders := append(buyOrders, sellOrders...)
+
+	if len(allOrders) > 0 {
+		log.Infof("all orders %v", allOrders)
+		createdOrders, err := orderExecutor.SubmitOrders(context.Background(), allOrders...)
+		if err != nil {
+			log.WithError(err).Errorf("can not place orders")
+		}
+
+		s.activeOrders.Add(createdOrders...)
+		s.orders.Add(createdOrders...)
+	}
 }
 
 func (s *Strategy) updateOrders(orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) {
-	if err := session.Exchange.CancelOrders(context.Background(), s.activeOrders.Orders()...); err != nil {
-		log.WithError(err).Errorf("cancel order error")
+	activeOrders := s.activeOrders.Orders()
+	if len(activeOrders) > 0 {
+		log.Infof("before update: start cancelling orders %v", activeOrders)
+		go func() {
+			if err := session.Exchange.CancelOrders(context.Background(), activeOrders...); err != nil {
+				log.WithError(err).Errorf("cancel order error")
+			}
+		}()
+		for _ = range activeOrders {
+			<-s.cancelDone
+		}
+		log.Infof("before update: canceled all orders")
 	}
 
 	// skip order updates if up-band - down-band < min profit spread
-	if (s.boll.LastUpBand() - s.boll.LastDownBand()) <= s.ProfitSpread.Float64() {
-		log.Infof("boll: down band price == up band price, skipping...")
+	upBand := s.boll.LastUpBand()
+	downBand := s.boll.LastDownBand()
+	currentPrice, ok := session.LastPrice(s.Symbol)
+	if !ok {
+		log.Errorf("last price not found")
+		return
+	}
+	spread := (upBand - downBand) / currentPrice
+	roc := s.GetROC()
+	dynamicSpread := math.Max(s.MinProfitSpread.Float64(), roc*s.ROCProfitSpreadMultiplier)
+	log.Infof("dynamicSpread %f", dynamicSpread)
+	if spread <= dynamicSpread {
+		log.Infof("boll: band spread %f too small, skipping %f...", spread, dynamicSpread)
 		return
 	}
 
@@ -286,19 +357,25 @@ func (s *Strategy) updateOrders(orderExecutor bbgo.OrderExecutor, session *bbgo.
 
 func (s *Strategy) submitReverseOrder(order types.Order, session *bbgo.ExchangeSession) {
 	balances := session.Account.Balances()
-
 	var side = order.Side.Reverse()
 	var price = order.Price
 	var quantity = order.Quantity
 
+	currentPrice, ok := session.LastPrice(s.Symbol)
+	if !ok {
+		log.Errorf("last price not found")
+		return
+	}
+	roc := s.GetROC()
+	dynamicSpread := math.Max(s.MinProfitSpread.Float64(), roc*s.ROCProfitSpreadMultiplier)
 	switch side {
 	case types.SideTypeSell:
-		price += s.ProfitSpread.Float64()
+		price += dynamicSpread * currentPrice
 		maxQuantity := balances[s.Market.BaseCurrency].Available.Float64()
 		quantity = math.Min(quantity, maxQuantity)
 
 	case types.SideTypeBuy:
-		price -= s.ProfitSpread.Float64()
+		price -= dynamicSpread * currentPrice
 		maxQuantity := balances[s.Market.QuoteCurrency].Available.Float64() / price
 		quantity = math.Min(quantity, maxQuantity)
 	}
@@ -350,23 +427,38 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	})
 	s.profitOrders.BindStream(session.UserDataStream)
 
+	c := make(chan struct{}, 1000)
 	// setup graceful shutting down handler
 	s.Graceful.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
 		// call Done to notify the main process.
 		defer wg.Done()
-		log.Infof("canceling active orders...")
 
-		if err := session.Exchange.CancelOrders(ctx, s.activeOrders.Orders()...); err != nil {
-			log.WithError(err).Errorf("cancel order error")
+		activeOrders := s.activeOrders.Orders()
+
+		log.Infof("on_shutdown: canceling active orders... %v", activeOrders)
+		go func() {
+			if err := session.Exchange.CancelOrders(ctx, activeOrders...); err != nil {
+				log.WithError(err).Errorf("cancel order error")
+			}
+		}()
+		for _ = range activeOrders {
+			<-c
 		}
+		log.Infof("on_shutdown: cancel active orders done")
+
+		profitOrders := s.profitOrders.Orders()
 
 		if s.CancelProfitOrdersOnShutdown {
-			log.Infof("canceling profit orders...")
-			err := session.Exchange.CancelOrders(ctx, s.profitOrders.Orders()...)
-
-			if err != nil {
-				log.WithError(err).Errorf("cancel profit order error")
+			log.Infof("canceling profit orders...%v", profitOrders)
+			go func() {
+				if err := session.Exchange.CancelOrders(ctx, profitOrders...); err != nil {
+					log.WithError(err).Errorf("cancel order error")
+				}
+			}()
+			for _ = range profitOrders {
+				<-c
 			}
+			log.Infof("on_shutdown: cancel profit orders done")
 		}
 	})
 
@@ -374,6 +466,23 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		log.Infof("connected, submitting the first round of the orders")
 		s.updateOrders(orderExecutor, session)
 	})
+
+	dict := make(map[uint64]struct{})
+	session.Stream.OnOrderUpdate(func(o types.Order) {
+		log.Infof("order update OrderID: %v %v", o.OrderID, o)
+		switch o.Status {
+		case types.OrderStatusNew:
+			dict[o.OrderID] = struct{}{}
+		case types.OrderStatusCanceled:
+			if _, ok := dict[o.OrderID]; ok {
+				delete(dict, o.OrderID)
+				c <- struct{}{}
+			}
+		case types.OrderStatusFilled:
+			delete(dict, o.OrderID)
+		}
+	})
+	s.cancelDone = c
 
 	// avoid using time ticker since we will need back testing here
 	session.MarketDataStream.OnKLineClosed(func(kline types.KLine) {

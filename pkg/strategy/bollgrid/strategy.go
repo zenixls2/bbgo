@@ -94,6 +94,8 @@ type Strategy struct {
 	MinBalanceForOrder float64 `json:"minBalanceForOrder"`
 
 	QuantityUnit float64 `json:"quantityUnit"`
+
+	CancelBadOrders bool `json:"cancelBadOrders"`
 }
 
 func (s *Strategy) ID() string {
@@ -148,7 +150,15 @@ func (s *Strategy) generateGridBuyOrders(session *bbgo.ExchangeSession) ([]types
 	if quoteBalance <= 0 {
 		return nil, fmt.Errorf("quote balance %s is zero: %f", s.Market.QuoteCurrency, quoteBalance.Float64())
 	}
-	gridNum := math.Floor(float64(s.GridNum) * quote.Available.Float64() / (quote.Available.Float64() + quote.Locked.Float64()))
+	availableAsset := quote.Available.Float64()
+	totalAsset := availableAsset + quote.Locked.Float64()
+	if availableAsset < s.MinBalanceForOrder {
+		return nil, fmt.Errorf("Asset not enough for posting orders")
+	}
+	gridNum := math.Floor(float64(s.GridNum) * availableAsset / totalAsset)
+	if gridNum < 1 {
+		return nil, fmt.Errorf("gridNum == 0, skip")
+	}
 
 	upBand, downBand := s.boll.LastUpBand(), s.boll.LastDownBand()
 	if upBand <= 0.0 {
@@ -207,9 +217,9 @@ func (s *Strategy) generateGridBuyOrders(session *bbgo.ExchangeSession) ([]types
 			}
 			newQuantity = math.Floor(quoteBalance.Float64()*quantityUnit/price) / quantityUnit
 			order.Quantity = newQuantity
-			log.Infof("submitting order: %s", order.String())
 			orders = append(orders, order)
 			quoteBalance = quoteBalance.Sub(fixedpoint.NewFromFloat(newQuantity).MulFloat64(price))
+			log.Infof("submitting order: %s", order.String())
 			break
 		} else {
 			quoteBalance = quoteBalance.Sub(quoteQuantity)
@@ -227,7 +237,15 @@ func (s *Strategy) generateGridSellOrders(session *bbgo.ExchangeSession) ([]type
 	if baseBalance <= 0 {
 		return nil, fmt.Errorf("base balance %s is zero: %+v", s.Market.BaseCurrency, baseBalance.Float64())
 	}
-	gridNum := math.Floor(float64(s.GridNum) * base.Available.Float64() / (base.Available.Float64() + base.Locked.Float64()))
+	availableAsset := base.Available.Float64()
+	totalAsset := availableAsset + base.Locked.Float64()
+	if availableAsset < s.MinBalanceForOrder {
+		return nil, fmt.Errorf("Asset not enough for posting orders: %f", availableAsset)
+	}
+	gridNum := math.Floor(float64(s.GridNum) * availableAsset / totalAsset)
+	if gridNum < 1 {
+		return nil, fmt.Errorf("gridNum == 0, skip")
+	}
 
 	upBand, downBand := s.boll.LastUpBand(), s.boll.LastDownBand()
 	if upBand <= 0.0 {
@@ -258,11 +276,8 @@ func (s *Strategy) generateGridSellOrders(session *bbgo.ExchangeSession) ([]type
 	gridSize := priceRange / float64(s.GridNum)
 
 	var orders []types.SubmitOrder
-	if baseBalance.Float64() < s.MinBalanceForOrder {
-		log.Errorf("base balance %f is not enough for sending order", baseBalance.Float64())
-		return orders, nil
-	}
-	gridQuantity := (baseBalance.Float64() / gridNum / s.QuantityUnit) * s.QuantityUnit
+
+	gridQuantity := math.Floor(baseBalance.Float64()*s.QuantityUnit/gridNum) / s.QuantityUnit
 	if gridQuantity < s.MinBalanceForOrder {
 		gridQuantity = s.MinBalanceForOrder
 	}
@@ -349,10 +364,46 @@ func (s *Strategy) updateOrders(orderExecutor bbgo.OrderExecutor, session *bbgo.
 		log.Infof("boll: band spread %f too small, skipping %f...", spread, dynamicSpread)
 		return
 	}
+	if s.CancelBadOrders {
+		profitOrders := s.cancelBadOrders(session)
+		if len(profitOrders) > 0 {
+			log.Infof("cancel bad orders %v", profitOrders)
+			go func() {
+				if err := session.Exchange.CancelOrders(context.Background(), profitOrders...); err != nil {
+					log.WithError(err).Errorf("cancel order error")
+				}
+			}()
+			for _ = range profitOrders {
+				<-s.cancelDone
+			}
+			log.Infof("cancel bad orders done")
+		}
+	}
 
 	s.placeGridOrders(orderExecutor, session)
 
 	s.activeOrders.Print()
+}
+
+func (s *Strategy) cancelBadOrders(session *bbgo.ExchangeSession) types.OrderSlice {
+	needCancelOrders := make(types.OrderSlice, 0)
+	/*bandWidth := 7.
+		sma := s.boll.LastSMA()
+		std := s.boll.LastStdDev()
+	    band := std * bandWidth*/
+	currentPrice, ok := session.LastPrice(s.Symbol)
+	if !ok {
+		log.Errorf("last price not found")
+		return needCancelOrders
+	}
+	bigUpBand, bigDownBand := currentPrice*1.1, currentPrice*0.91
+
+	for _, order := range s.profitOrders.Orders() {
+		if order.Price > bigUpBand || order.Price < bigDownBand {
+			needCancelOrders = append(needCancelOrders, order)
+		}
+	}
+	return needCancelOrders
 }
 
 func (s *Strategy) submitReverseOrder(order types.Order, session *bbgo.ExchangeSession) {

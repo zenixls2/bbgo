@@ -96,6 +96,8 @@ type Strategy struct {
 	QuantityUnit float64 `json:"quantityUnit"`
 
 	CancelBadOrders bool `json:"cancelBadOrders"`
+
+	cancelMap map[uint64]struct{}
 }
 
 func (s *Strategy) ID() string {
@@ -337,6 +339,9 @@ func (s *Strategy) updateOrders(orderExecutor bbgo.OrderExecutor, session *bbgo.
 	activeOrders := s.activeOrders.Orders()
 	if len(activeOrders) > 0 {
 		log.Infof("before update: start cancelling orders %v", activeOrders)
+		for _, order := range activeOrders {
+			s.cancelMap[order.OrderID] = struct{}{}
+		}
 		go func() {
 			if err := session.Exchange.CancelOrders(context.Background(), activeOrders...); err != nil {
 				log.WithError(err).Errorf("cancel order error")
@@ -368,6 +373,9 @@ func (s *Strategy) updateOrders(orderExecutor bbgo.OrderExecutor, session *bbgo.
 		profitOrders := s.cancelBadOrders(session)
 		if len(profitOrders) > 0 {
 			log.Infof("cancel bad orders %v", profitOrders)
+			for _, order := range profitOrders {
+				s.cancelMap[order.OrderID] = struct{}{}
+			}
 			go func() {
 				if err := session.Exchange.CancelOrders(context.Background(), profitOrders...); err != nil {
 					log.WithError(err).Errorf("cancel order error")
@@ -464,6 +472,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 	s.orders = bbgo.NewOrderStore(s.Symbol)
 	s.orders.BindStream(session.UserDataStream)
+	s.cancelMap = make(map[uint64]struct{})
 
 	// we don't persist orders so that we can not clear the previous orders for now. just need time to support this.
 	s.activeOrders = bbgo.NewLocalActiveOrderBook()
@@ -487,6 +496,9 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		activeOrders := s.activeOrders.Orders()
 
 		log.Infof("on_shutdown: canceling active orders... %v", activeOrders)
+		for _, order := range activeOrders {
+			s.cancelMap[order.OrderID] = struct{}{}
+		}
 		go func() {
 			if err := session.Exchange.CancelOrders(ctx, activeOrders...); err != nil {
 				log.WithError(err).Errorf("cancel order error")
@@ -497,9 +509,12 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		}
 		log.Infof("on_shutdown: cancel active orders done")
 
-		profitOrders := s.profitOrders.Orders()
 
 		if s.CancelProfitOrdersOnShutdown {
+			profitOrders := s.profitOrders.Orders()
+			for _, order := range profitOrders {
+				s.cancelMap[order.OrderID] = struct{}{}
+			}
 			log.Infof("canceling profit orders...%v", profitOrders)
 			go func() {
 				if err := session.Exchange.CancelOrders(ctx, profitOrders...); err != nil {
@@ -518,19 +533,17 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		s.updateOrders(orderExecutor, session)
 	})
 
-	dict := make(map[uint64]struct{})
 	session.Stream.OnOrderUpdate(func(o types.Order) {
+		if _, ok := s.cancelMap[o.OrderID]; !ok {
+			return
+		}
 		log.Infof("order update OrderID: %v %v", o.OrderID, o)
 		switch o.Status {
-		case types.OrderStatusNew:
-			dict[o.OrderID] = struct{}{}
 		case types.OrderStatusCanceled:
-			if _, ok := dict[o.OrderID]; ok {
-				delete(dict, o.OrderID)
-				c <- struct{}{}
-			}
+			delete(s.cancelMap, o.OrderID)
+			c <- struct{}{}
 		case types.OrderStatusFilled:
-			delete(dict, o.OrderID)
+			delete(s.cancelMap, o.OrderID)
 		}
 	})
 	s.cancelDone = c

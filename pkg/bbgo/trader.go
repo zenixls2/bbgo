@@ -10,6 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	_ "github.com/go-sql-driver/mysql"
+	_ "modernc.org/sqlite"
 )
 
 // SingleExchangeStrategy represents the single Exchange strategy

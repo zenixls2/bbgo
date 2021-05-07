@@ -67,4 +67,3 @@ func LoadExchangeMarketsWithCache(ctx context.Context, ex types.Exchange) (marke
 	})
 	return markets, err
 }
-

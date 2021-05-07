@@ -76,7 +76,6 @@ func (s *OrderService) Sync(ctx context.Context, exchange types.Exchange, symbol
 	return <-errC
 }
 
-
 // QueryLast queries the last order from the database
 func (s *OrderService) QueryLast(ex types.ExchangeName, symbol string, isMargin, isIsolated bool, limit int) ([]types.Order, error) {
 	log.Infof("querying last order exchange = %s AND symbol = %s AND is_margin = %v AND is_isolated = %v", ex, symbol, isMargin, isIsolated)

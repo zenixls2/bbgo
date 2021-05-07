@@ -17,6 +17,7 @@ import (
 	"github.com/x-cray/logrus-prefixed-formatter"
 
 	_ "github.com/go-sql-driver/mysql"
+	_ "modernc.org/sqlite"
 )
 
 var userConfig *bbgo.Config

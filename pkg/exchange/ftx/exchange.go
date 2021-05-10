@@ -433,20 +433,24 @@ func sortByCreatedASC(orders []order) {
 	})
 }
 
-func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) error {
-	for _, o := range orders {
+func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (errs []error) {
+	for j, o := range orders {
 		rest := e.newRest()
 		if len(o.ClientOrderID) > 0 {
 			if _, err := rest.CancelOrderByClientID(ctx, o.ClientOrderID); err != nil {
-				return err
+				for i := j; i < len(orders); i++ {
+					errs = append(errs, err)
+				}
+				return errs
+			} else {
+				errs = append(errs, nil)
 			}
 			continue
 		}
-		if _, err := rest.CancelOrderByOrderID(ctx, o.OrderID); err != nil {
-			return err
-		}
+		_, err := rest.CancelOrderByOrderID(ctx, o.OrderID)
+		errs = append(errs, err)
 	}
-	return nil
+	return errs
 }
 
 func (e *Exchange) QueryTicker(ctx context.Context, symbol string) (*types.Ticker, error) {

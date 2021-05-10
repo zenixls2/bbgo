@@ -311,8 +311,11 @@ func (s *Strategy) CrossRun(ctx context.Context, _ bbgo.OrderExecutionRouter, se
 
 				time.Sleep(time.Second)
 
-				if err := tradingSession.Exchange.CancelOrders(ctx, createdOrders...); err != nil {
-					log.WithError(err).Error("cancel order error")
+				errs := tradingSession.Exchange.CancelOrders(ctx, createdOrders...)
+				for _, err := range errs {
+					if err != nil {
+						log.WithError(err).Error("cancel order error")
+					}
 				}
 			}
 		}

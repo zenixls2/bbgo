@@ -163,8 +163,11 @@ var cancelOrderCmd = &cobra.Command{
 					return err
 				}
 
-				if err := session.Exchange.CancelOrders(ctx, openOrders...); err != nil {
-					return err
+				errs := session.Exchange.CancelOrders(ctx, openOrders...)
+				for _, err := range errs {
+					if err != nil {
+						return err
+					}
 				}
 			} else {
 				log.Error("unsupported operation")

@@ -489,7 +489,7 @@ func (e *Exchange) QueryClosedOrders(ctx context.Context, symbol string, since, 
 	return toGlobalOrders(binanceOrders)
 }
 
-func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (err2 error) {
+func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (errs []error) {
 	for _, o := range orders {
 		var req = e.Client.NewCancelOrderService()
 
@@ -505,11 +505,13 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (err
 		_, err := req.Do(ctx)
 		if err != nil {
 			log.WithError(err).Errorf("order cancel error")
-			err2 = err
+			errs = append(errs, err)
+		} else {
+			errs = append(errs, nil)
 		}
 	}
 
-	return err2
+	return errs
 }
 
 func (e *Exchange) submitMarginOrder(ctx context.Context, order types.SubmitOrder) (*types.Order, error) {

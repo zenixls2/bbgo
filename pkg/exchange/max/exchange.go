@@ -259,7 +259,7 @@ func (e *Exchange) CancelOrdersByGroupID(ctx context.Context, groupID uint32) ([
 	return toGlobalOrders(maxOrders)
 }
 
-func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (err2 error) {
+func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (errs []error) {
 	var groupIDs = make(map[uint32]struct{})
 	var orphanOrders []types.Order
 	for _, o := range orders {
@@ -269,6 +269,7 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (err
 			orphanOrders = append(orphanOrders, o)
 		}
 	}
+	var groupErrs map[uint32]error
 
 	if len(groupIDs) > 0 {
 		for groupID := range groupIDs {
@@ -277,10 +278,14 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (err
 
 			if _, err := req.Do(ctx); err != nil {
 				log.WithError(err).Errorf("group id order cancel error")
-				err2 = err
+				groupErrs[groupID] = err
+			} else {
+				groupErrs[groupID] = nil
 			}
 		}
 	}
+
+	var orphanErrs []error
 
 	for _, o := range orphanOrders {
 		var req = e.client.OrderService.NewOrderCancelRequest()
@@ -289,16 +294,28 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (err
 		} else if len(o.ClientOrderID) > 0 {
 			req.ClientOrderID(o.ClientOrderID)
 		} else {
-			return fmt.Errorf("order id or client order id is not defined, order=%+v", o)
+			orphanErrs = append(orphanErrs, fmt.Errorf("order id or client order id is not defined, order=%+v", o))
+			continue
 		}
 
 		if err := req.Do(ctx); err != nil {
 			log.WithError(err).Errorf("order cancel error")
-			err2 = err
+			orphanErrs = append(orphanErrs, err)
+		} else {
+			orphanErrs = append(orphanErrs, nil)
+		}
+	}
+	index := 0
+	for _, o := range orders {
+		if o.GroupID > 0 {
+			errs = append(errs, groupErrs[o.GroupID])
+		} else {
+			errs = append(errs, orphanErrs[index])
+			index++
 		}
 	}
 
-	return err2
+	return errs
 }
 
 func toMaxSubmitOrder(o types.SubmitOrder) (*maxapi.Order, error) {

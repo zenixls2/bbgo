@@ -93,8 +93,11 @@ func (s *Strategy) CrossSubscribe(sessions map[string]*bbgo.ExchangeSession) {
 
 func (s *Strategy) clear(ctx context.Context, session *bbgo.ExchangeSession) {
 	if s.order.OrderID > 0 {
-		if err := session.Exchange.CancelOrders(ctx, s.order); err != nil {
-			log.WithError(err).Errorf("can not cancel trailingstop order: %+v", s.order)
+		errs := session.Exchange.CancelOrders(ctx, s.order)
+		for _, err := range errs {
+			if err != nil {
+				log.WithError(err).Errorf("can not cancel trailingstop order: %+v", s.order)
+			}
 		}
 
 		// clear out the existing order

@@ -174,9 +174,12 @@ func aggregatePrice(pvs types.PriceVolumeSlice, requiredQuantity fixedpoint.Valu
 }
 
 func (s *Strategy) updateQuote(ctx context.Context, orderExecutionRouter bbgo.OrderExecutionRouter) {
-	if err := s.makerSession.Exchange.CancelOrders(ctx, s.activeMakerOrders.Orders()...); err != nil {
-		log.WithError(err).Errorf("can not cancel %s orders", s.Symbol)
-		return
+	errs := s.makerSession.Exchange.CancelOrders(ctx, s.activeMakerOrders.Orders()...)
+	for _, err := range errs {
+		if err != nil {
+			log.WithError(err).Errorf("can not cancel %s orders", s.Symbol)
+			return
+		}
 	}
 
 	// avoid unlock issue and wait for the balance update
@@ -812,8 +815,11 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 		defer quoteTicker.Stop()
 
 		defer func() {
-			if err := s.makerSession.Exchange.CancelOrders(context.Background(), s.activeMakerOrders.Orders()...); err != nil {
-				log.WithError(err).Errorf("can not cancel %s orders", s.Symbol)
+			errs := s.makerSession.Exchange.CancelOrders(context.Background(), s.activeMakerOrders.Orders()...)
+			for _, err := range errs {
+				if err != nil {
+					log.WithError(err).Errorf("can not cancel %s orders", s.Symbol)
+				}
 			}
 		}()
 
@@ -879,9 +885,12 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 			log.Warnf("%d orders are not cancelled yet:", len(orders))
 			s.activeMakerOrders.Print()
 
-			if err := s.makerSession.Exchange.CancelOrders(ctx, s.activeMakerOrders.Orders()...); err != nil {
-				log.WithError(err).Errorf("can not cancel %s orders", s.Symbol)
-				continue
+			errs := s.makerSession.Exchange.CancelOrders(ctx, s.activeMakerOrders.Orders()...)
+			for _, err := range errs {
+				if err != nil {
+					log.WithError(err).Errorf("can not cancel %s orders", s.Symbol)
+					continue
+				}
 			}
 
 			log.Infof("waiting for orders to be cancelled...")

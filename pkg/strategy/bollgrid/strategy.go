@@ -336,21 +336,26 @@ func (s *Strategy) placeGridOrders(orderExecutor bbgo.OrderExecutor, session *bb
 	}
 }
 
+func (s *Strategy) cancelWait(session *bbgo.ExchangeSession, orders ...types.Order) {
+	for _, order := range orders {
+		s.cancelMap[order.OrderID] = struct{}{}
+	}
+	errs := session.Exchange.CancelOrders(context.Background(), orders...)
+	for i, err := range errs {
+		if err != nil {
+			delete(s.cancelMap, orders[i].OrderID)
+			log.WithError(err).Errorf("cancel order error")
+		} else {
+			<-s.cancelDone
+		}
+	}
+}
+
 func (s *Strategy) updateOrders(orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) {
 	activeOrders := s.activeOrders.Orders()
 	if len(activeOrders) > 0 {
 		log.Infof("before update: start cancelling orders %v", activeOrders)
-		for _, order := range activeOrders {
-			s.cancelMap[order.OrderID] = struct{}{}
-		}
-		go func() {
-			if err := session.Exchange.CancelOrders(context.Background(), activeOrders...); err != nil {
-				log.WithError(err).Errorf("cancel order error")
-			}
-		}()
-		for _ = range activeOrders {
-			<-s.cancelDone
-		}
+		s.cancelWait(session, activeOrders...)
 		log.Infof("before update: canceled all orders")
 	}
 
@@ -374,17 +379,7 @@ func (s *Strategy) updateOrders(orderExecutor bbgo.OrderExecutor, session *bbgo.
 		profitOrders := s.cancelBadOrders(session)
 		if len(profitOrders) > 0 {
 			log.Infof("cancel bad orders %v", profitOrders)
-			for _, order := range profitOrders {
-				s.cancelMap[order.OrderID] = struct{}{}
-			}
-			go func() {
-				if err := session.Exchange.CancelOrders(context.Background(), profitOrders...); err != nil {
-					log.WithError(err).Errorf("cancel order error")
-				}
-			}()
-			for _ = range profitOrders {
-				<-s.cancelDone
-			}
+			s.cancelWait(session, profitOrders...)
 			log.Infof("cancel bad orders done")
 		}
 	}
@@ -497,34 +492,18 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		activeOrders := s.activeOrders.Orders()
 
 		log.Infof("on_shutdown: canceling active orders... %v", activeOrders)
-		for _, order := range activeOrders {
-			s.cancelMap[order.OrderID] = struct{}{}
-		}
-		go func() {
-			if err := session.Exchange.CancelOrders(ctx, activeOrders...); err != nil {
-				log.WithError(err).Errorf("cancel order error")
-			}
-		}()
-		for _ = range activeOrders {
-			<-c
-		}
-		log.Infof("on_shutdown: cancel active orders done")
 
+		s.cancelWait(session, activeOrders...)
+
+		log.Infof("on_shutdown: cancel active orders done")
 
 		if s.CancelProfitOrdersOnShutdown {
 			profitOrders := s.profitOrders.Orders()
-			for _, order := range profitOrders {
-				s.cancelMap[order.OrderID] = struct{}{}
-			}
+
 			log.Infof("canceling profit orders...%v", profitOrders)
-			go func() {
-				if err := session.Exchange.CancelOrders(ctx, profitOrders...); err != nil {
-					log.WithError(err).Errorf("cancel order error")
-				}
-			}()
-			for _ = range profitOrders {
-				<-c
-			}
+
+			s.cancelWait(session, profitOrders...)
+
 			log.Infof("on_shutdown: cancel profit orders done")
 		}
 	})

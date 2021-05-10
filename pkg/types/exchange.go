@@ -83,7 +83,7 @@ type ExchangeTradeService interface {
 
 	QueryOpenOrders(ctx context.Context, symbol string) (orders []Order, err error)
 
-	CancelOrders(ctx context.Context, orders ...Order) error
+	CancelOrders(ctx context.Context, orders ...Order) []error
 }
 
 type ExchangeTradeHistoryService interface {

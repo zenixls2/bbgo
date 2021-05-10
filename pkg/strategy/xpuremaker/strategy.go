@@ -75,8 +75,15 @@ func (s *Strategy) cancelOrders(session *bbgo.ExchangeSession) {
 	for clientOrderID, o := range s.activeOrders {
 		log.Infof("canceling order: %+v", o)
 
-		if err := session.Exchange.CancelOrders(context.Background(), o); err != nil {
-			log.WithError(err).Error("cancel order error")
+		errs := session.Exchange.CancelOrders(context.Background(), o)
+		hasErr := false
+		for _, err := range errs {
+			if err != nil {
+				log.WithError(err).Error("cancel order error")
+			}
+			hasErr = true
+		}
+		if hasErr {
 			continue
 		}
 

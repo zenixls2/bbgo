@@ -145,21 +145,24 @@ func (e Exchange) QueryClosedOrders(ctx context.Context, symbol string, since, u
 	return orders, nil
 }
 
-func (e Exchange) CancelOrders(ctx context.Context, orders ...types.Order) error {
+func (e Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (errs []error) {
 	for _, order := range orders {
 		matching, ok := e.matchingBooks[order.Symbol]
 		if !ok {
-			return fmt.Errorf("matching engine is not initialized for symbol %s", order.Symbol)
+			e := fmt.Errorf("matching engine is not initialized for symbol %s", order.Symbol)
+			errs = append(errs, e)
+			continue
 		}
 		canceledOrder, err := matching.CancelOrder(order)
+		errs = append(errs, err)
 		if err != nil {
-			return err
+			continue
 		}
 
 		e.userDataStream.EmitOrderUpdate(canceledOrder)
 	}
 
-	return nil
+	return errs
 }
 
 func (e Exchange) QueryAccount(ctx context.Context) (*types.Account, error) {

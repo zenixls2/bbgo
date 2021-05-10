@@ -61,8 +61,11 @@ func (s *Strategy) ID() string {
 }
 
 func (s *Strategy) updateOrders(orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) {
-	if err := session.Exchange.CancelOrders(context.Background(), s.activeOrders.Bids.Orders()...); err != nil {
-		log.WithError(err).Errorf("cancel order error")
+	errs := session.Exchange.CancelOrders(context.Background(), s.activeOrders.Bids.Orders()...)
+	for _, err := range errs {
+		if err != nil {
+			log.WithError(err).Errorf("cancel order error")
+		}
 	}
 
 	s.updateBidOrders(orderExecutor, session)
@@ -118,8 +121,11 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 		log.Infof("canceling active orders...")
 
-		if err := session.Exchange.CancelOrders(ctx, s.activeOrders.Orders()...); err != nil {
-			log.WithError(err).Errorf("cancel order error")
+		errs := session.Exchange.CancelOrders(ctx, s.activeOrders.Orders()...)
+		for _, err := range errs {
+			if err != nil {
+				log.WithError(err).Errorf("cancel order error")
+			}
 		}
 	})
 

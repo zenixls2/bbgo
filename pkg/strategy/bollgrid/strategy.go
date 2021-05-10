@@ -241,9 +241,7 @@ func (s *Strategy) generateGridSellOrders(session *bbgo.ExchangeSession) ([]type
 	}
 	availableAsset := base.Available.Float64()
 	totalAsset := availableAsset + base.Locked.Float64()
-	if availableAsset < s.MinBalanceForOrder {
-		return nil, fmt.Errorf("Asset not enough for posting orders: %f", availableAsset)
-	}
+
 	gridNum := math.Floor(float64(s.GridNum) * availableAsset / totalAsset)
 	if gridNum < 1 {
 		return nil, fmt.Errorf("gridNum == 0, skip")
@@ -260,6 +258,9 @@ func (s *Strategy) generateGridSellOrders(session *bbgo.ExchangeSession) ([]type
 	currentPrice, ok := session.LastPrice(s.Symbol)
 	if !ok {
 		return nil, fmt.Errorf("last price not found")
+	}
+	if availableAsset*currentPrice < s.MinBalanceForOrder {
+		return nil, fmt.Errorf("Asset not enough for posting orders: %f", availableAsset)
 	}
 
 	if currentPrice > upBand || currentPrice < downBand {
@@ -280,8 +281,8 @@ func (s *Strategy) generateGridSellOrders(session *bbgo.ExchangeSession) ([]type
 	var orders []types.SubmitOrder
 
 	gridQuantity := math.Floor(baseBalance.Float64()*s.QuantityUnit/gridNum) / s.QuantityUnit
-	if gridQuantity < s.MinBalanceForOrder {
-		gridQuantity = s.MinBalanceForOrder
+	if gridQuantity*currentPrice < s.MinBalanceForOrder {
+		gridQuantity = math.Floor(s.MinBalanceForOrder*s.QuantityUnit/currentPrice) / s.QuantityUnit
 	}
 
 	for price := downBand; price <= upBand; price += gridSize {
@@ -477,7 +478,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	// we don't persist orders so that we can not clear the previous orders for now. just need time to support this.
 	s.activeOrders = bbgo.NewLocalActiveOrderBook()
 	s.activeOrders.OnFilled(func(o types.Order) {
-		s.submitReverseOrder(o, session)
+		//s.submitReverseOrder(o, session)
 	})
 	s.activeOrders.BindStream(session.UserDataStream)
 
@@ -544,6 +545,11 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			c <- struct{}{}
 		case types.OrderStatusFilled:
 			delete(s.cancelMap, o.OrderID)
+		case types.OrderStatusRejected:
+			if _, ok := s.cancelMap[o.OrderID]; ok {
+				delete(s.cancelMap, o.OrderID)
+				c <- struct{}{}
+			}
 		}
 	})
 	s.cancelDone = c

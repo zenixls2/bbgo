@@ -336,28 +336,27 @@ func (s *Strategy) placeGridOrders(orderExecutor bbgo.OrderExecutor, session *bb
 	}
 }
 
-func (s *Strategy) cancelWait(session *bbgo.ExchangeSession, orders ...types.Order) {
+func (s *Strategy) cancelWait(session *bbgo.ExchangeSession, isProfit bool, orders ...types.Order) {
 	for _, order := range orders {
 		s.cancelMap[order.OrderID] = struct{}{}
 	}
+	log.Infof("before send to exchnge")
 	errs := session.Exchange.CancelOrders(context.Background(), orders...)
 	for i, err := range errs {
 		if err != nil {
-			delete(s.cancelMap, orders[i].OrderID)
 			log.WithError(err).Errorf("cancel order error")
-		} else {
+			if isProfit {
+				s.profitOrders.Remove(orders[i])
+			} else {
+				s.activeOrders.Remove(orders[i])
+			}
+		}/* else {
 			<-s.cancelDone
-		}
+		}*/
 	}
 }
 
 func (s *Strategy) updateOrders(orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) {
-	activeOrders := s.activeOrders.Orders()
-	if len(activeOrders) > 0 {
-		log.Infof("before update: start cancelling orders %v", activeOrders)
-		s.cancelWait(session, activeOrders...)
-		log.Infof("before update: canceled all orders")
-	}
 
 	// skip order updates if up-band - down-band < min profit spread
 	upBand := s.boll.LastUpBand()
@@ -375,11 +374,17 @@ func (s *Strategy) updateOrders(orderExecutor bbgo.OrderExecutor, session *bbgo.
 		log.Infof("boll: band spread %f too small, skipping %f...", spread, dynamicSpread)
 		return
 	}
+	activeOrders := s.activeOrders.Orders()
+	if len(activeOrders) > 0 {
+		log.Infof("before update: start cancelling orders %v", activeOrders)
+		s.cancelWait(session, false, activeOrders...)
+		log.Infof("before update: canceled all orders")
+	}
 	if s.CancelBadOrders {
 		profitOrders := s.cancelBadOrders(session)
 		if len(profitOrders) > 0 {
 			log.Infof("cancel bad orders %v", profitOrders)
-			s.cancelWait(session, profitOrders...)
+			s.cancelWait(session, true, profitOrders...)
 			log.Infof("cancel bad orders done")
 		}
 	}
@@ -473,7 +478,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	// we don't persist orders so that we can not clear the previous orders for now. just need time to support this.
 	s.activeOrders = bbgo.NewLocalActiveOrderBook()
 	s.activeOrders.OnFilled(func(o types.Order) {
-		//s.submitReverseOrder(o, session)
+		s.submitReverseOrder(o, session)
 	})
 	s.activeOrders.BindStream(session.UserDataStream)
 
@@ -484,6 +489,9 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	s.profitOrders.BindStream(session.UserDataStream)
 
 	c := make(chan struct{}, 1000)
+
+	s.cancelDone = c
+
 	// setup graceful shutting down handler
 	s.Graceful.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
 		// call Done to notify the main process.
@@ -493,7 +501,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 		log.Infof("on_shutdown: canceling active orders... %v", activeOrders)
 
-		s.cancelWait(session, activeOrders...)
+		s.cancelWait(session, false, activeOrders...)
 
 		log.Infof("on_shutdown: cancel active orders done")
 
@@ -502,7 +510,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 			log.Infof("canceling profit orders...%v", profitOrders)
 
-			s.cancelWait(session, profitOrders...)
+			s.cancelWait(session, true, profitOrders...)
 
 			log.Infof("on_shutdown: cancel profit orders done")
 		}
@@ -511,27 +519,29 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	session.UserDataStream.OnStart(func() {
 		log.Infof("connected, submitting the first round of the orders")
 		s.updateOrders(orderExecutor, session)
+		log.Infof("first round done")
 	})
 
 	session.Stream.OnOrderUpdate(func(o types.Order) {
-		if _, ok := s.cancelMap[o.OrderID]; !ok {
+		log.Infof("order update OrderID: %v %v", o.OrderID, o)
+		/*if _, ok := s.cancelMap[o.OrderID]; !ok {
 			return
 		}
-		log.Infof("order update OrderID: %v %v", o.OrderID, o)
 		switch o.Status {
-		case types.OrderStatusCanceled:
+		case types.OrderStatusCanceled, types.OrderStatusFilled, types.OrderStatusRejected:
 			delete(s.cancelMap, o.OrderID)
 			c <- struct{}{}
-		case types.OrderStatusFilled:
-			delete(s.cancelMap, o.OrderID)
-		case types.OrderStatusRejected:
-			if _, ok := s.cancelMap[o.OrderID]; ok {
-				delete(s.cancelMap, o.OrderID)
-				c <- struct{}{}
-			}
-		}
+		}*/
 	})
-	s.cancelDone = c
+
+	session.Stream.OnTradeUpdate(func(o types.Trade) {
+		log.Infof("order trade OrderID: %v %v", o.OrderID, o)
+		/*if _, ok := s.cancelMap[o.OrderID]; !ok {
+			return
+		}
+		delete(s.cancelMap, o.OrderID)
+		c <- struct{}{}*/
+	})
 
 	// avoid using time ticker since we will need back testing here
 	session.MarketDataStream.OnKLineClosed(func(kline types.KLine) {

@@ -239,15 +239,16 @@ func (e *Exchange) QueryOpenOrders(ctx context.Context, symbol string) (orders [
 	return orders, err
 }
 
-func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) error {
+func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (errs []error) {
 	if len(orders) == 0 {
-		return nil
+		return errs
 	}
 
 	var reqs []*okexapi.CancelOrderRequest
 	for _, order := range orders {
 		if len(order.Symbol) == 0 {
-			return errors.New("symbol is required for canceling an okex order")
+			errs = append(errs, errors.New("symbol is required for canceling an okex order"))
+			continue
 		}
 
 		req := e.client.TradeService.NewCancelOrderRequest()
@@ -257,12 +258,18 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) erro
 			req.ClientOrderID(order.ClientOrderID)
 		}
 		reqs = append(reqs, req)
+		errs = append(errs, nil)
 	}
 
 	batchReq := e.client.TradeService.NewBatchCancelOrderRequest()
 	batchReq.Add(reqs...)
 	_, err := batchReq.Do(ctx)
-	return err
+	if err != nil {
+		for i, _ := range errs {
+			errs[i] = err
+		}
+	}
+	return errs
 }
 
 func (e *Exchange) NewStream() types.Stream {

@@ -292,8 +292,11 @@ func (e *TwapExecution) cancelActiveOrders(ctx context.Context) {
 		log.Infof("canceling %d open orders:", len(orders))
 		e.activeMakerOrders.Print()
 
-		if err := e.Session.Exchange.CancelOrders(ctx, orders...); err != nil {
-			log.WithError(err).Errorf("can not cancel %s orders", e.Symbol)
+		errs := e.Session.Exchange.CancelOrders(ctx, orders...)
+		for _, err := range errs {
+			if err != nil {
+			    log.WithError(err).Errorf("can not cancel %s orders", e.Symbol)
+		        }
 		}
 
 		select {

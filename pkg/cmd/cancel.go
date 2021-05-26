@@ -103,14 +103,16 @@ var cancelOrderCmd = &cobra.Command{
 
 			if orderID > 0 {
 				logrus.Infof("canceling order by the given order id %d", orderID)
-				err := ses.Exchange.CancelOrders(ctx, types.Order{
+				errs := ses.Exchange.CancelOrders(ctx, types.Order{
 					SubmitOrder: types.SubmitOrder{
 						Symbol: symbol,
 					},
 					OrderID: orderID,
 				})
-				if err != nil {
-					return err
+				for _, err := range errs {
+					if err != nil {
+						return err
+					}
 				}
 				return nil
 			}

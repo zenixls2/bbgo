@@ -7,19 +7,23 @@ import (
 
 	"github.com/c9s/bbgo/pkg/bbgo"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
+	"github.com/c9s/bbgo/pkg/signals"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
 const ID = "skeleton"
 
 var log = logrus.WithField("strategy", ID)
+var sigs *types.Signals
 
 func init() {
 	bbgo.RegisterStrategy(ID, &Strategy{})
+	sigs = signals.New()
 }
 
 type Strategy struct {
 	Symbol string `json:"symbol"`
+	sig    types.Signal
 }
 
 func (s *Strategy) ID() string {
@@ -29,6 +33,9 @@ func (s *Strategy) ID() string {
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 	log.Infof("subscribe %s", s.Symbol)
 	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: "1m"})
+	sig, _ := sigs.FindByName("miningHamster")
+	s.sig = sig
+
 }
 
 var Ten = fixedpoint.NewFromInt(10)

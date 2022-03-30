@@ -1,0 +1,26 @@
+sessions:
+  binance:
+    exchange: binance
+    envVarPrefix: binance
+
+
+backtest:
+  startTime: "2021-09-04"
+  endTime: "2021-10-14"
+  symbols:
+  - MATICBUSD
+  account:
+    binance:
+      makerFeeRate: 0
+      takerFeeRate: 15
+      balances:
+        MATIC: 0.0
+        BUSD: 100.0
+
+
+exchangeStrategies:
+- on: binance
+  vegaschannel:
+    symbol: MATICBUSD
+    interval: 1h
+

@@ -7,6 +7,8 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/c9s/bbgo/pkg/types"
+
+	"github.com/montanaflynn/stats"
 )
 
 // These numbers should be aligned with bbgo MaxNumOfKLines and MaxNumOfKLinesTruncate
@@ -20,6 +22,30 @@ type EWMA struct {
 	LastOpenTime time.Time
 
 	UpdateCallbacks []func(value float64)
+}
+
+type Trend int
+
+const (
+	TrendUp Trend = iota
+	TrendDown
+	TrendNeutral
+)
+
+func (inc *EWMA) Trend() Trend {
+	if len(inc.Values) == 0 {
+		return TrendNeutral
+	}
+	med, err := stats.Median(stats.Float64Data(inc.Values))
+	if err != nil {
+		panic(err)
+	}
+	if inc.Last() > med {
+		return TrendUp
+	} else if inc.Last() < med {
+		return TrendDown
+	}
+	return TrendNeutral
 }
 
 func (inc *EWMA) Update(value float64) {

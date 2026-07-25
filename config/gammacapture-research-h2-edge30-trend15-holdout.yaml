@@ -1,0 +1,29 @@
+---
+# Frozen holdout counterpart of gammacapture-research-h2-edge30-trend15-train.yaml.
+backtest:
+  sessions: [binance]
+  startTime: "2026-06-01"
+  endTime: "2026-07-13"
+  symbols: [BTCJPY]
+  accounts:
+    binance:
+      makerFeeRate: 0.1%
+      takerFeeRate: 0.1%
+      balances: {JPY: 1000000, BTC: 0}
+sessions:
+  binance: {exchange: binance, envVarPrefix: BINANCE}
+exchangeStrategies:
+  - on: binance
+    gammacapture:
+      environment: backtest
+      symbol: BTCJPY
+      interval: 1m
+      symbolSelection: {mode: allowlist, quoteAsset: JPY, symbols: [BTCJPY]}
+      barrier: {width: 0.001, epochDuration: 30m, updateOnlyWhenFlat: true, maxCrossingsPerEvent: 1}
+      intensity: {window: 2h, priorAlphaUp: 1, priorBetaUp: 60, priorAlphaDown: 1, priorBetaDown: 60, minEvents: 10}
+      horizon: {prediction: 2h, maximumHolding: 3h}
+      trend: {lookback: 15m, minReturnBps: 15}
+      signal: {lowerThreshold: 0.42, upperThreshold: 0.58, entryProbability: 0.60, exitProbability: 0.45, maxChurn: 4, entryConfirmationWindow: 5m, stretchedSignalRetraceBps: 10}
+      takeProfit: {activationBarriers: 6, initialTargetBarriers: 8, minTrailingBarriers: 1, maxTrailingBarriers: 4}
+      stopLoss: {hardStopBarriers: 2, softStopBarriers: 1}
+      risk: {maxRiskPerTradeJPY: 1000, maxSymbolNotionalJPY: 50000, estimatedCostBps: 25, minimumNetEdgeBps: 30, maxEntryBarRangeBps: 25, maxEntryBarReturnBps: 15, softExitMinHolding: 10m, cooldownAfterStop: 30m}

@@ -1,0 +1,14 @@
+# Research-only quote policy. This is consumed by the policy/research tools;
+# it is intentionally not enabled in config/gammacapture.yaml until live BBO
+# capture and queue-aware paper fills are available.
+strategy:
+  marketMaker:
+    makerFeeBps: 10
+    minimumNetEdgeBps: 2
+    adverseSelectionBps: 2
+    minimumHalfSpreadBps: 15
+    maximumHalfSpreadBps: 80
+    volatilityMultiplier: 0.75
+    inventoryTarget: 0
+    inventoryLimit: 100
+    inventorySkewBps: 20

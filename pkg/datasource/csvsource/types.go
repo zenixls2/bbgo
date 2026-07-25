@@ -6,6 +6,9 @@ import (
 )
 
 type CsvConfig struct {
+	// Path is the root containing <exchange>/<symbol>/<granularity> CSV files.
+	// When omitted the backtest report output directory is retained for backwards compatibility.
+	Path        string     `json:"path,omitempty" yaml:"path,omitempty"`
 	Market      MarketType `json:"market"`
 	Granularity DataType   `json:"granularity"`
 }

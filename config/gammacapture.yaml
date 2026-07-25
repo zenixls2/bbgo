@@ -1,0 +1,202 @@
+---
+# Candle-replay configuration. The strategy itself is paper-first and rejects live.
+backtest:
+  sessions: [binance]
+  startTime: "2026-01-01"
+  endTime: "2026-07-13"
+  symbols: [SOLJPY]
+  accounts:
+    binance:
+      makerFeeRate: 0.1%
+      takerFeeRate: 0.1%
+      balances:
+        JPY: 1000000
+        SOL: 0
+
+sessions:
+  binance:
+    exchange: binance
+    envVarPrefix: BINANCE
+
+notifications:
+  telegram:
+    broadcast: true
+  switches:
+    trade: true
+    orderUpdate: true
+    submitOrder: true
+    postition: true
+
+exchangeStrategies:
+  - on: binance
+    gammacapture:
+      environment: live
+      symbol: SOLJPY
+      interval: 1m
+      symbolSelection:
+        mode: allowlist
+        quoteAsset: JPY
+        symbols: [SOLJPY]
+        denylist: []
+      barrier:
+        # Log return barrier: 10 bps. It stays fixed for the epoch.
+        width: 0.001
+        epochDuration: 30m
+        updateOnlyWhenFlat: true
+        # A 1m close cannot reveal the path through multiple barriers; reset
+        # rather than count a multi-bar jump as a chronological sequence.
+        maxCrossingsPerEvent: 1
+      intensity:
+        # Two hours captures the active local regime; minEvents=10 means
+        # HEALTHY requires 20 clean crossings in that rolling window.
+        # Live startup warm-up uses the latest completed aggTrade archive; a
+        # longer causal window avoids starting DEGRADED when the last 2h are
+        # unusually quiet.
+        window: 6h
+        priorAlphaUp: 1
+        priorBetaUp: 60
+        priorAlphaDown: 1
+        priorBetaDown: 60
+        minEvents: 10
+      horizon:
+        prediction: 15m
+        maximumHolding: 30m
+      referencePrice:
+        # BBGO's standard backtest service replays closed candles only. Paper
+        # mode defaults to ordered lastTrade observations instead.
+        #mode: klineClose
+        mode: microprice
+      signal:
+        lowerThreshold: 0.40
+        upperThreshold: 0.60
+        entryProbability: 0.62
+        exitProbability: 0.42
+        maxChurn: 4
+        # Permit a settled confirmation candle after a completed upcrossing.
+        entryConfirmationWindow: 5m
+        # A stretched upcrossing must pull back before it can be confirmed.
+        stretchedSignalRetraceBps: 10
+      takeProfit:
+        activationBarriers: 4
+        initialTargetBarriers: 6
+        minTrailingBarriers: 1
+        maxTrailingBarriers: 4
+      stopLoss:
+        hardStopBarriers: 3
+        softStopBarriers: 2
+      # Load recent public market executions before opening the live stream.
+      # This prevents the model from starting cold; the archive must be kept
+      # current by the aggTrade sync/capture job.
+      aggTradeWarmup:
+        enabled: true
+        path: data/gammacapture
+        livePath: data/gammacapture/live
+        # Daily Vision files arrive after UTC day close; keep enough history to
+        # warm from the latest completed archive before the live stream catches up.
+        lookback: 72h
+        maxAge: 72h
+        requireHealthy: true
+      # Fee-aware maker quote path. Start with a small notional while live BBO,
+      # queue-position, and fill-reconciliation behavior is being validated.
+      marketMaker:
+        enabled: true
+        # Cancel maker orders left by an earlier gammacapture process before
+        # opening a new quote window. Binance UI orders are not selected.
+        startupCancelStaleOrders: true
+        makerFeeBps: 10
+        takerFeeBps: 10
+        minimumNetEdgeBps: 2
+        adverseSelectionBps: 2
+        minimumHalfSpreadBps: 15
+        maximumHalfSpreadBps: 80
+        volatilityMultiplier: 0.75
+        inventoryTarget: 0
+        inventoryLimit: 0.02 # fallback only when autoInventoryLimit is false
+        autoInventoryLimit: true
+        # Dynamic risk budget: 10 JPY is the absolute floor; larger accounts
+        # use 0.25% of current SOLJPY quote-equivalent equity. Quote notional
+        # is calculated from realized volatility and crossing load; it is not
+        # clamped to a fixed JPY minimum/maximum.
+        inventoryRiskBudgetJPY: 10
+        inventoryRiskBudgetRatio: 0.0025
+        inventoryRiskZScore: 1.645
+        inventoryMaxOrderLevels: 32
+        # Target and cap are dynamic quantities: 25% and 50% of pair equity,
+        # respectively, subject to the volatility and order-level caps. The
+        # legacy target ratio remains the target/cap ratio (25% / 50% = 0.5).
+        inventoryTargetRatio: 0.5
+        inventoryCapitalTargetRatio: 0.25
+        inventoryCapitalMaxRatio: 0.50
+        inventorySkewBps: 8
+        # Side-specific sizing de-risks the side exposed to inventory,
+        # direction, imbalance, or one-sided crossing intensity. The other
+        # side remains at the common statistical risk-sized notional.
+        sideAllocationSensitivity: 0.75
+        sideAllocationFillRateWeight: 0.25
+        sideAllocationSmoothing: 0.25
+        sideDistanceSensitivity: 0.75
+        # Reference value used only for risk-budget defaults and inventory-band
+        # initialization. Actual order size is statistical and account-bound.
+        quoteNotionalJPY: 120
+        # SOLJPY is thin; leave quotes resting, but permit a material BBO or
+        # imbalance change to reprice after a short safety interval.
+        refreshInterval: 60s
+        minRefreshInterval: 20s
+        maxRefreshInterval: 15m
+        # The horizon model updates once per minute, but each quote remains
+        # active until this statistically selected trading window ends.
+        minTradingWindow: 10m
+        maxTradingWindow: 30m
+        horizonLookback: 6h
+        horizonUpdateInterval: 1m
+        horizonMinSamples: 20
+        refreshMoveBps: 8
+        # Reprice a side that has moved materially away from the current BBO
+        # after the minimum resting time; this is directional, not a BBO-tick
+        # cancel loop.
+        adverseRepriceBps: 20
+        refreshImbalanceDelta: 0.25
+        # A one-minute causal crossing model detects fast turns without
+        # replacing the slower six-hour health model used for reset gating.
+        fastWindow: 60s
+        # Sparse JPY markets need a longer raw-data coverage window while the
+        # fast crossing model remains on its one-minute response horizon.
+        fastEvidenceWindow: 10m
+        # Observational raw trade/BBO coverage thresholds. These do not
+        # override crossing health or prove fee-adjusted profitability.
+        fastEvidenceMinTrades: 20
+        fastEvidenceMinBBOUpdates: 20
+        directionSkewBps: 10
+        imbalanceSkewBps: 10
+        inventoryReset:
+          enabled: true
+          maxAskAge: 3m
+          fastAskAge: 1m
+          adverseMoveBps: 40
+          fastAdverseMoveBps: 20
+          fastDirectionThreshold: 0.25
+          maxSlippageBps: 25
+          # Fallback only; live reset orders reuse the same risk-sized ticket
+          # as the passive quote when the dynamic band is available.
+          reductionNotionalJPY: 120
+          cooldown: 15m
+          # AggTrade archives do not expose queue position; haircut the
+          # crossing intensity before estimating passive fill probability.
+          fillIntensityHaircut: 0.25
+          riskZScore: 1.645
+      risk:
+        maxRiskPerTradeJPY: 1000
+        maxSymbolNotionalJPY: 50000
+        # Enforced in paper mode when lastTrade is selected; candle replay has
+        # no historical BBO stream and reports this gate as not applicable.
+        maxSpreadBps: 10
+        maxBookAge: 5s
+        # 20 bps fee budget (0.1% per taker side) + 10 bps spread/slippage.
+        estimatedCostBps: 30
+        # Require an additional 15 bps model edge after all costs.
+        minimumNetEdgeBps: 15
+        # Avoid buying a spike close in a one-minute candle replay.
+        maxEntryBarRangeBps: 25
+        maxEntryBarReturnBps: 15
+        softExitMinHolding: 5m
+        cooldownAfterStop: 30m

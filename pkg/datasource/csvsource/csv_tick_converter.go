@@ -108,8 +108,10 @@ func (c *CSVTickConverter) detCandleStart(ts time.Time, interval types.Interval)
 	}
 	if last != nil {
 		var end = last.EndTime.Time()
-		if ts.After(end) {
-			return true, end
+		// EndTime is the next candle's boundary in this converter. A trade at
+		// exactly that timestamp belongs to the new candle, not the old one.
+		if !ts.Before(end) {
+			return true, interval.Truncate(ts)
 		}
 	}
 

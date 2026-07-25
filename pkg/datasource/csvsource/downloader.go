@@ -260,6 +260,9 @@ func readCSVFromUrl(exchange types.ExchangeName, url string) (csvContent []byte,
 		return nil, fmt.Errorf("http get error, url %s: %w", url, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("download returned HTTP %s for %s (archive may not be published yet)", resp.Status, url)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -349,7 +352,8 @@ func parseCsvTicksBinance(csvContent []byte) ([]string, error) {
 		if _, err := strconv.ParseFloat(quantity, 64); err != nil {
 			return nil, fmt.Errorf("Binance invalid quantity at line %d: %s", lineNo, quantity)
 		}
-		if _, err := strconv.ParseInt(timestamp, 10, 64); err != nil {
+		timestamp, err := normalizeBinanceTimestampMillis(timestamp)
+		if err != nil {
 			return nil, fmt.Errorf("Binance invalid timestamp at line %d: %s", lineNo, timestamp)
 		}
 		isBuyerMaker, err := strconv.ParseBool(isBuyerMakerStr)
@@ -363,6 +367,25 @@ func parseCsvTicksBinance(csvContent []byte) ([]string, error) {
 		lines = append(lines, strings.Join([]string{tradeID, side, quantity, price, timestamp}, ","))
 	}
 	return lines, nil
+}
+
+// normalizeBinanceTimestampMillis handles Binance Vision archives that use
+// milliseconds (legacy), microseconds (current spot archives), or nanoseconds.
+// CsvTick is intentionally normalized to milliseconds throughout this package.
+func normalizeBinanceTimestampMillis(timestamp string) (string, error) {
+	v, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return "", err
+	}
+
+	switch len(timestamp) {
+	case 16:
+		v /= 1_000 // microseconds → milliseconds
+	case 19:
+		v /= 1_000_000 // nanoseconds → milliseconds
+	}
+
+	return strconv.FormatInt(v, 10), nil
 }
 
 // parseCsvTicksBybit parses Bybit trades CSV content and normalizes to: trade_id,side,size,price,timestamp

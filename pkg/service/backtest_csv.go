@@ -49,10 +49,12 @@ func (s *BacktestServiceCSV) Sync(ctx context.Context, exchange types.Exchange, 
 
 	path := fmt.Sprintf("%s/%s/%s", s.path, exchange.Name().String(), symbol)
 
-	kLineMap, err := csvsource.ReadTicksFromCSV(
+	kLineMap, err := csvsource.ReadTicksFromCSVRange(
 		path,
 		symbol,
 		intervals,
+		startTime,
+		endTime,
 	)
 	if err != nil {
 		return errors.Errorf("reading csv data: %v", err)
@@ -125,10 +127,24 @@ func (s *BacktestServiceCSV) QueryKLinesCh(since, until time.Time, exchange type
 		return returnError(errors.Errorf("symbols is empty when querying kline, please check your strategy setting. "))
 	}
 
-	ch := make(chan types.KLine, len(s.kLines))
+	if len(intervals) == 0 {
+		return returnError(errors.Errorf("intervals is empty when querying kline"))
+	}
+	// BBGO's backtest matcher must be driven by the smallest requested interval.
+	// The caller constructs this slice from a map, so intervals[0] is not stable.
+	feedInterval := intervals[0]
+	for _, interval := range intervals[1:] {
+		if interval.Duration() < feedInterval.Duration() {
+			feedInterval = interval
+		}
+	}
+	ch := make(chan types.KLine, len(s.kLines[feedInterval]))
 	go func() {
 		defer close(ch)
-		for _, kline := range s.kLines[intervals[0]] {
+		for _, kline := range s.kLines[feedInterval] {
+			if kline.StartTime.Before(since) || !kline.StartTime.Before(until) {
+				continue
+			}
 			ch <- kline
 		}
 	}()

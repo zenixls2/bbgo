@@ -95,3 +95,21 @@ func Test_CSV_Download(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeBinanceTimestampMillis(t *testing.T) {
+	tests := []struct {
+		name, input, want string
+	}{
+		{"milliseconds", "1783555200836", "1783555200836"},
+		{"microseconds", "1783555200836321", "1783555200836"},
+		{"nanoseconds", "1783555200836321000", "1783555200836"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeBinanceTimestampMillis(tt.input)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

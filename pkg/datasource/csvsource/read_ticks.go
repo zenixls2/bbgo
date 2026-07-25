@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/c9s/bbgo/pkg/types"
 )
@@ -66,4 +67,62 @@ func ReadTicksFromCSV(
 	}
 
 	return converter.GetKLineResults(), nil
+}
+
+// ReadTicksFromCSVRange converts timestamp-ordered daily tick files without
+// retaining the full archive in memory. Binance Vision files are one day each;
+// sorting each file is sufficient while the sorted file list preserves the
+// chronological order across the requested range.
+func ReadTicksFromCSVRange(path, symbol string, intervals []types.Interval, since, until time.Time) (map[types.Interval][]types.KLine, error) {
+	files, err := csvFiles(path)
+	if err != nil {
+		return nil, err
+	}
+	converter := NewCSVTickConverter(intervals)
+	for _, filename := range files {
+		file, err := os.Open(filename)
+		if err != nil {
+			return nil, err
+		}
+		reader := NewCSVTickReader(csv.NewReader(file))
+		ticks, readErr := reader.ReadAll()
+		closeErr := file.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		sort.Slice(ticks, func(i, j int) bool {
+			return ticks[i].Timestamp.Time().Before(ticks[j].Timestamp.Time())
+		})
+		for _, tick := range ticks {
+			t := tick.Timestamp.Time()
+			if (!since.IsZero() && t.Before(since)) || (!until.IsZero() && !t.Before(until)) {
+				continue
+			}
+			tick.Symbol = symbol
+			converter.CsvTickToKLine(tick)
+		}
+	}
+	return converter.GetKLineResults(), nil
+}
+
+func csvFiles(path string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(path, func(filename string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || filepath.Ext(filename) != ".csv" {
+			return nil
+		}
+		files = append(files, filename)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
 }

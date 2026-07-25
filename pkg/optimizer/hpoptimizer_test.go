@@ -1,9 +1,11 @@
 package optimizer
 
 import (
+	"testing"
+
+	"github.com/c9s/bbgo/pkg/backtest"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"reflect"
-	"testing"
 )
 
 func TestBuildParamDomains(t *testing.T) {
@@ -197,5 +199,30 @@ func TestBuildParamDomains(t *testing.T) {
 		if !verifier(pd) {
 			t.Errorf("unexpect param domain at #%d: %#v", i, pd)
 		}
+	}
+}
+
+func TestEquityWithMinimumTurnover(t *testing.T) {
+	metric := EquityWithMinimumTurnover(3)
+	passing := &backtest.SummaryReport{
+		InitialEquityValue: fixedpoint.NewFromInt(100),
+		FinalEquityValue:   fixedpoint.NewFromInt(120),
+		SymbolReports: []backtest.SessionSymbolReport{{
+			RoundTurnCount: 3,
+		}},
+	}
+	if got := metric(passing); got != 20 {
+		t.Fatalf("expected passing equity diff 20, got %v", got)
+	}
+
+	failing := &backtest.SummaryReport{
+		InitialEquityValue: fixedpoint.NewFromInt(100),
+		FinalEquityValue:   fixedpoint.NewFromInt(150),
+		SymbolReports: []backtest.SessionSymbolReport{{
+			RoundTurnCount: 1,
+		}},
+	}
+	if got := metric(failing); got != -1000000000002 {
+		t.Fatalf("expected dominated turnover penalty -1000000000002, got %v", got)
 	}
 }

@@ -1,0 +1,18 @@
+[Unit]
+Description=BBGO Gamma Capture public data collector (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zenixls2/src/bbgo
+ExecStart=/home/zenixls2/src/bbgo/bin/gammacapture-capture -symbol %i -duration 720h -output /home/zenixls2/src/bbgo/data/gammacapture/%i
+Restart=always
+RestartSec=15
+Nice=5
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,32 @@
+---
+# Research-only alternative: a two-hour directional move must compensate for
+# 25 bps estimated execution cost and retain at least 15 bps expected edge.
+backtest:
+  sessions: [binance]
+  startTime: "2026-04-16"
+  endTime: "2026-04-20"
+  syncSecKLines: true
+  symbols: [BTCJPY]
+  csvConfig: {path: data/gammacapture, market: spot, granularity: aggTrades}
+  accounts:
+    binance:
+      makerFeeRate: 0.1%
+      takerFeeRate: 0.1%
+      balances: {JPY: 1000000, BTC: 0}
+sessions:
+  binance: {exchange: binance, envVarPrefix: BINANCE}
+exchangeStrategies:
+  - on: binance
+    gammacapture:
+      environment: replay
+      symbol: BTCJPY
+      interval: 1s
+      symbolSelection: {mode: allowlist, quoteAsset: JPY, symbols: [BTCJPY]}
+      # Retain only deterministic one-bar crossings even at one-second cadence.
+      barrier: {width: 0.001, epochDuration: 30m, updateOnlyWhenFlat: true, maxCrossingsPerEvent: 1}
+      intensity: {window: 2h, priorAlphaUp: 1, priorBetaUp: 60, priorAlphaDown: 1, priorBetaDown: 60, minEvents: 10}
+      horizon: {prediction: 2h, maximumHolding: 3h}
+      signal: {lowerThreshold: 0.42, upperThreshold: 0.58, entryProbability: 0.60, exitProbability: 0.45, maxChurn: 4, entryConfirmationWindow: 5m, stretchedSignalRetraceBps: 0}
+      takeProfit: {activationBarriers: 6, initialTargetBarriers: 8, minTrailingBarriers: 1, maxTrailingBarriers: 4}
+      stopLoss: {hardStopBarriers: 2, softStopBarriers: 1}
+      risk: {maxRiskPerTradeJPY: 1000, maxSymbolNotionalJPY: 50000, estimatedCostBps: 25, minimumNetEdgeBps: 15, maxEntryBarRangeBps: 25, maxEntryBarReturnBps: 15, softExitMinHolding: 10m, cooldownAfterStop: 30m}

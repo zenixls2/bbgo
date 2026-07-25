@@ -1,0 +1,38 @@
+---
+# Data-only synchronization for independent JPY-universe research.  The BTCJPY
+# strategy's deliberately impossible edge threshold prevents orders while BBGO
+# syncs all listed symbols into the local SQLite store.
+backtest:
+  sessions: [binance]
+  startTime: "2026-01-01"
+  endTime: "2026-07-13"
+  symbols: [BTCJPY, ETHJPY, SOLJPY, XRPJPY, ADAJPY]
+  accounts:
+    binance:
+      makerFeeRate: 0.1%
+      takerFeeRate: 0.1%
+      balances: {JPY: 1000000, BTC: 0}
+
+sessions:
+  binance:
+    exchange: binance
+    envVarPrefix: BINANCE
+
+exchangeStrategies:
+  - on: binance
+    gammacapture:
+      environment: backtest
+      symbol: BTCJPY
+      interval: 1m
+      symbolSelection: {mode: allowlist, quoteAsset: JPY, symbols: [BTCJPY]}
+      barrier: {width: 0.001, maxCrossingsPerEvent: 1}
+      intensity: {window: 2h, minEvents: 10}
+      horizon: {prediction: 15m, maximumHolding: 30m}
+      signal: {lowerThreshold: 0.40, upperThreshold: 0.60, entryProbability: 0.62, exitProbability: 0.42, entryConfirmationWindow: 5m}
+      takeProfit: {activationBarriers: 4, initialTargetBarriers: 6, minTrailingBarriers: 1, maxTrailingBarriers: 4}
+      stopLoss: {hardStopBarriers: 3, softStopBarriers: 2}
+      risk:
+        estimatedCostBps: 25
+        minimumNetEdgeBps: 1000000
+        maxEntryBarRangeBps: 25
+        maxEntryBarReturnBps: 15

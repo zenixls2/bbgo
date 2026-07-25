@@ -45,6 +45,11 @@ type Config struct {
 	Algorithm     string           `yaml:"algorithm,omitempty"`
 	Objective     string           `yaml:"objectiveBy,omitempty"`
 	MaxEvaluation int              `yaml:"maxEvaluation"`
+	// MinimumRoundTurns is used by equitywithturnover. A candidate below this
+	// completed round-turn count receives a dominated objective value, which
+	// prevents the optimizer from selecting a no-trade configuration merely
+	// because it avoided losses.
+	MinimumRoundTurns int `yaml:"minimumRoundTurns,omitempty"`
 }
 
 var defaultExecutorConfig = &ExecutorConfig{
@@ -79,7 +84,7 @@ func LoadConfig(yamlConfigFileName string) (*Config, error) {
 	switch objective := strings.ToLower(optConfig.Objective); objective {
 	case "", "default":
 		optConfig.Objective = HpOptimizerObjectiveEquity
-	case HpOptimizerObjectiveEquity, HpOptimizerObjectiveProfit, HpOptimizerObjectiveVolume, HpOptimizerObjectiveProfitFactor:
+	case HpOptimizerObjectiveEquity, HpOptimizerObjectiveEquityWithTurnover, HpOptimizerObjectiveProfit, HpOptimizerObjectiveVolume, HpOptimizerObjectiveProfitFactor:
 		optConfig.Objective = objective
 	default:
 		return nil, fmt.Errorf(`unknown objective "%s"`, optConfig.Objective)
@@ -87,6 +92,9 @@ func LoadConfig(yamlConfigFileName string) (*Config, error) {
 
 	if optConfig.MaxEvaluation <= 0 {
 		optConfig.MaxEvaluation = 100
+	}
+	if optConfig.MinimumRoundTurns < 0 {
+		return nil, fmt.Errorf("minimumRoundTurns must be non-negative")
 	}
 
 	if optConfig.Executor == nil {

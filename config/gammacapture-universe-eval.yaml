@@ -1,0 +1,42 @@
+---
+# Same frozen parameters for every candidate.  The file is research-only and
+# is not an allowlist promotion; each instance writes its own gate funnel.
+backtest:
+  sessions: [binance]
+  startTime: "2026-01-01"
+  endTime: "2026-07-13"
+  symbols: [BTCJPY, ETHJPY, SOLJPY, XRPJPY, ADAJPY]
+  accounts:
+    binance:
+      makerFeeRate: 0.1%
+      takerFeeRate: 0.1%
+      balances: {JPY: 1000000, BTC: 0, ETH: 0, SOL: 0, XRP: 0, ADA: 0}
+
+sessions:
+  binance:
+    exchange: binance
+    envVarPrefix: BINANCE
+
+gammacaptureDefaults: &gammacapture
+  environment: backtest
+  interval: 1m
+  symbolSelection: {mode: allowlist, quoteAsset: JPY, symbols: [BTCJPY, ETHJPY, SOLJPY, XRPJPY, ADAJPY]}
+  barrier: {width: 0.001, epochDuration: 30m, updateOnlyWhenFlat: true, maxCrossingsPerEvent: 1}
+  intensity: {window: 2h, priorAlphaUp: 1, priorBetaUp: 60, priorAlphaDown: 1, priorBetaDown: 60, minEvents: 10}
+  horizon: {prediction: 15m, maximumHolding: 30m}
+  signal: {lowerThreshold: 0.40, upperThreshold: 0.60, entryProbability: 0.62, exitProbability: 0.42, maxChurn: 4, entryConfirmationWindow: 5m, stretchedSignalRetraceBps: 10}
+  takeProfit: {activationBarriers: 4, initialTargetBarriers: 6, minTrailingBarriers: 1, maxTrailingBarriers: 4}
+  stopLoss: {hardStopBarriers: 3, softStopBarriers: 2}
+  risk: {maxRiskPerTradeJPY: 1000, maxSymbolNotionalJPY: 50000, estimatedCostBps: 25, minimumNetEdgeBps: 15, maxEntryBarRangeBps: 25, maxEntryBarReturnBps: 15, softExitMinHolding: 5m, cooldownAfterStop: 30m}
+
+exchangeStrategies:
+  - on: binance
+    gammacapture: {<<: *gammacapture, symbol: BTCJPY}
+  - on: binance
+    gammacapture: {<<: *gammacapture, symbol: ETHJPY}
+  - on: binance
+    gammacapture: {<<: *gammacapture, symbol: SOLJPY}
+  - on: binance
+    gammacapture: {<<: *gammacapture, symbol: XRPJPY}
+  - on: binance
+    gammacapture: {<<: *gammacapture, symbol: ADAJPY}

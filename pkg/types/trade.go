@@ -69,14 +69,20 @@ type Trade struct {
 	GID int64 `json:"gid" db:"gid"`
 
 	// ID is the source trade ID
-	ID            uint64           `json:"id" db:"id"`
-	OrderID       uint64           `json:"orderID" db:"order_id"`
-	OrderUUID     string           `json:"orderUUID,omitempty" db:"order_uuid"`
-	Exchange      ExchangeName     `json:"exchange" db:"exchange"`
-	Price         fixedpoint.Value `json:"price" db:"price"`
-	Quantity      fixedpoint.Value `json:"quantity" db:"quantity"`
-	QuoteQuantity fixedpoint.Value `json:"quoteQuantity" db:"quote_quantity"`
-	Symbol        string           `json:"symbol" db:"symbol"`
+	ID uint64 `json:"id" db:"id"`
+	// AggregateTradeID and the first/last underlying IDs are populated by
+	// Binance aggregate-trade streams. They are deliberately not persisted in
+	// the generic trade table; they let capture/recovery code detect gaps.
+	AggregateTradeID uint64           `json:"aggregateTradeID,omitempty" db:"-"`
+	FirstTradeID     uint64           `json:"firstTradeID,omitempty" db:"-"`
+	LastTradeID      uint64           `json:"lastTradeID,omitempty" db:"-"`
+	OrderID          uint64           `json:"orderID" db:"order_id"`
+	OrderUUID        string           `json:"orderUUID,omitempty" db:"order_uuid"`
+	Exchange         ExchangeName     `json:"exchange" db:"exchange"`
+	Price            fixedpoint.Value `json:"price" db:"price"`
+	Quantity         fixedpoint.Value `json:"quantity" db:"quantity"`
+	QuoteQuantity    fixedpoint.Value `json:"quoteQuantity" db:"quote_quantity"`
+	Symbol           string           `json:"symbol" db:"symbol"`
 
 	Side          SideType         `json:"side" db:"side"`
 	IsBuyer       bool             `json:"isBuyer" db:"is_buyer"`

@@ -40,6 +40,32 @@ var TotalEquityDiff = func(summaryReport *backtest.SummaryReport) float64 {
 	return finalEquity - initEquity
 }
 
+// EquityWithMinimumTurnover keeps final-equity optimization fee-aware while
+// imposing a hard minimum on completed round turns. Below the threshold the
+// objective is deliberately dominated by a large negative value, with the
+// small turnover tie-breaker favoring candidates that get closer to the
+// threshold. This prevents a no-trade candidate from winning simply by
+// preserving capital. A fixed scale is used because some isolated backtest
+// summaries do not populate InitialEquityValue.
+func EquityWithMinimumTurnover(minimumRoundTurns int) MetricValueFunc {
+	const turnoverFailurePenalty = -1e12
+
+	return func(summaryReport *backtest.SummaryReport) float64 {
+		if summaryReport == nil {
+			return 0
+		}
+		completedTurns := 0
+		for _, report := range summaryReport.SymbolReports {
+			completedTurns += report.RoundTurnCount
+		}
+		equityDiff := TotalEquityDiff(summaryReport)
+		if minimumRoundTurns <= 0 || completedTurns >= minimumRoundTurns {
+			return equityDiff
+		}
+		return turnoverFailurePenalty - float64(minimumRoundTurns-completedTurns)
+	}
+}
+
 var ProfitFactorMetricValueFunc = func(summaryReport *backtest.SummaryReport) float64 {
 	if len(summaryReport.SymbolReports) == 0 {
 		return 0
@@ -214,6 +240,7 @@ func (o *GridOptimizer) Run(executor Executor, configJson []byte) (map[string][]
 		"totalEquityDiff": TotalEquityDiff,
 		"profitFactor":    ProfitFactorMetricValueFunc,
 	}
+	valueFunctions[HpOptimizerObjectiveEquityWithTurnover] = EquityWithMinimumTurnover(o.Config.MinimumRoundTurns)
 	var metrics = map[string][]Metric{}
 
 	var ops = o.buildOps()

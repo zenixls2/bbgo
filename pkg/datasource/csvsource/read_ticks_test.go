@@ -2,8 +2,10 @@ package csvsource
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/c9s/bbgo/pkg/types"
 )
@@ -26,4 +28,13 @@ func Test_ReadTicksFromCSV(t *testing.T) {
 	assert.Equal(t, 7.495, klines[0].Low.Float64(), "Low")
 	assert.Equal(t, 7.598, klines[0].Close.Float64(), "Close")
 	assert.Equal(t, 26786.3, klines[0].Volume.Float64(), "Volume")
+}
+
+func TestReadTicksFromCSVRange(t *testing.T) {
+	path := "./testdata/binance/FXSUSDT/aggTrades"
+	start := time.Unix(1700182800, 0)
+	klines, err := ReadTicksFromCSVRange(path, "FXSUSDT", []types.Interval{types.Interval1h}, start, start.Add(time.Hour))
+	require.NoError(t, err)
+	require.Len(t, klines[types.Interval1h], 1)
+	require.Equal(t, start, klines[types.Interval1h][0].StartTime.Time())
 }

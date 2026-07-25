@@ -128,6 +128,13 @@ func (e *GeneralOrderExecutor) DisableNotify() {
 	e.disableNotify = true
 }
 
+// OnProfit exposes the executor's completed-position callback to strategies
+// that need causal, fee-inclusive feedback after a close is actually matched.
+// The callback receives nil for non-closing fills.
+func (e *GeneralOrderExecutor) OnProfit(cb func(trade types.Trade, profit *types.Profit)) {
+	e.tradeCollector.OnProfit(cb)
+}
+
 func (e *GeneralOrderExecutor) SetMaxRetries(maxRetries uint) {
 	e.maxRetries = maxRetries
 }

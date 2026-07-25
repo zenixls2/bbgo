@@ -20,6 +20,10 @@ import (
 const (
 	// HpOptimizerObjectiveEquity optimize the parameters to maximize equity gain
 	HpOptimizerObjectiveEquity = "equity"
+	// HpOptimizerObjectiveEquityWithTurnover maximizes fee-inclusive equity gain
+	// while rejecting candidates that do not reach the configured minimum number
+	// of completed round turns.
+	HpOptimizerObjectiveEquityWithTurnover = "equitywithturnover"
 	// HpOptimizerObjectiveProfit optimize the parameters to maximize trading profit
 	HpOptimizerObjectiveProfit = "profit"
 	// HpOptimizerObjectiveVolume optimize the parameters to maximize trading volume
@@ -202,6 +206,8 @@ func (o *HyperparameterOptimizer) buildObjective(executor Executor, configJson [
 		metricValueFunc = TotalVolume
 	case HpOptimizerObjectiveEquity:
 		metricValueFunc = TotalEquityDiff
+	case HpOptimizerObjectiveEquityWithTurnover:
+		metricValueFunc = EquityWithMinimumTurnover(o.Config.MinimumRoundTurns)
 	case HpOptimizerObjectiveProfitFactor:
 		metricValueFunc = ProfitFactorMetricValueFunc
 	}

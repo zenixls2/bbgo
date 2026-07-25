@@ -1,0 +1,37 @@
+# Fee-aware, bounded in-sample search for gammacapture.
+#
+# This intentionally searches only parameters that are causal in candle replay.
+# The selected candidate must still pass the frozen June--July holdout and must
+# have a meaningful number of independent trades; the BBGO objective alone does
+# not impose either constraint.
+algorithm: tpe
+# Use final-equity change: BBGO's totalProfit excludes recorded commissions.
+objectiveBy: equity
+maxEvaluation: 48
+
+executor:
+  type: local
+  local:
+    maxNumberOfProcesses: 4
+
+matrix:
+  - type: rangeInt
+    label: initial_target_barriers
+    path: /exchangeStrategies/0/gammacapture/takeProfit/initialTargetBarriers
+    min: 5
+    max: 9
+    step: 1
+
+  - type: rangeFloat
+    label: entry_probability
+    path: /exchangeStrategies/0/gammacapture/signal/entryProbability
+    min: 0.58
+    max: 0.70
+    step: 0.02
+
+  - type: rangeFloat
+    label: minimum_net_edge_bps
+    path: /exchangeStrategies/0/gammacapture/risk/minimumNetEdgeBps
+    min: 0
+    max: 20
+    step: 5

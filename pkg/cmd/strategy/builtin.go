@@ -26,6 +26,7 @@ import (
 	_ "github.com/c9s/bbgo/pkg/strategy/fixedmaker"
 	_ "github.com/c9s/bbgo/pkg/strategy/flashcrash"
 	_ "github.com/c9s/bbgo/pkg/strategy/fmaker"
+	_ "github.com/c9s/bbgo/pkg/strategy/gammacapture"
 	_ "github.com/c9s/bbgo/pkg/strategy/grid"
 	_ "github.com/c9s/bbgo/pkg/strategy/grid2"
 	_ "github.com/c9s/bbgo/pkg/strategy/harmonic"

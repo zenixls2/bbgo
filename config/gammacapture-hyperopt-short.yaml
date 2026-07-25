@@ -1,0 +1,30 @@
+# Compact candidate-selection pass. The wider 48-trial run uses
+# gammacapture-hyperopt-train.yaml; this file keeps CLI progress output small
+# enough for the selected parameter report to remain visible.
+algorithm: tpe
+# Use final-equity change: BBGO's totalProfit excludes recorded commissions.
+objectiveBy: equity
+maxEvaluation: 8
+executor:
+  type: local
+  local:
+    maxNumberOfProcesses: 4
+matrix:
+  - type: rangeInt
+    label: initial_target_barriers
+    path: /exchangeStrategies/0/gammacapture/takeProfit/initialTargetBarriers
+    min: 5
+    max: 9
+    step: 1
+  - type: rangeFloat
+    label: entry_probability
+    path: /exchangeStrategies/0/gammacapture/signal/entryProbability
+    min: 0.58
+    max: 0.70
+    step: 0.02
+  - type: rangeFloat
+    label: minimum_net_edge_bps
+    path: /exchangeStrategies/0/gammacapture/risk/minimumNetEdgeBps
+    min: 0
+    max: 20
+    step: 5

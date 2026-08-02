@@ -38,9 +38,21 @@ func (s *Strategy) warmModelFromAggTrades(now time.Time) error {
 		return fmt.Errorf("aggTradeWarmup lookback and maxAge must be positive")
 	}
 	root := filepath.Join(s.AggTradeWarmup.Path, "binance", s.Symbol, "aggTrades")
+	directCaptureFiles := false
 	files, err := filepath.Glob(filepath.Join(root, "*.csv"))
 	if err != nil {
 		return fmt.Errorf("list aggregate-trade files: %w", err)
+	}
+	// The userspace capture service writes the same causal CSV schema to
+	// <path>/<symbol> rather than the Vision archive hierarchy. Accept both
+	// layouts so a newly selected symbol can warm without a manual copy.
+	if len(files) == 0 {
+		root = filepath.Join(s.AggTradeWarmup.Path, s.Symbol)
+		directCaptureFiles = true
+		files, err = filepath.Glob(filepath.Join(root, s.Symbol+"-trades-*.csv"))
+		if err != nil {
+			return fmt.Errorf("list direct aggregate-trade files: %w", err)
+		}
 	}
 	sort.Strings(files)
 	liveFiles, liveErr := filepath.Glob(filepath.Join(s.AggTradeWarmup.LivePath, s.Symbol+"-trades-*.csv"))
@@ -54,7 +66,7 @@ func (s *Strategy) warmModelFromAggTrades(now time.Time) error {
 	cutoff := now.Add(-time.Duration(s.AggTradeWarmup.Lookback))
 	trades := make([]warmupTrade, 0, 4096)
 	for _, filename := range files {
-		if filepath.Dir(filename) == s.AggTradeWarmup.LivePath {
+		if directCaptureFiles || filepath.Dir(filename) == s.AggTradeWarmup.LivePath {
 			if err := readLiveWarmupFile(filename, cutoff, now, &trades); err != nil {
 				return err
 			}
@@ -102,6 +114,8 @@ func (s *Strategy) warmModelFromAggTrades(now time.Time) error {
 		if s.MarketMaker.Enabled {
 			s.makerHorizonModel.ObserveWithGap(trade.when, trade.price, s.MarketMaker, gapBefore)
 		}
+		s.model.Observe(trade.when, gapBefore)
+		s.observeFastModelExposure(trade.when, gapBefore)
 		if gapBefore {
 			// The path through a capture outage is unknown. Re-anchor and wait
 			// for the next observed move instead of counting a synthetic crossing
@@ -113,9 +127,8 @@ func (s *Strategy) warmModelFromAggTrades(now time.Time) error {
 		}
 		for _, event := range engine.Update(s.Symbol, fixedpoint.NewFromFloat(trade.price), trade.when, trade.when, 0) {
 			s.model.Update(event)
-			if s.fastModel != nil {
-				s.fastModel.Update(event)
-			}
+			s.updateFastModels(event)
+			s.updateMakerDirectionModels(event)
 		}
 		last = trade.when
 		lastID = trade.id
@@ -169,10 +182,10 @@ type fastEvidenceWarmupEvent struct {
 // malformed or partially written rows are skipped and the live stream remains
 // authoritative afterwards.
 func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
-	if s.fastEvidence == nil {
+	if s.fastEvidence == nil && len(s.fastEvidenceModels) == 0 {
 		return nil
 	}
-	window := time.Duration(s.MarketMaker.FastEvidenceWindow)
+	window := s.maxFastEvidenceWindow()
 	if window <= 0 {
 		return fmt.Errorf("fast evidence window must be positive")
 	}
@@ -184,6 +197,17 @@ func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
 	bookFiles, err := filepath.Glob(filepath.Join(s.AggTradeWarmup.LivePath, s.Symbol+"-bookticker-*.csv"))
 	if err != nil {
 		return fmt.Errorf("list live BBO capture files: %w", err)
+	}
+	if len(tradeFiles) == 0 && len(bookFiles) == 0 {
+		collectorRoot := filepath.Join(s.AggTradeWarmup.Path, s.Symbol)
+		tradeFiles, err = filepath.Glob(filepath.Join(collectorRoot, s.Symbol+"-trades-*.csv"))
+		if err != nil {
+			return fmt.Errorf("list collector trade capture files: %w", err)
+		}
+		bookFiles, err = filepath.Glob(filepath.Join(collectorRoot, s.Symbol+"-bookticker-*.csv"))
+		if err != nil {
+			return fmt.Errorf("list collector BBO capture files: %w", err)
+		}
 	}
 	if len(tradeFiles) == 0 && len(bookFiles) == 0 {
 		return fmt.Errorf("no live capture files for %s under %s", s.Symbol, s.AggTradeWarmup.LivePath)
@@ -288,22 +312,24 @@ func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
 	sort.SliceStable(events, func(i, j int) bool { return events[i].when.Before(events[j].when) })
 	for _, event := range events {
 		if event.trade != nil {
-			s.fastEvidence.ObserveTrade(event.when, *event.trade)
+			s.observeFastEvidenceTrade(event.when, *event.trade)
 		}
 		if event.book != nil {
-			s.fastEvidence.ObserveBBO(event.when, *event.book)
+			s.observeFastEvidenceBBO(event.when, *event.book)
 		}
 	}
-	warmSnapshot := s.fastEvidence.Snapshot(now)
+	warmSnapshot := s.adaptiveFastSnapshot(now)
 	log.WithFields(map[string]interface{}{
-		"symbol":     s.Symbol,
-		"window":     window,
-		"tradeCount": warmSnapshot.TradeCount,
-		"bboCount":   warmSnapshot.BBOCount,
-		"health":     warmSnapshot.Health,
-		"observed":   warmSnapshot.Observed,
-		"tradeFiles": len(tradeFiles),
-		"bookFiles":  len(bookFiles),
+		"symbol":             s.Symbol,
+		"window":             window,
+		"selectedFastWindow": warmSnapshot.Window,
+		"windowHealths":      warmSnapshot.HealthSummary,
+		"tradeCount":         warmSnapshot.Evidence.TradeCount,
+		"bboCount":           warmSnapshot.Evidence.BBOCount,
+		"health":             warmSnapshot.Evidence.Health,
+		"observed":           warmSnapshot.Evidence.Observed,
+		"tradeFiles":         len(tradeFiles),
+		"bookFiles":          len(bookFiles),
 	}).Info("warmed fast evidence from capture")
 	return nil
 }

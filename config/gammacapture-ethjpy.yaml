@@ -1,17 +1,17 @@
 ---
-# Candle-replay configuration. The strategy itself is paper-first and rejects live.
+# Live ETHJPY profile; this backtest block is retained only for explicit replay checks.
 backtest:
   sessions: [binance]
   startTime: "2026-01-01"
   endTime: "2026-07-13"
-  symbols: [SOLJPY]
+  symbols: [ETHJPY]
   accounts:
     binance:
       makerFeeRate: 0.1%
       takerFeeRate: 0.1%
       balances:
         JPY: 1000000
-        SOL: 0
+        ETH: 0
 
 sessions:
   binance:
@@ -36,27 +36,25 @@ exchangeStrategies:
   - on: binance
     gammacapture:
       environment: live
-      symbol: SOLJPY
+      symbol: ETHJPY
       interval: 1m
       symbolSelection:
         mode: allowlist
         quoteAsset: JPY
-        symbols: [SOLJPY]
-        denylist: []
+        symbols: [ETHJPY]
       barrier:
         # Log return barrier: 10 bps. It stays fixed for the epoch.
         width: 0.001
         epochDuration: 30m
         updateOnlyWhenFlat: true
-        # A 1m close cannot reveal the path through multiple barriers; reset
-        # rather than count a multi-bar jump as a chronological sequence.
+        # A sparse/reconnected observation cannot reveal the path through
+        # multiple barriers; reset rather than invent a chronological sequence.
         maxCrossingsPerEvent: 1
       intensity:
-        # Two hours captures the active local regime; minEvents=10 means
+        # Six hours captures the active local regime; minEvents=10 means
         # HEALTHY requires 20 clean crossings in that rolling window.
-        # Live startup warm-up uses the latest completed aggTrade archive; a
-        # longer causal window avoids starting DEGRADED when the last 2h are
-        # unusually quiet.
+        # Live startup replays the local Binance BBO capture; a longer causal
+        # window avoids starting DEGRADED when a shorter interval is quiet.
         window: 6h
         priorAlphaUp: 1
         priorBetaUp: 60
@@ -64,12 +62,14 @@ exchangeStrategies:
         priorBetaDown: 60
         minEvents: 10
       horizon:
+        # Directional/replay horizon; maker quote lifetimes are configured
+        # independently under marketMaker.min/maxTradingWindow.
         prediction: 15m
         maximumHolding: 30m
       referencePrice:
-        # BBGO's standard backtest service replays closed candles only. Paper
-        # mode defaults to ordered lastTrade observations instead.
-        #mode: klineClose
+        # Directional crossings use microprice when BBO is available. Maker
+        # execution-risk estimators separately use ask returns for BUY and bid
+        # returns for SELL.
         mode: microprice
       signal:
         lowerThreshold: 0.40
@@ -89,18 +89,15 @@ exchangeStrategies:
       stopLoss:
         hardStopBarriers: 3
         softStopBarriers: 2
-      # The live maker profile starts cold and learns from the exchange stream.
-      # Archive replay remains decode-compatible but is deliberately disabled:
-      # persisted online sufficient statistics replace historical pre-training.
+      # The maker does not load a frozen/pre-trained model. Startup instead
+      # replays the local Binance BBO/trade capture through the same causal
+      # online learners, then continues from the exchange stream.
       aggTradeWarmup:
         enabled: false
         path: data/gammacapture
         livePath: data/gammacapture/live
-        # Daily Vision files arrive after UTC day close; keep enough history to
-        # warm from the latest completed archive before the live stream catches up.
-        lookback: 72h
-        maxAge: 72h
-        requireHealthy: true
+        # These paths are also the local collector roots used by the BBO/trade
+        # startup replay even though legacy aggregate-trade warmup is disabled.
       # Fee-aware maker quote path. Start with a small notional while live BBO,
       # queue-position, and fill-reconciliation behavior is being validated.
       marketMaker:
@@ -111,8 +108,8 @@ exchangeStrategies:
         # Refresh authenticated balances so external JPY/base changes are
         # reflected in position sizing without restarting BBGO.
         accountSyncInterval: 60s
-        # Runtime uses authenticated session/account fee rates when available;
-        # these values are replay/public-session fallbacks only.
+        # Conservative fee floors: authenticated session/account rates may
+        # raise these values, but cannot lower the configured budget.
         makerFeeBps: 10
         takerFeeBps: 10
         minimumNetEdgeBps: 2
@@ -124,15 +121,15 @@ exchangeStrategies:
         inventoryLimit: 0.02 # fallback only when autoInventoryLimit is false
         autoInventoryLimit: true
         # Dynamic risk budget: 10 JPY is the absolute floor; larger accounts
-        # use 0.25% of current SOLJPY quote-equivalent equity. Quote notional
+        # use 0.25% of current ETHJPY quote-equivalent equity. Quote notional
         # is calculated from realized volatility and crossing load; it is not
         # clamped to a fixed JPY minimum/maximum.
         inventoryRiskBudgetJPY: 10
         inventoryRiskBudgetRatio: 0.0025
         inventoryRiskZScore: 1.645
-        inventoryMaxOrderLevels: 32
+        inventoryMaxOrderLevels: 32 # also divides target-centered band capacity into per-fill tranches
         # Target-centered capital band: risk capacity is a half-width around
-        # 50% SOL / 50% JPY, bounded by the configured minimum reserve and a 100% maximum.
+        # 50% ETH / 50% JPY, bounded by the configured minimum reserve and a 100% maximum.
         # Actual order quantities are additionally capped by remaining headroom.
         inventoryTargetRatio: 0.5 # legacy fallback without pair-equity balances
         inventoryCapitalMinRatio: 0.0
@@ -144,20 +141,20 @@ exchangeStrategies:
         # Reference value used only for risk-budget defaults and inventory-band
         # initialization. Actual order size is statistical and account-bound.
         quoteNotionalJPY: 120
-        # SOLJPY is thin; leave quotes resting and reprice only for material
-        # price/adverse BBO changes. L1 imbalance remains diagnostic telemetry.
+        # ETHJPY is thin; preserve queue age through the modeled keep window.
+        # Ordinary price/imbalance changes remain diagnostic until expiry.
         refreshInterval: 60s
         minRefreshInterval: 20s
-        maxRefreshInterval: 15m
-        # Live evidence selected the 10-minute fallback in every evaluation.
-        # Keep a fixed, explicit window until quote-distance crossing statistics
-        # can support an out-of-sample dynamic-horizon promotion.
+        maxRefreshInterval: 30m
+        # The order-keep model maps the distance/volatility first-passage time
+        # upward to a measured horizon. Ten minutes is the statistical floor;
+        # 10m, 15m, and 30m are independently health- and arrival-gated.
         minTradingWindow: 10m
-        maxTradingWindow: 10m
+        maxTradingWindow: 30m
         horizonLookback: 6h
         horizonUpdateInterval: 1m
         horizonMinSamples: 20
-        # Train every 10/15-minute distance outcome from live BBO only. The
+        # Train every 10/15/30-minute distance outcome from live BBO only. The
         # fast regime adapts intraday; the persisted slow baseline prevents a
         # sparse quote distance from falling off a hard six-hour cliff.
         onlineArrival:
@@ -166,37 +163,34 @@ exchangeStrategies:
           fastHalfLife: 6h
           slowHalfLife: 72h
           persistenceInterval: 10m
-        # Disabled: the existing v1 artifact was trained on midpoint touch
-        # labels. Version 2 requires BUY labels from future ask minima, SELL
-        # labels from future bid maxima, and priceBasis=executable-bbo. The
-        # online-arrival model learns those semantics directly from raw BBO
-        # without pre-training.
-        horizonTouchModel:
-          enabled: false
-          path: config/gammacapture-horizon-touch-soljpy.json
-          historicalWeight: 0.75
-          touchToFillHaircut: 0.25
-          minimumBrierImprovementPct: 5
+          # Reconstruct the rolling models and complete live training before
+          # any order lifecycle starts. Persisted horizon cursors make replay
+          # idempotent across restarts.
+          startupLookback: 72h
+          startupMaxAge: 15m
+          requireStartupHistory: true
+        # No horizonTouchModel block: the live-only online arrival estimator
+        # above is the exclusive fill-rate source.
         refreshMoveBps: 8
         # Reprice a side that has moved materially away from the current BBO
-        # after the minimum resting time; this is directional, not a BBO-tick
-        # cancel loop.
+        # only after its modeled keep window; this is directional, not a
+        # BBO-tick cancel loop. Crossed/missing-side recovery remains faster.
         adverseRepriceBps: 20
-        # Diagnostic threshold only; imbalance no longer triggers cancellation.
-        refreshImbalanceDelta: 0.25
-        # SOLJPY is too sparse for a one-minute crossing horizon to produce a
-        # fee-positive quote. Treat this path as the medium-term (10-minute) quote
-        # model; the six-hour model remains the long-term risk anchor.
-        fastWindow: 10m
-        # Keep raw trade/BBO evidence on the same medium-term horizon so the
-        # crossing and public-evidence samples describe the same regime.
-        fastEvidenceWindow: 10m
+        # Maintain all candidate crossing, public-evidence, and direction models
+        # continuously. Select the shortest HEALTHY window; a longer healthy
+        # window takes over immediately when a shorter one degrades.
+        fastWindows: [10m, 15m, 30m]
         # Observational raw trade/BBO coverage thresholds. These do not
         # override crossing health or prove fee-adjusted profitability.
         fastEvidenceMinTrades: 20
         fastEvidenceMinBBOUpdates: 20
-        directionSkewBps: 10
-        imbalanceSkewBps: 10
+        # Public-flow agreement is an auxiliary input for ETHJPY. A conflict
+        # suppresses only the volume component; inventory/direction gates remain.
+        ofiVolumeAgreement:
+          enabled: true
+          minOFI: 0.10
+          minVolume: 0.10
+          suppressOnDisagreement: true
         inventoryReset:
           enabled: true
           maxAskAge: 3m
@@ -233,7 +227,7 @@ exchangeStrategies:
           # the selected causal start pattern in logs, but do not authorize an
           # IOC until additional shadow outcomes narrow its holdout interval.
           shadowStartEnabled: true
-          # Live buy thresholds are generated from best-ask return variance.
+          # Live return thresholds are generated from executable ask variance.
           # These fixed BPS fallbacks remain zero so missing calibration fails
           # closed instead of silently reverting to an old market regime.
           startReturn1mMinBps: 0
@@ -241,7 +235,7 @@ exchangeStrategies:
           startReturnTailProbability: 0.10
           startMinimumTrades5m: 10
           # A positive endpoint alone is not a confirmed breakout. Estimate
-          # five-minute best-ask variance from one-second BBO samples and use
+          # five-minute ask variance from one-second BBO samples and use
           # the Brownian maximum-drawdown quantile implied by a 10% tail. This
           # produces a live BPS limit instead of a fixed, uncalibrated number.
           startMinimumBBO5m: 20
@@ -253,7 +247,7 @@ exchangeStrategies:
           # reset this causal deficit clock.
           minDeficitAge: 10m
           # The live adverse-move gate is the same five-minute upper-tail move
-          # generated from BBO best-ask variance; zero disables the legacy BPS
+          # generated from executable ask variance; zero disables the legacy BPS
           # fallback so unavailable calibration fails closed.
           adverseMoveBps: 0
           maxSlippageBps: 5
@@ -275,18 +269,16 @@ exchangeStrategies:
           minimumImprovementBps: 2
 
         earlyBump:
-          # The Jul-23..29 causal event study found that a >=7-bps rebound
-          # after a >=15-bps five-minute drawdown preceded the +10-bps barrier
-          # before the -10-bps barrier in 21/45 observations. The <1-bps
-          # rebound baseline was 45/255. Their two-sided 95% Wilson intervals
-          # did not overlap (activation lower 32.9%, baseline upper 22.8%).
-          #
-          # These observations selected the model and are not an untouched
-          # production test, so run the complete state machine in shadow first.
-          # Shadow mode logs the hypothetical locked bid but cannot amend it.
+          # The original Jul-23..29 study used a five-minute drawdown. Live
+          # shadow detection now measures drawdown over the adaptive selected
+          # 10/15/30-minute evidence window so a slow decline cannot lose its
+          # causal high before the 30-second rebound confirms. The old 21/45
+          # versus 45/255 Wilson counts remain development evidence only; the
+          # selected-window trigger stays shadow-only until new per-window
+          # outcomes are calibrated out of sample.
           enabled: true
           shadowOnly: true
-          minimumDrawdown5mBps: 15
+          minimumDrawdownBps: 15
           minimumRebound30sBps: 7
           exitRebound30sBps: 3.5
           # The missed Jul-29 low was 6.7 bps above the resting bid. The
@@ -300,7 +292,7 @@ exchangeStrategies:
           minimumSamples: 30
           confidenceZScore: 1.959963984540054
           minimumProbabilityLift: 0
-          minimumBBO5m: 20
+          minimumBBO: 20
           lockDuration: 30s
           cooldown: 2m
       risk:

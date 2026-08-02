@@ -364,3 +364,40 @@ func TestBacktestRuntimeStateIsReset(t *testing.T) {
 	require.Zero(t, s.GateStats.Entries)
 	require.True(t, s.Position.GetBase().IsZero())
 }
+
+func TestIntensityModelTracksObservationExposureWithoutCrossings(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	model := NewIntensityModel(IntensityConfig{
+		Window:       types.Duration(6 * time.Hour),
+		PriorAlphaUp: 1, PriorBetaUp: 60,
+		PriorAlphaDown: 1, PriorBetaDown: 60,
+		MinEvents: 10,
+	})
+	for offset := 8 * time.Hour; offset >= 0; offset -= 2 * time.Hour {
+		model.Observe(now.Add(-offset), false)
+	}
+
+	got := model.Snapshot(now)
+	if got.Observed != 6*time.Hour {
+		t.Fatalf("observation exposure should cap at configured window: %+v", got)
+	}
+	wantTotal := 2.0 / (60.0 + (6 * time.Hour).Seconds())
+	if math.Abs(got.Total-wantTotal) > 1e-12 {
+		t.Fatalf("zero-crossing posterior must use observed market-data exposure: got=%g want=%g", got.Total, wantTotal)
+	}
+	if got.Health != HealthInsufficient {
+		t.Fatalf("activity health remains count-based: %+v", got)
+	}
+}
+
+func TestIntensityModelGapResetsObservationExposure(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	model := NewIntensityModel(IntensityConfig{Window: types.Duration(30 * time.Minute)})
+	model.Observe(now.Add(-20*time.Minute), false)
+	model.Observe(now.Add(-10*time.Minute), true)
+	model.Observe(now, false)
+
+	if got := model.Snapshot(now).Observed; got != 10*time.Minute {
+		t.Fatalf("post-gap exposure mismatch: got=%s want=10m", got)
+	}
+}

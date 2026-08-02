@@ -20,6 +20,7 @@ func TestUpdateMarketMakerModelConsumesBookTickerEvents(t *testing.T) {
 			PriorBetaDown:  60,
 			MinEvents:      1,
 		}),
+		makerDirectionModel: NewDecayedDirectionModel(10 * time.Minute),
 	}
 	now := time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC)
 	ticker := types.BookTicker{
@@ -36,5 +37,28 @@ func TestUpdateMarketMakerModelConsumesBookTickerEvents(t *testing.T) {
 	}
 	if s.State.LastReferenceTime != now.Add(time.Second) {
 		t.Fatalf("model reference timestamp was not advanced: %s", s.State.LastReferenceTime)
+	}
+	if got := s.makerDirectionModel.Snapshot(now.Add(time.Second)); got.PosteriorDirection <= 0 {
+		t.Fatalf("live crossing did not advance direction posterior: %+v", got)
+	}
+}
+
+func TestMakerSubmittedSidePricesDoesNotCreatePhantomSide(t *testing.T) {
+	askOnly := []types.SubmitOrder{{Side: types.SideTypeSell, Price: fixedpoint.NewFromInt(307_788)}}
+	bid, ask := makerSubmittedSidePrices(askOnly)
+	if bid.Sign() != 0 {
+		t.Fatalf("ask-only submission created phantom bid %s", bid)
+	}
+	if ask.Compare(fixedpoint.NewFromInt(307_788)) != 0 {
+		t.Fatalf("ask-only submission lost actual ask price: %s", ask)
+	}
+
+	bidOnly := []types.SubmitOrder{{Side: types.SideTypeBuy, Price: fixedpoint.NewFromInt(295_000)}}
+	bid, ask = makerSubmittedSidePrices(bidOnly)
+	if ask.Sign() != 0 {
+		t.Fatalf("bid-only submission created phantom ask %s", ask)
+	}
+	if bid.Compare(fixedpoint.NewFromInt(295_000)) != 0 {
+		t.Fatalf("bid-only submission lost actual bid price: %s", bid)
 	}
 }

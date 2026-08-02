@@ -29,13 +29,57 @@ type CrossingModel interface {
 }
 
 type IntensityModel struct {
-	cfg    IntensityConfig
-	events []CrossingEvent
-	last   time.Time
+	cfg             IntensityConfig
+	events          []CrossingEvent
+	last            time.Time
+	observed        time.Duration
+	lastObservation time.Time
 }
 
 func NewIntensityModel(cfg IntensityConfig) *IntensityModel { return &IntensityModel{cfg: cfg} }
+func (m *IntensityModel) Observe(at time.Time, gapBefore bool) {
+	if m == nil || at.IsZero() {
+		return
+	}
+	window := time.Duration(m.cfg.Window)
+	if gapBefore || m.lastObservation.IsZero() || at.Before(m.lastObservation) {
+		if gapBefore || at.Before(m.lastObservation) {
+			m.observed = 0
+		}
+		m.lastObservation = at
+		return
+	}
+	delta := at.Sub(m.lastObservation)
+	if window > 0 && delta >= window {
+		m.observed = 0
+	} else {
+		m.observed += delta
+		if window > 0 && m.observed > window {
+			m.observed = window
+		}
+	}
+	m.lastObservation = at
+}
+
+func (m *IntensityModel) observedDuration(now time.Time) time.Duration {
+	if m == nil || m.lastObservation.IsZero() || now.Before(m.lastObservation) {
+		return 0
+	}
+	window := time.Duration(m.cfg.Window)
+	observed := m.observed
+	tail := now.Sub(m.lastObservation)
+	if window > 0 && tail >= window {
+		return 0
+	}
+	observed += tail
+	if window > 0 && observed > window {
+		observed = window
+	}
+	return observed
+}
+
 func (m *IntensityModel) Update(e CrossingEvent) {
+	m.Observe(e.ExchangeTime, false)
 	m.events = append(m.events, e)
 	m.last = e.ExchangeTime
 	m.trim(e.ExchangeTime)
@@ -54,13 +98,9 @@ func (m *IntensityModel) trim(now time.Time) {
 func (m *IntensityModel) Snapshot(now time.Time) ModelSnapshot {
 	m.trim(now)
 	var up, down int
-	var first time.Time
 	for _, e := range m.events {
 		if e.GapAffected {
 			continue
-		}
-		if first.IsZero() {
-			first = e.ExchangeTime
 		}
 		if e.Direction == DirectionUp {
 			up++
@@ -68,10 +108,7 @@ func (m *IntensityModel) Snapshot(now time.Time) ModelSnapshot {
 			down++
 		}
 	}
-	d := time.Duration(m.cfg.Window)
-	if !first.IsZero() && now.Sub(first) < d {
-		d = now.Sub(first)
-	}
+	d := m.observedDuration(now)
 	seconds := d.Seconds()
 	if seconds < 1 {
 		seconds = 1

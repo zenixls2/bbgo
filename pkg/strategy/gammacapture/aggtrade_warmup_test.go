@@ -42,6 +42,7 @@ func TestWarmModelFromAggTrades(t *testing.T) {
 		State: &State{Engine: NewCrossingEngine(.001, 0, 1)},
 	}
 	s.model = NewIntensityModel(s.Intensity)
+	s.makerDirectionModel = NewDecayedDirectionModel(10 * time.Minute)
 	if err := s.warmModelFromAggTrades(start.Add(50 * time.Minute)); err != nil {
 		t.Fatalf("warmup failed: %v", err)
 	}
@@ -50,6 +51,9 @@ func TestWarmModelFromAggTrades(t *testing.T) {
 	}
 	if len(s.makerHorizonModel.points) == 0 || s.makerHorizonModel.EmpiricalVolatilityFloor(start.Add(50*time.Minute), 2*time.Hour) <= 0 {
 		t.Fatalf("public aggregate-trade warmup did not seed maker horizon statistics: points=%d", len(s.makerHorizonModel.points))
+	}
+	if got := s.makerDirectionModel.Snapshot(start.Add(50 * time.Minute)); got.EffectiveSamples <= 0 {
+		t.Fatalf("public aggregate-trade warmup did not seed direction posterior: %+v", got)
 	}
 }
 

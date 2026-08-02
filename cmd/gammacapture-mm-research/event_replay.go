@@ -28,33 +28,88 @@ type replayOrder struct {
 	queueAhead float64
 }
 
+type replayInventoryBand struct {
+	min, target, max float64
+}
+
+func prepareReplayInventory(cfg gammacapture.MarketMakerConfig) (gammacapture.MarketMakerConfig, replayInventoryBand) {
+	band := replayInventoryBand{min: 0, target: cfg.InventoryTarget, max: cfg.InventoryLimit}
+	if band.max <= band.min {
+		band.max = band.min + 1
+	}
+	band.target = math.Max(band.min, math.Min(band.max, band.target))
+	quoteCfg := cfg
+	quoteCfg.InventoryTarget = band.target
+	quoteCfg.InventoryLimit = math.Max(band.target-band.min, band.max-band.target)
+	if quoteCfg.InventoryLimit <= 0 {
+		quoteCfg.InventoryLimit = band.max - band.min
+	}
+	return quoteCfg, band
+}
+
+func prepareReplayOrder(side types.SideType, plan gammacapture.MarketMakerQuotePlan, book bboSnapshot, inventory, quote, minOrderNotional float64, band replayInventoryBand) replayOrder {
+	var price, plannedNotional, availableNotional, queueAhead float64
+	switch side {
+	case types.SideTypeBuy:
+		price = plan.BidPrice
+		plannedNotional = plan.BidQuoteNotional
+		availableNotional = math.Min(quote, math.Max(0, band.max-inventory)*price)
+		queueAhead = book.bidSize
+	case types.SideTypeSell:
+		price = plan.AskPrice
+		plannedNotional = plan.AskQuoteNotional
+		availableNotional = math.Max(0, inventory-band.min) * price
+		queueAhead = book.askSize
+	default:
+		return replayOrder{}
+	}
+	notional := math.Min(plannedNotional, availableNotional)
+	if price <= 0 || notional < minOrderNotional {
+		return replayOrder{}
+	}
+	return replayOrder{active: true, side: side, price: price, quantity: notional / price, queueAhead: queueAhead}
+}
+
 type tickerStats struct {
-	Symbol                         string                  `json:"symbol"`
-	TradeEvents                    int                     `json:"tradeEvents"`
-	BBOEvents                      int                     `json:"bboEvents"`
-	TradeCoverageHours             float64                 `json:"tradeCoverageHours"`
-	BBOCoverageHours               float64                 `json:"bboCoverageHours"`
-	TradesPerHour                  float64                 `json:"tradesPerHour"`
-	BuyTradeFraction               float64                 `json:"buyTradeFraction"`
-	MedianSpreadBps                float64                 `json:"medianSpreadBps"`
-	P95SpreadBps                   float64                 `json:"p95SpreadBps"`
-	MedianBidDepth                 float64                 `json:"medianBidDepth"`
-	MedianAskDepth                 float64                 `json:"medianAskDepth"`
-	RealizedOneMinuteVolatilityBps float64                 `json:"realizedOneMinuteVolatilityBps"`
-	MakerFeeBps                    float64                 `json:"makerFeeBps"`
-	RoundTripFeeBps                float64                 `json:"roundTripFeeBps"`
-	P95GrossBBOEdgeAfterFeesBps    float64                 `json:"p95GrossBBOEdgeAfterFeesBps"`
-	BBOAboveRoundTripFeeFraction   float64                 `json:"bboAboveRoundTripFeeFraction"`
-	UpCrosses                      int                     `json:"upCrosses"`
-	DownCrosses                    int                     `json:"downCrosses"`
-	UpCrossesPerHour               float64                 `json:"upCrossesPerHour"`
-	DownCrossesPerHour             float64                 `json:"downCrossesPerHour"`
-	TwoSidedOpportunityPerHour     float64                 `json:"twoSidedOpportunityPerHour"`
-	StatisticallyUsable            bool                    `json:"statisticallyUsable"`
-	UsabilityReason                string                  `json:"usabilityReason"`
-	HorizonExcursions              []horizonExcursionStats `json:"horizonExcursions"`
-	SelectedHorizonMinutes         int                     `json:"selectedHorizonMinutes"`
-	SelectedHorizonScoreBpsPerHour float64                 `json:"selectedHorizonScoreBpsPerHour"`
+	Symbol                         string                   `json:"symbol"`
+	TradeEvents                    int                      `json:"tradeEvents"`
+	BBOEvents                      int                      `json:"bboEvents"`
+	TradeCoverageHours             float64                  `json:"tradeCoverageHours"`
+	BBOCoverageHours               float64                  `json:"bboCoverageHours"`
+	TradesPerHour                  float64                  `json:"tradesPerHour"`
+	BuyTradeFraction               float64                  `json:"buyTradeFraction"`
+	MedianSpreadBps                float64                  `json:"medianSpreadBps"`
+	P95SpreadBps                   float64                  `json:"p95SpreadBps"`
+	MedianBidDepth                 float64                  `json:"medianBidDepth"`
+	MedianAskDepth                 float64                  `json:"medianAskDepth"`
+	RealizedOneMinuteVolatilityBps float64                  `json:"realizedOneMinuteVolatilityBps"`
+	HorizonVolatility              []horizonVolatilityStats `json:"horizonVolatility"`
+	MakerFeeBps                    float64                  `json:"makerFeeBps"`
+	RoundTripFeeBps                float64                  `json:"roundTripFeeBps"`
+	P95GrossBBOEdgeAfterFeesBps    float64                  `json:"p95GrossBBOEdgeAfterFeesBps"`
+	BBOAboveRoundTripFeeFraction   float64                  `json:"bboAboveRoundTripFeeFraction"`
+	UpCrosses                      int                      `json:"upCrosses"`
+	DownCrosses                    int                      `json:"downCrosses"`
+	UpCrossesPerHour               float64                  `json:"upCrossesPerHour"`
+	DownCrossesPerHour             float64                  `json:"downCrossesPerHour"`
+	TwoSidedOpportunityPerHour     float64                  `json:"twoSidedOpportunityPerHour"`
+	StatisticallyUsable            bool                     `json:"statisticallyUsable"`
+	UsabilityReason                string                   `json:"usabilityReason"`
+	HorizonExcursions              []horizonExcursionStats  `json:"horizonExcursions"`
+	SelectedHorizonMinutes         int                      `json:"selectedHorizonMinutes"`
+	SelectedHorizonScoreBpsPerHour float64                  `json:"selectedHorizonScoreBpsPerHour"`
+}
+
+// horizonVolatilityStats uses non-overlapping, UTC-aligned BBO-mid closes.
+// This keeps the volatility clock consistent with the quote horizon and avoids
+// treating highly overlapping forward returns as independent observations.
+type horizonVolatilityStats struct {
+	HorizonMinutes       int     `json:"horizonMinutes"`
+	Samples              int     `json:"samples"`
+	MeanReturnBps        float64 `json:"meanReturnBps"`
+	RMSReturnBps         float64 `json:"rmsReturnBps"`
+	StandardDeviationBps float64 `json:"standardDeviationBps"`
+	P95AbsoluteReturnBps float64 `json:"p95AbsoluteReturnBps"`
 }
 
 // horizonExcursionStats measures how far the BBO mid moves after a quote is
@@ -123,7 +178,10 @@ func summarizeTicker(trades []tick, bbo []bboSnapshot, quoteDistanceBps, makerFe
 	}
 	s.MedianBidDepth = percentile(bidDepths, 0.50)
 	s.MedianAskDepth = percentile(askDepths, 0.50)
+	s.HorizonVolatility = summarizeHorizonVolatility(bbo, []int{15, 30})
 
+	// Keep one-minute volatility as a short-scale diagnostic only. Quote-model
+	// calibration and comparisons use the horizon-matched BBO values above.
 	// Use one-minute closes from the captured aggregate trades for a causal
 	// realized-volatility estimate, rather than treating every trade as an
 	// independent return.
@@ -152,41 +210,28 @@ func summarizeTicker(trades []tick, bbo []bboSnapshot, quoteDistanceBps, makerFe
 		}
 	}
 
-	// Count aggressive trade crossings relative to the selected quote distance
-	// using the latest BBO snapshot. This is a ticker-specific opportunity rate,
-	// not a claim that our order would have filled at that price.
-	bi := 0
-	for _, trade := range trades {
-		for bi+1 < len(bbo) && !bbo[bi+1].time.After(trade.time) {
-			bi++
-		}
-		if len(bbo) == 0 || bbo[bi].time.After(trade.time) {
+	// Crossing health is a path property over the quote horizon. Comparing an
+	// aggressive trade with the contemporaneous mid only measures an anomalous
+	// execution price and misses ordinary BBO travel to a resting quote.
+	s.HorizonExcursions = summarizeHorizonExcursions(bbo, quoteDistanceBps)
+	s.SelectedHorizonMinutes, s.SelectedHorizonScoreBpsPerHour = selectBestHorizon(s.HorizonExcursions, quoteDistanceBps, s.RoundTripFeeBps)
+	for _, horizon := range s.HorizonExcursions {
+		if horizon.HorizonMinutes != s.SelectedHorizonMinutes {
 			continue
 		}
-		mid := (bbo[bi].bid + bbo[bi].ask) / 2
-		if trade.side == types.SideTypeBuy && trade.price >= mid*math.Exp(quoteDistanceBps/10_000) {
-			s.UpCrosses++
-		} else if trade.side == types.SideTypeSell && trade.price <= mid*math.Exp(-quoteDistanceBps/10_000) {
-			s.DownCrosses++
-		}
-	}
-	overlapHours := s.BBOCoverageHours
-	if overlapHours <= 0 {
-		overlapHours = s.TradeCoverageHours
-	}
-	if overlapHours > 0 {
-		s.UpCrossesPerHour = float64(s.UpCrosses) / overlapHours
-		s.DownCrossesPerHour = float64(s.DownCrosses) / overlapHours
-		s.TwoSidedOpportunityPerHour = math.Min(s.UpCrossesPerHour, s.DownCrossesPerHour)
+		s.UpCrosses = horizon.UpCrosses
+		s.DownCrosses = horizon.DownCrosses
+		s.UpCrossesPerHour = horizon.UpCrossesPerHour
+		s.DownCrossesPerHour = horizon.DownCrossesPerHour
+		s.TwoSidedOpportunityPerHour = math.Min(horizon.UpCrossesPerHour, horizon.DownCrossesPerHour)
+		break
 	}
 	s.StatisticallyUsable = s.BBOCoverageHours >= 24 && s.TradeEvents >= 10_000 && s.UpCrosses >= 50 && s.DownCrosses >= 50
 	if s.StatisticallyUsable {
-		s.UsabilityReason = "at least 24h BBO, 10k trades, and 50 crossings per side"
+		s.UsabilityReason = "at least 24h BBO, 10k trades, and 50 horizon-path crossings per side"
 	} else {
-		s.UsabilityReason = "need >=24h BBO, >=10k trades, and >=50 up/down crossings"
+		s.UsabilityReason = "need >=24h BBO, >=10k trades, and >=50 horizon-path crossings per side"
 	}
-	s.HorizonExcursions = summarizeHorizonExcursions(bbo, quoteDistanceBps)
-	s.SelectedHorizonMinutes, s.SelectedHorizonScoreBpsPerHour = selectBestHorizon(s.HorizonExcursions, quoteDistanceBps, s.RoundTripFeeBps)
 	return s
 }
 
@@ -195,7 +240,7 @@ func selectBestHorizon(stats []horizonExcursionStats, quoteDistanceBps, roundTri
 	bestScore := 0.0
 	netEdge := math.Max(0, 2*quoteDistanceBps-roundTripFeeBps)
 	for _, stat := range stats {
-		if stat.HorizonMinutes < 5 {
+		if stat.HorizonMinutes < 10 {
 			continue
 		}
 		score := math.Min(stat.UpCrossesPerHour, stat.DownCrossesPerHour) * netEdge
@@ -211,7 +256,11 @@ func summarizeHorizonExcursions(bbo []bboSnapshot, quoteDistanceBps float64) []h
 	if len(bbo) < 2 || quoteDistanceBps <= 0 {
 		return nil
 	}
-	horizons := []int{1, 3, 5, 10, 15}
+	horizons := []int{1, 3, 5, 10, 15, 30}
+	mids := make([]float64, len(bbo))
+	for i, book := range bbo {
+		mids[i] = (book.bid + book.ask) / 2
+	}
 	out := make([]horizonExcursionStats, 0, len(horizons))
 	for _, minutes := range horizons {
 		window := time.Duration(minutes) * time.Minute
@@ -220,50 +269,53 @@ func summarizeHorizonExcursions(bbo []bboSnapshot, quoteDistanceBps float64) []h
 		var upTimes, downTimes []time.Time
 		upCrosses, downCrosses, twoSided := 0, 0, 0
 		var lastUpEvent, lastDownEvent time.Time
-		j := 1
+
+		// Maintain the maximum and minimum future midpoint in O(n) for each
+		// horizon. The previous nested scan was O(n * events-in-window), which
+		// becomes prohibitive when adding a 30-minute BBO window.
+		maxDeque := make([]int, 0, len(bbo))
+		minDeque := make([]int, 0, len(bbo))
+		right := 0
 		for i := 0; i < len(bbo); i++ {
-			if j <= i {
-				j = i + 1
-			}
-			for j < len(bbo) && bbo[j].time.Sub(bbo[i].time) <= window {
-				j++
-			}
-			if j <= i+1 {
-				continue
-			}
-			mid := (bbo[i].bid + bbo[i].ask) / 2
-			if mid <= 0 {
-				continue
-			}
-			maxMid, minMid := mid, mid
-			for k := i + 1; k < j; k++ {
-				futureMid := (bbo[k].bid + bbo[k].ask) / 2
-				if futureMid > maxMid {
-					maxMid = futureMid
+			end := bbo[i].time.Add(window)
+			for right < len(bbo) && !bbo[right].time.After(end) {
+				for len(maxDeque) > 0 && mids[maxDeque[len(maxDeque)-1]] <= mids[right] {
+					maxDeque = maxDeque[:len(maxDeque)-1]
 				}
-				if futureMid < minMid {
-					minMid = futureMid
+				maxDeque = append(maxDeque, right)
+				for len(minDeque) > 0 && mids[minDeque[len(minDeque)-1]] >= mids[right] {
+					minDeque = minDeque[:len(minDeque)-1]
+				}
+				minDeque = append(minDeque, right)
+				right++
+			}
+			if right > i+1 && mids[i] > 0 {
+				up := math.Log(mids[maxDeque[0]]/mids[i]) * 10_000
+				down := math.Log(mids[i]/mids[minDeque[0]]) * 10_000
+				ups = append(ups, up)
+				downs = append(downs, down)
+				upHit, downHit := up >= quoteDistanceBps, down >= quoteDistanceBps
+				upEvent := upHit && (lastUpEvent.IsZero() || bbo[i].time.Sub(lastUpEvent) >= window)
+				downEvent := downHit && (lastDownEvent.IsZero() || bbo[i].time.Sub(lastDownEvent) >= window)
+				if upEvent {
+					upCrosses++
+					upTimes = append(upTimes, bbo[i].time)
+					lastUpEvent = bbo[i].time
+				}
+				if downEvent {
+					downCrosses++
+					downTimes = append(downTimes, bbo[i].time)
+					lastDownEvent = bbo[i].time
+				}
+				if upEvent && downEvent {
+					twoSided++
 				}
 			}
-			up := math.Log(maxMid/mid) * 10_000
-			down := math.Log(mid/minMid) * 10_000
-			ups = append(ups, up)
-			downs = append(downs, down)
-			upHit, downHit := up >= quoteDistanceBps, down >= quoteDistanceBps
-			upEvent := upHit && (lastUpEvent.IsZero() || bbo[i].time.Sub(lastUpEvent) >= window)
-			downEvent := downHit && (lastDownEvent.IsZero() || bbo[i].time.Sub(lastDownEvent) >= window)
-			if upEvent {
-				upCrosses++
-				upTimes = append(upTimes, bbo[i].time)
-				lastUpEvent = bbo[i].time
+			if len(maxDeque) > 0 && maxDeque[0] == i {
+				maxDeque = maxDeque[1:]
 			}
-			if downEvent {
-				downCrosses++
-				downTimes = append(downTimes, bbo[i].time)
-				lastDownEvent = bbo[i].time
-			}
-			if upEvent && downEvent {
-				twoSided++
+			if len(minDeque) > 0 && minDeque[0] == i {
+				minDeque = minDeque[1:]
 			}
 		}
 		s := horizonExcursionStats{HorizonMinutes: minutes, Samples: len(ups), UpCrosses: upCrosses, DownCrosses: downCrosses}
@@ -283,6 +335,62 @@ func summarizeHorizonExcursions(bbo []bboSnapshot, quoteDistanceBps float64) []h
 			s.TwoSidedCrossFraction = float64(twoSided) / float64(len(ups))
 		}
 		out = append(out, s)
+	}
+	return out
+}
+
+func summarizeHorizonVolatility(bbo []bboSnapshot, horizons []int) []horizonVolatilityStats {
+	out := make([]horizonVolatilityStats, 0, len(horizons))
+	for _, minutes := range horizons {
+		stat := horizonVolatilityStats{HorizonMinutes: minutes}
+		if minutes <= 0 || len(bbo) < 2 {
+			out = append(out, stat)
+			continue
+		}
+		window := time.Duration(minutes) * time.Minute
+		closes := make(map[time.Time]float64)
+		var buckets []time.Time
+		for _, book := range bbo {
+			mid := (book.bid + book.ask) / 2
+			if mid <= 0 {
+				continue
+			}
+			bucket := book.time.Truncate(window)
+			if _, exists := closes[bucket]; !exists {
+				buckets = append(buckets, bucket)
+			}
+			closes[bucket] = mid
+		}
+		sort.Slice(buckets, func(i, j int) bool { return buckets[i].Before(buckets[j]) })
+		returns := make([]float64, 0, len(buckets)-1)
+		for i := 1; i < len(buckets); i++ {
+			if buckets[i].Sub(buckets[i-1]) != window {
+				continue
+			}
+			returns = append(returns, math.Log(closes[buckets[i]]/closes[buckets[i-1]])*10_000)
+		}
+		stat.Samples = len(returns)
+		if len(returns) > 0 {
+			absolute := make([]float64, 0, len(returns))
+			var sum, sumSquares float64
+			for _, r := range returns {
+				sum += r
+				sumSquares += r * r
+				absolute = append(absolute, math.Abs(r))
+			}
+			stat.MeanReturnBps = sum / float64(len(returns))
+			stat.RMSReturnBps = math.Sqrt(sumSquares / float64(len(returns)))
+			if len(returns) > 1 {
+				var squaredDeviations float64
+				for _, r := range returns {
+					delta := r - stat.MeanReturnBps
+					squaredDeviations += delta * delta
+				}
+				stat.StandardDeviationBps = math.Sqrt(squaredDeviations / float64(len(returns)-1))
+			}
+			stat.P95AbsoluteReturnBps = percentile(absolute, 0.95)
+		}
+		out = append(out, stat)
 	}
 	return out
 }
@@ -370,6 +478,7 @@ func readLiveTrades(path, symbol string, from, to time.Time) []tick {
 			if parseErr != nil || when.Before(from) || !when.Before(to) {
 				continue
 			}
+			tradeID, _ := strconv.ParseUint(row[2], 10, 64)
 			price, e1 := strconv.ParseFloat(row[3], 64)
 			quantity, e2 := strconv.ParseFloat(row[4], 64)
 			if e1 != nil || e2 != nil || price <= 0 || quantity <= 0 {
@@ -379,7 +488,7 @@ func readLiveTrades(path, symbol string, from, to time.Time) []tick {
 			if sideErr != nil {
 				continue
 			}
-			out = append(out, tick{time: when, price: price, size: quantity, side: side})
+			out = append(out, tick{id: tradeID, time: when, price: price, size: quantity, side: side})
 		}
 		_ = file.Close()
 	}
@@ -395,11 +504,12 @@ func simulateEventReplay(trades []tick, bbo []bboSnapshot, cfg gammacapture.Mark
 	if len(trades) == 0 || len(bbo) == 0 {
 		return result{SyntheticFillModel: "historical_bbo_aggtrade_market_maker_event_replay", DataQuality: "no-overlap"}
 	}
+	quoteCfg, inventoryBand := prepareReplayInventory(cfg)
 	quote := startingQuote
-	inventory := cfg.InventoryLimit / 2
+	inventory := inventoryBand.target
 	initialEquity := quote + inventory*bbo[0].bid
-	var fees, maxInventory float64
-	var fills, buys, sells, observations, quoteActive, quoteRefreshes int
+	fees, maxInventory := 0.0, math.Abs(inventory)
+	var fills, buys, sells, executionEvents, partialFillEvents, observations, quoteActive, quoteRefreshes int
 	var bidOrder, askOrder replayOrder
 	var current bboSnapshot
 	var lastQuote time.Time
@@ -438,14 +548,28 @@ func simulateEventReplay(trades []tick, bbo []bboSnapshot, cfg gammacapture.Mark
 			if totalSeconds > 0 {
 				volatility = math.Sqrt(sumSquares / totalSeconds)
 			}
-			plan := cfg.Quote(gammacapture.MarketMakerQuoteInput{
+			selectedHorizon := time.Duration(quoteCfg.MinTradingWindow)
+			keepDecision := quoteCfg.DynamicOrderKeepDecision(selectedHorizon,
+				quoteCfg.OrderKeepDistanceBps(quoteCfg.HalfSpreadForHorizon(selectedHorizon, volatility)), volatility)
+			for i := 0; i < 3; i++ {
+				distance := quoteCfg.OrderKeepDistanceBps(quoteCfg.HalfSpreadForHorizon(keepDecision.Duration, volatility))
+				next := quoteCfg.DynamicOrderKeepDecision(selectedHorizon, distance, volatility)
+				if next.Duration == keepDecision.Duration {
+					keepDecision = next
+					break
+				}
+				keepDecision = next
+			}
+			plan := quoteCfg.Quote(gammacapture.MarketMakerQuoteInput{
 				MidPrice: mid, BestBid: current.bid, BestAsk: current.ask,
-				// volatility is bps/sqrt(second); Quote converts it into an
-				// expected move over the distance-dependent quote lifetime.
-				VolatilityPerSqrtSec: volatility,
-				Inventory:            inventory,
-				CanBuy:               quote >= cfg.QuoteNotional,
-				CanSell:              inventory*mid >= minOrderNotional,
+				// Volatility and queue lifetime use the same first-passage
+				// horizon, matching the live strategy.
+				VolatilityPerSqrtSec:  volatility,
+				TradingHorizonSeconds: keepDecision.Duration.Seconds(),
+				Inventory:             inventory, InventoryMin: inventoryBand.min, InventoryMax: inventoryBand.max,
+				QuoteNotionalBase: cfg.QuoteNotional,
+				CanBuy:            quote >= minOrderNotional && inventory < inventoryBand.max,
+				CanSell:           (inventory-inventoryBand.min)*mid >= minOrderNotional,
 			})
 			if plan.Reason == "quoted" {
 				quotedHalfSpreadSum += plan.HalfSpreadBps
@@ -454,7 +578,8 @@ func simulateEventReplay(trades []tick, bbo []bboSnapshot, cfg gammacapture.Mark
 					maxQuotedHalfSpread = plan.HalfSpreadBps
 				}
 			}
-			minRefresh, maxRefresh := cfg.RefreshIntervals(plan.HalfSpreadBps, volatility)
+			minRefresh, _ := quoteCfg.RefreshIntervals(plan.HalfSpreadBps, volatility)
+			orderKeepDuration := keepDecision.Duration
 			quoteCrossed := (bidOrder.active && bidOrder.price >= current.ask) || (askOrder.active && askOrder.price <= current.bid)
 			shouldRefresh := lastQuote.IsZero()
 			if !shouldRefresh {
@@ -463,7 +588,7 @@ func simulateEventReplay(trades []tick, bbo []bboSnapshot, cfg gammacapture.Mark
 				// quote earns its queue priority until it crosses the BBO or
 				// reaches its distance-derived horizon.
 				missingSide := (plan.AllowBid && !bidOrder.active) || (plan.AllowAsk && !askOrder.active)
-				shouldRefresh = elapsed >= minRefresh && (quoteCrossed || missingSide || elapsed >= maxRefresh)
+				shouldRefresh = elapsed >= minRefresh && (quoteCrossed || missingSide || elapsed >= orderKeepDuration)
 			}
 			if shouldRefresh {
 				if !lastQuote.IsZero() {
@@ -473,10 +598,10 @@ func simulateEventReplay(trades []tick, bbo []bboSnapshot, cfg gammacapture.Mark
 				bidOrder = replayOrder{}
 				askOrder = replayOrder{}
 				if plan.AllowBid {
-					bidOrder = replayOrder{active: true, side: types.SideTypeBuy, price: plan.BidPrice, quantity: cfg.QuoteNotional / plan.BidPrice, queueAhead: current.bidSize}
+					bidOrder = prepareReplayOrder(types.SideTypeBuy, plan, current, inventory, quote, minOrderNotional, inventoryBand)
 				}
 				if plan.AllowAsk {
-					askOrder = replayOrder{active: true, side: types.SideTypeSell, price: plan.AskPrice, quantity: math.Min(cfg.QuoteNotional/plan.AskPrice, inventory), queueAhead: current.askSize}
+					askOrder = prepareReplayOrder(types.SideTypeSell, plan, current, inventory, quote, minOrderNotional, inventoryBand)
 				}
 				lastQuote = current.time
 			}
@@ -489,25 +614,33 @@ func simulateEventReplay(trades []tick, bbo []bboSnapshot, cfg gammacapture.Mark
 		trade := trades[ti]
 		ti++
 		if askOrder.active && trade.side == types.SideTypeBuy && trade.price >= askOrder.price {
-			fill := consumeQueue(&askOrder, trade.size)
+			fill, completed := consumeQueue(&askOrder, trade.size)
 			if fill > 0 {
-				askOrder.active = false
 				inventory -= fill
 				quote += fill * askOrder.price
 				fees += fill * askOrder.price * cfg.MakerFeeBps / 10_000
-				fills++
-				sells++
+				executionEvents++
+				if completed {
+					fills++
+					sells++
+				} else {
+					partialFillEvents++
+				}
 			}
 		}
 		if bidOrder.active && trade.side == types.SideTypeSell && trade.price <= bidOrder.price {
-			fill := consumeQueue(&bidOrder, trade.size)
+			fill, completed := consumeQueue(&bidOrder, trade.size)
 			if fill > 0 && quote >= fill*bidOrder.price {
-				bidOrder.active = false
 				inventory += fill
 				quote -= fill * bidOrder.price
 				fees += fill * bidOrder.price * cfg.MakerFeeBps / 10_000
-				fills++
-				buys++
+				executionEvents++
+				if completed {
+					fills++
+					buys++
+				} else {
+					partialFillEvents++
+				}
 			}
 		}
 		if math.Abs(inventory) > maxInventory {
@@ -537,6 +670,7 @@ func simulateEventReplay(trades []tick, bbo []bboSnapshot, cfg gammacapture.Mark
 	return result{
 		HalfSpreadBps: cfg.MinimumHalfSpreadBps, InventorySkewBps: cfg.InventorySkewBps,
 		Observations: observations, Fills: fills, BuyFills: buys, SellFills: sells,
+		ExecutionEvents: executionEvents, PartialFillEvents: partialFillEvents,
 		MakerFeesJPY: fees, FinalEquityJPY: finalEquity, NetPnLJPY: finalEquity - initialEquity,
 		MaxAbsInventory: maxInventory, QuoteUptimePct: float64(quoteActive) * 100 / float64(max(1, observations)),
 		FillsPerDay: float64(fills) / days, SyntheticFillModel: "historical_bbo_aggtrade_market_maker_event_replay",
@@ -546,18 +680,24 @@ func simulateEventReplay(trades []tick, bbo []bboSnapshot, cfg gammacapture.Mark
 	}
 }
 
-func consumeQueue(order *replayOrder, volume float64) float64 {
+func consumeQueue(order *replayOrder, volume float64) (float64, bool) {
 	if volume <= 0 || !order.active {
-		return 0
+		return 0, false
 	}
 	if order.queueAhead >= volume {
 		order.queueAhead -= volume
-		return 0
+		return 0, false
 	}
-	fill := volume - order.queueAhead
+	fill := math.Min(volume-order.queueAhead, order.quantity)
 	order.queueAhead = 0
-	if fill > order.quantity {
-		fill = order.quantity
+	if fill <= 0 {
+		return 0, false
 	}
-	return fill
+	order.quantity -= fill
+	if order.quantity <= 1e-12 {
+		order.quantity = 0
+		order.active = false
+		return fill, true
+	}
+	return fill, false
 }

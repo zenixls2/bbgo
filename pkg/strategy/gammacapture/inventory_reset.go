@@ -17,21 +17,27 @@ type InventoryResetInput struct {
 	MakerFeeBps          float64
 	TakerFeeBps          float64
 	MaxSlippageBps       float64
-	FillIntensity        float64
+	FillIntensity        float64 // actual quote-distance events / second
+	FillIntensityValid   bool
 	FillIntensityHaircut float64
 	VolatilityPerSqrtSec float64
 	FastDirectionSignal  float64 // [-1,1], negative means short-term downside pressure
+	FastSignalHealthy    bool
+	AverageCost          float64 // BBGO fee-adjusted position cost
 }
 
 type InventoryResetDecision struct {
-	Trigger         bool
-	Reason          string
-	Age             time.Duration
-	AdverseMoveBps  float64
-	FillProbability float64
-	WaitValueBps    float64
-	IOCValueBps     float64
-	RiskBps         float64
+	Trigger                bool
+	Reason                 string
+	Age                    time.Duration
+	AdverseMoveBps         float64
+	FillProbability        float64
+	WaitValueBps           float64
+	IOCValueBps            float64
+	IOCRoundTripBps        float64
+	IOCImprovementBps      float64
+	ExpectedFutureDriftBps float64
+	RiskBps                float64
 }
 
 // Evaluate compares the expected net value of waiting for a passive ask with
@@ -54,17 +60,25 @@ func (c InventoryResetConfig) Evaluate(in InventoryResetInput) InventoryResetDec
 	d.AdverseMoveBps = math.Log(in.MidPrice/in.AnchorMidPrice) * 10_000
 	staleReset := d.Age >= time.Duration(c.MaxAskAge) && d.AdverseMoveBps <= -c.AdverseMoveBps
 	fastReset := c.FastAskAge > 0 && c.FastAdverseMoveBps > 0 && c.FastDirectionThreshold > 0 &&
+		in.FastSignalHealthy &&
 		d.Age >= time.Duration(c.FastAskAge) &&
 		in.FastDirectionSignal <= -c.FastDirectionThreshold &&
 		d.AdverseMoveBps <= -c.FastAdverseMoveBps
 	if !staleReset && !fastReset {
 		if d.Age < time.Duration(c.FastAskAge) {
 			d.Reason = "ask not stale"
+		} else if !in.FastSignalHealthy && d.Age < time.Duration(c.MaxAskAge) {
+			d.Reason = "fast signal unhealthy"
 		} else if in.FastDirectionSignal > -math.Abs(c.FastDirectionThreshold) {
 			d.Reason = "short-term downside threshold not reached"
 		} else {
 			d.Reason = "adverse move threshold not reached"
 		}
+		return d
+	}
+
+	if !in.FillIntensityValid {
+		d.Reason = "insufficient ask-distance crossing statistics"
 		return d
 	}
 
@@ -80,15 +94,26 @@ func (c InventoryResetConfig) Evaluate(in InventoryResetInput) InventoryResetDec
 	askNetBps := math.Log(in.AskPrice/in.MidPrice)*10_000 - in.MakerFeeBps
 	iocPrice := in.BestBid * (1 - math.Max(0, in.MaxSlippageBps)/10_000)
 	iocNetBps := math.Log(iocPrice/in.MidPrice)*10_000 - in.TakerFeeBps
-	driftBps := d.AdverseMoveBps / seconds
-	futureMarkBps := driftBps*seconds - in.TakerFeeBps
+	driftWeight := math.Min(1, math.Max(0, c.DriftContinuationWeight))
+	d.ExpectedFutureDriftBps = driftWeight * d.AdverseMoveBps
+	futureMarkBps := d.ExpectedFutureDriftBps - in.TakerFeeBps
 	d.WaitValueBps = d.FillProbability*askNetBps + (1-d.FillProbability)*futureMarkBps - d.RiskBps
 	d.IOCValueBps = iocNetBps
-	d.Trigger = d.IOCValueBps >= d.WaitValueBps
-	if d.Trigger {
-		d.Reason = "ioc value exceeds passive wait value"
-	} else {
-		d.Reason = "passive wait value remains higher"
+	d.IOCImprovementBps = d.IOCValueBps - d.WaitValueBps
+	if in.AverageCost <= 0 {
+		d.Reason = "missing fee-adjusted average cost"
+		return d
 	}
+	d.IOCRoundTripBps = math.Log(iocPrice/in.AverageCost)*10_000 - in.TakerFeeBps
+	if d.IOCRoundTripBps < c.MinimumRoundTripValueBps {
+		d.Reason = "ioc round-trip value below minimum"
+		return d
+	}
+	if d.IOCImprovementBps < c.MinimumImprovementBps {
+		d.Reason = "passive wait value remains higher"
+		return d
+	}
+	d.Trigger = true
+	d.Reason = "profitable ioc value exceeds passive wait value"
 	return d
 }

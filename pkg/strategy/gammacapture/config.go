@@ -323,6 +323,29 @@ func (s *Config) Validate() error {
 	if s.Risk.EstimatedCostBps < 0 || s.Risk.MinimumNetEdgeBps < 0 || s.Risk.MinimumRangeBps < 0 || s.Risk.MaxSpreadBps < 0 || s.Risk.MaxBookAge < 0 || s.Risk.MaxEntryBarRangeBps < 0 || s.Risk.MaxEntryBarReturnBps < 0 || s.Signal.StretchedSignalRetraceBps < 0 || s.Trend.MinReturnBps < 0 || s.MarketMaker.MakerFeeBps < 0 || s.MarketMaker.TakerFeeBps < 0 || s.MarketMaker.AdverseSelectionBps < 0 || s.MarketMaker.MinimumNetEdgeBps < 0 || s.MarketMaker.RefreshInterval < 0 || s.MarketMaker.MinRefreshInterval < 0 || s.MarketMaker.RefreshMoveBps < 0 || s.MarketMaker.AdverseRepriceBps < 0 || s.MarketMaker.RefreshImbalanceDelta < 0 || s.MarketMaker.FastWindow < 0 || s.MarketMaker.FastEvidenceWindow < 0 || s.MarketMaker.DirectionSkewBps < 0 || s.MarketMaker.ImbalanceSkewBps < 0 || s.MarketMaker.InventoryReset.MaxAskAge < 0 || s.MarketMaker.InventoryReset.FastAskAge < 0 || s.MarketMaker.InventoryReset.AdverseMoveBps < 0 || s.MarketMaker.InventoryReset.FastAdverseMoveBps < 0 || s.MarketMaker.InventoryReset.FastDirectionThreshold < 0 || s.MarketMaker.InventoryReset.MaxSlippageBps < 0 || s.MarketMaker.InventoryReset.ReductionNotional < 0 || s.MarketMaker.InventoryReset.Cooldown < 0 || s.MarketMaker.InventoryReset.FillIntensityHaircut < 0 || s.MarketMaker.InventoryReset.RiskZScore < 0 {
 		return fmt.Errorf("risk cost, edge, and entry-bar limits must not be negative")
 	}
+	reset := s.MarketMaker.InventoryReset
+	if reset.MinimumRoundTripValueBps < 0 || reset.MinimumImprovementBps < 0 {
+		return fmt.Errorf("inventory reset value limits must not be negative")
+	}
+	if reset.DriftContinuationWeight < 0 || reset.DriftContinuationWeight > 1 {
+		return fmt.Errorf("inventory reset driftContinuationWeight must be between zero and one")
+	}
+	acquisition := s.MarketMaker.AcquisitionReset
+	if acquisition.MinDeficitAge < 0 || acquisition.AdverseMoveBps < 0 || acquisition.MaxSlippageBps < 0 ||
+		acquisition.Cooldown < 0 || acquisition.MinSamples < 0 || acquisition.ConfidenceZScore < 0 ||
+		acquisition.StartMinimumBBO5m < 0 || acquisition.StartMinimumVolatilitySamples5m < 0 ||
+		acquisition.StartReturnTailProbability < 0 || acquisition.StartDrawdownTailProbability < 0 ||
+		acquisition.StartMaxDrawdown5mBps < 0 ||
+		acquisition.FillIntensityHaircut < 0 || acquisition.RiskZScore < 0 ||
+		acquisition.MinimumExpectedValueBps < 0 || acquisition.MinimumImprovementBps < 0 {
+		return fmt.Errorf("acquisition reset probability, cost, and timing limits must not be negative")
+	}
+	if acquisition.StartReturnTailProbability >= 0.5 {
+		return fmt.Errorf("acquisition reset return tail probability must be below one half")
+	}
+	if acquisition.StartDrawdownTailProbability >= 1 {
+		return fmt.Errorf("acquisition reset drawdown tail probability must be below one")
+	}
 	if s.Environment == "live" {
 	} else if s.Environment != "paper" && s.Environment != "replay" && s.Environment != "backtest" {
 		return fmt.Errorf("environment must be paper, replay, or backtest")
@@ -382,6 +405,18 @@ func (s *Config) Validate() error {
 		}
 		if b.MinStopBarriers < 2 || b.MinStopBarriers > b.MaxStopBarriers {
 			return fmt.Errorf("barrierSelection stop range must be at least two and ordered")
+		}
+	}
+	if s.MarketMaker.HorizonTouchModel.Enabled && s.MarketMaker.HorizonTouchModel.Path == "" {
+		return fmt.Errorf("marketMaker.horizonTouchModel.path is required when the model is enabled")
+	}
+	for _, configured := range s.MarketMaker.FastWindows {
+		window := time.Duration(configured)
+		if window <= 0 {
+			return fmt.Errorf("marketMaker.fastWindows entries must be positive")
+		}
+		if window < time.Duration(s.MarketMaker.MinTradingWindow) || window > time.Duration(s.MarketMaker.MaxTradingWindow) {
+			return fmt.Errorf("marketMaker.fastWindows entry %s must be within minTradingWindow and maxTradingWindow", window)
 		}
 	}
 	return nil

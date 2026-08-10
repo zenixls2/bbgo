@@ -154,12 +154,12 @@ exchangeStrategies:
         # the old soft-band/6 fixed tranche cap is not applied a second time.
         jointDistanceQuantity:
           enabled: true
-          # The positive fee-net lower-bound guard improved replay risk but did
-          # not yet preserve prior P&L because repeated fills interact with the
-          # moving Macro target. Keep full hard-headroom diagnostics without
-          # changing live prices or quantities.
-          shadowOnly: true
-          candidateCount: 5
+          # Posterior-sign fractional Kelly uses hard headroom only after the
+          # joint candidate is accepted; a rejection leaves the established
+          # soft-cap allocator byte-for-byte equivalent. Thirteen points are
+          # numerical resolution, not thirteen simultaneous orders.
+          shadowOnly: false
+          candidateCount: 13
         # After a private fill, compare inward opposite-side prices against the
         # ordinary quote on paired completed BBO paths. The model may spend
         # cycle edge during a statistically supported continuation or risk

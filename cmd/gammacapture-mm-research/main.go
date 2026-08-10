@@ -156,6 +156,7 @@ func main() {
 	overrideMacroCarryBudget := flag.Float64("override-macro-carry-risk-budget-ratio", -1, "research-only Macro carry risk budget ratio")
 	overrideMacroBarInterval := flag.Duration("override-macro-bar-interval", -1, "research-only Macro bar interval")
 	disableJointDistanceQuantity := flag.Bool("disable-joint-distance-quantity", false, "research-only disable joint distance/quantity optimizer")
+	activateJointDistanceQuantity := flag.Bool("activate-joint-distance-quantity", false, "research-only activate joint distance/quantity optimizer even when production is shadow-only")
 	overrideJointDistanceCandidates := flag.Int("override-joint-distance-candidates", -1, "research-only joint distance ladder candidate count")
 	replayFrom := flag.String("replay-from", "", "exact Macro replay start (RFC3339)")
 	replayTo := flag.String("replay-to", "", "exact Macro replay end (RFC3339)")
@@ -172,20 +173,21 @@ func main() {
 	lifecycleOnly := flag.Bool("lifecycle-only", false, "report journal maker lifecycles without replaying either quote policy")
 	flag.Parse()
 	activeProductionConfigOverrides = productionConfigOverrides{
-		InventoryRiskBudgetRatio:     *overrideRiskBudgetRatio,
-		InventoryRiskZScore:          *overrideRiskZScore,
-		MinimumHalfSpreadBps:         *overrideMinimumHalfSpread,
-		VolatilityMultiplier:         *overrideVolatilityMultiplier,
-		MinimumNetEdgeBps:            *overrideMinimumNetEdge,
-		MinimumNetEdgeSet:            *overrideMinimumNetEdge >= 0,
-		MaxTradingWindow:             *overrideMaxTradingWindow,
-		HorizonLookback:              *overrideHorizonLookback,
-		HorizonMinSamples:            *overrideHorizonMinSamples,
-		MacroRiskAversion:            *overrideMacroRiskAversion,
-		MacroCarryRiskBudget:         *overrideMacroCarryBudget,
-		MacroBarInterval:             *overrideMacroBarInterval,
-		DisableJointDistanceQuantity: *disableJointDistanceQuantity,
-		JointDistanceCandidateCount:  *overrideJointDistanceCandidates,
+		InventoryRiskBudgetRatio:      *overrideRiskBudgetRatio,
+		InventoryRiskZScore:           *overrideRiskZScore,
+		MinimumHalfSpreadBps:          *overrideMinimumHalfSpread,
+		VolatilityMultiplier:          *overrideVolatilityMultiplier,
+		MinimumNetEdgeBps:             *overrideMinimumNetEdge,
+		MinimumNetEdgeSet:             *overrideMinimumNetEdge >= 0,
+		MaxTradingWindow:              *overrideMaxTradingWindow,
+		HorizonLookback:               *overrideHorizonLookback,
+		HorizonMinSamples:             *overrideHorizonMinSamples,
+		MacroRiskAversion:             *overrideMacroRiskAversion,
+		MacroCarryRiskBudget:          *overrideMacroCarryBudget,
+		MacroBarInterval:              *overrideMacroBarInterval,
+		DisableJointDistanceQuantity:  *disableJointDistanceQuantity,
+		ActivateJointDistanceQuantity: *activateJointDistanceQuantity,
+		JointDistanceCandidateCount:   *overrideJointDistanceCandidates,
 	}
 	if *cpuProfilePath != "" {
 		profileFile, err := os.Create(*cpuProfilePath)

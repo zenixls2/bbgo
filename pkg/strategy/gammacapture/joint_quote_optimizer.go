@@ -18,21 +18,77 @@ type JointDistanceQuantityInput struct {
 	BasePlan         MarketMakerQuotePlan
 	Projection       ProbabilityCenteredQuoteInput
 	ConfidenceZScore float64
+	PairEquityJPY    float64
+	RiskAversion     float64
 }
 
 type JointDistanceQuantityDecision struct {
-	Enabled            bool
-	Applied            bool
-	Reason             string
-	Plan               MarketMakerQuotePlan
-	Projection         ProbabilityCenteredQuoteDecision
-	Crossing           MarketMakerHorizonDecision
-	CandidateCount     int
-	SelectedCandidate  int
-	ExpectedCycleJPY   float64
-	ExpectedPnLJPYHour float64
-	LowerPnLJPYHour    float64
-	CapitalUtilization float64
+	Enabled                   bool
+	Applied                   bool
+	Reason                    string
+	Plan                      MarketMakerQuotePlan
+	Projection                ProbabilityCenteredQuoteDecision
+	Crossing                  MarketMakerHorizonDecision
+	CandidateCount            int
+	SelectedCandidate         int
+	SelectedQuantityCandidate int
+	QuantityScale             float64
+	ExpectedCycleJPY          float64
+	ExpectedPnLJPYHour        float64
+	LowerPnLJPYHour           float64
+	PathStdErrorJPYHour       float64
+	KellyPenaltyJPYHour       float64
+	KellyUtilityJPYHour       float64
+	PathPositiveConfidence    float64
+	PathEffectiveSamples      float64
+	CapitalUtilization        float64
+	PairCapitalUtilization    float64
+}
+
+// jointPathPositiveConfidence is the posterior expected sign of a positive
+// path mean under a locally normal mean posterior. It is zero at no directional
+// evidence and approaches one continuously; unlike a significance gate, it
+// does not strand every sparse-market quote at the exchange minimum.
+func jointPathPositiveConfidence(mean, standardError float64) float64 {
+	if mean <= 0 || math.IsNaN(mean) || math.IsNaN(standardError) {
+		return 0
+	}
+	if standardError <= 0 {
+		return 1
+	}
+	return math.Max(0, math.Min(1, math.Erf(mean/(standardError*math.Sqrt2))))
+}
+
+func jointQuantityScales(in ProbabilityCenteredQuoteInput, count int) []float64 {
+	fastGross := math.Max(0, in.FastBuyNotionalJPY) + math.Max(0, in.FastSellNotionalJPY)
+	if fastGross <= 0 {
+		return nil
+	}
+	maxGross := math.Min(fastGross,
+		math.Max(0, in.MaxBuyNotionalJPY)+math.Max(0, in.MaxSellNotionalJPY))
+	if maxGross <= 0 {
+		return nil
+	}
+	minGross := math.Max(0, in.MinBuyNotionalJPY) + math.Max(0, in.MinSellNotionalJPY)
+	maxScale := math.Min(1, maxGross/fastGross)
+	minScale := math.Min(maxScale, minGross/fastGross)
+	if minScale <= 0 {
+		denominator := count
+		if denominator < 2 {
+			denominator = 2
+		}
+		minScale = maxScale / float64(denominator)
+	}
+	if count < 2 || maxScale <= minScale*(1+1e-12) {
+		return []float64{maxScale}
+	}
+	scales := make([]float64, 0, count)
+	ratio := maxScale / minScale
+	for index := 0; index < count; index++ {
+		fraction := float64(index) / float64(count-1)
+		scales = append(scales, minScale*math.Pow(ratio, fraction))
+	}
+	return scales
 }
 
 func jointDistanceCandidatePlan(
@@ -98,8 +154,23 @@ func OptimizeJointDistanceQuantity(
 		z = 1.645
 	}
 	hours := in.Horizon.Hours()
+	if in.PairEquityJPY <= 0 {
+		d.Reason = "pair equity unavailable for path utility"
+		return d
+	}
+	riskAversion := in.RiskAversion
+	if riskAversion <= 0 {
+		riskAversion = config.MacroInventory.RiskAversion
+	}
+	quantityScales := jointQuantityScales(in.Projection, count)
+	if len(quantityScales) == 0 {
+		d.Reason = "no executable quantity scales"
+		return d
+	}
 	bestScore := math.Inf(-1)
 	bestGross := -1.0
+	crossingReady, positiveEdge, pathReady, projectionReady := 0, 0, 0, 0
+	positivePathMean, confidenceScaleReady := 0, 0
 	for index := 0; index < count; index++ {
 		fraction := float64(index) / float64(count-1)
 		plan := jointDistanceCandidatePlan(
@@ -109,59 +180,122 @@ func OptimizeJointDistanceQuantity(
 			in.BestBid, in.BestAsk, plan.BidPrice, plan.AskPrice)
 		crossing := model.CrossingDecisionAtSideDistances(
 			in.Now, config, in.Horizon, buyDistance, sellDistance, grossEdge)
-		if !crossing.HasSufficientCrossings(config.HorizonMinSamples) ||
-			crossing.NetRoundTripEdgeBps <= 0 {
+		if !crossing.HasSufficientCrossings(config.HorizonMinSamples) {
 			continue
 		}
-		projectionInput := in.Projection
-		projectionInput.Horizon = in.Horizon
-		projectionInput.DirectFillProbabilities = true
-		projectionInput.BuyFillProbability = crossing.BuyTouchProbability
-		projectionInput.SellFillProbability = crossing.SellTouchProbability
-		projectionInput.BothFillProbability = crossing.BothTouchProbability
-		projection := ProbabilityCenteredQuoteNotionals(projectionInput)
-		if !projection.Enabled {
+		crossingReady++
+		if crossing.NetRoundTripEdgeBps <= 0 {
 			continue
 		}
-		lowerBuy := math.Max(0, crossing.BuyTouchProbability-z*crossing.BuyTouchStdError)
-		lowerSell := math.Max(0, crossing.SellTouchProbability-z*crossing.SellTouchStdError)
-		expectedCycle := math.Min(
-			crossing.BuyTouchProbability*projection.BuyNotionalJPY,
-			crossing.SellTouchProbability*projection.SellNotionalJPY)
-		lowerCycle := math.Min(
-			lowerBuy*projection.BuyNotionalJPY,
-			lowerSell*projection.SellNotionalJPY)
-		expectedPnL := expectedCycle * crossing.NetRoundTripEdgeBps / 10_000 / hours
-		lowerPnL := lowerCycle * crossing.NetRoundTripEdgeBps / 10_000 / hours
-		gross := projection.ProjectedGrossNotionalJPY
-		if lowerPnL > bestScore+1e-12 ||
-			(math.Abs(lowerPnL-bestScore) <= 1e-12 && gross > bestGross) {
-			bestScore, bestGross = lowerPnL, gross
-			d.Enabled = true
-			d.Reason = "max confidence-adjusted fee-net cycle pnl per hour"
-			d.Plan = plan
-			d.Projection = projection
-			d.Crossing = crossing
-			d.SelectedCandidate = index
-			d.ExpectedCycleJPY = expectedCycle
-			d.ExpectedPnLJPYHour = expectedPnL
-			d.LowerPnLJPYHour = lowerPnL
-			if in.Projection.FastBuyNotionalJPY+in.Projection.FastSellNotionalJPY > 0 {
-				d.CapitalUtilization = gross /
-					(in.Projection.FastBuyNotionalJPY + in.Projection.FastSellNotionalJPY)
+		positiveEdge++
+		pathStats := model.JointPathPayoffStatistics(
+			in.Now, config, in.Horizon, buyDistance, sellDistance)
+		// One independent path cannot identify dispersion. Beyond that minimum,
+		// sample scarcity belongs in the standard error and confidence bound,
+		// rather than a duplicate hard gate tied to crossing sample health.
+		if pathStats.EffectiveSamples <= 1 {
+			continue
+		}
+		pathReady++
+		for quantityIndex, rawScale := range quantityScales {
+			projectionInput := in.Projection
+			projectionInput.Horizon = in.Horizon
+			projectionInput.FastBuyNotionalJPY *= rawScale
+			projectionInput.FastSellNotionalJPY *= rawScale
+			projectionInput.DirectFillProbabilities = true
+			projectionInput.BuyFillProbability = crossing.BuyTouchProbability
+			projectionInput.SellFillProbability = crossing.SellTouchProbability
+			projectionInput.BothFillProbability = crossing.BothTouchProbability
+			rawProjection := ProbabilityCenteredQuoteNotionals(projectionInput)
+			if !rawProjection.Enabled || rawProjection.ProjectedGrossNotionalJPY <= 0 {
+				continue
+			}
+			projectionReady++
+			rawPayoff := pathStats.Evaluate(
+				rawProjection.BuyNotionalJPY, rawProjection.SellNotionalJPY,
+				in.PairEquityJPY, riskAversion, 0)
+			positiveConfidence := jointPathPositiveConfidence(
+				rawPayoff.ExpectedPnLJPY, rawPayoff.StdErrorJPY)
+			if positiveConfidence > 0 {
+				positivePathMean++
+			}
+			scale := rawScale * positiveConfidence
+			if scale+1e-12 < quantityScales[0] {
+				continue
+			}
+			confidenceScaleReady++
+			projectionInput = in.Projection
+			projectionInput.Horizon = in.Horizon
+			projectionInput.FastBuyNotionalJPY *= scale
+			projectionInput.FastSellNotionalJPY *= scale
+			projectionInput.DirectFillProbabilities = true
+			projectionInput.BuyFillProbability = crossing.BuyTouchProbability
+			projectionInput.SellFillProbability = crossing.SellTouchProbability
+			projectionInput.BothFillProbability = crossing.BothTouchProbability
+			projection := ProbabilityCenteredQuoteNotionals(projectionInput)
+			if !projection.Enabled || projection.ProjectedGrossNotionalJPY <= 0 {
+				continue
+			}
+			pathPayoff := pathStats.Evaluate(
+				projection.BuyNotionalJPY, projection.SellNotionalJPY,
+				in.PairEquityJPY, riskAversion, 0)
+			pathConfidence := pathStats.Evaluate(
+				projection.BuyNotionalJPY, projection.SellNotionalJPY,
+				in.PairEquityJPY, riskAversion, z)
+			score := pathPayoff.CertaintyEquivalent / hours
+			gross := projection.ProjectedGrossNotionalJPY
+			if score > bestScore+1e-12 ||
+				(math.Abs(score-bestScore) <= 1e-12 && gross > bestGross) {
+				bestScore, bestGross = score, gross
+				d.Enabled = true
+				d.Reason = "max posterior-sign-scaled terminal-wealth kelly utility"
+				d.Plan = plan
+				d.Projection = projection
+				d.Crossing = crossing
+				d.SelectedCandidate = index
+				d.SelectedQuantityCandidate = quantityIndex
+				d.QuantityScale = scale
+				d.ExpectedCycleJPY = math.Min(
+					crossing.BuyTouchProbability*projection.BuyNotionalJPY,
+					crossing.SellTouchProbability*projection.SellNotionalJPY)
+				d.ExpectedPnLJPYHour = pathPayoff.ExpectedPnLJPY / hours
+				d.LowerPnLJPYHour = pathConfidence.CertaintyEquivalent / hours
+				d.PathStdErrorJPYHour = pathPayoff.StdErrorJPY / hours
+				d.KellyPenaltyJPYHour = pathPayoff.KellyPenaltyJPY / hours
+				d.KellyUtilityJPYHour = score
+				d.PathPositiveConfidence = positiveConfidence
+				d.PathEffectiveSamples = pathStats.EffectiveSamples
+				d.PairCapitalUtilization = gross / in.PairEquityJPY
+				if in.Projection.FastBuyNotionalJPY+in.Projection.FastSellNotionalJPY > 0 {
+					d.CapitalUtilization = gross /
+						(in.Projection.FastBuyNotionalJPY + in.Projection.FastSellNotionalJPY)
+				}
 			}
 		}
 	}
+	if !d.Enabled {
+		switch {
+		case crossingReady == 0:
+			d.Reason = "insufficient crossing samples for every distance"
+		case positiveEdge == 0:
+			d.Reason = "no distance has positive fee-net crossing edge"
+		case pathReady == 0:
+			d.Reason = "insufficient terminal path variance samples"
+		case projectionReady == 0:
+			d.Reason = "no executable probability projection"
+		case positivePathMean == 0:
+			d.Reason = "no candidate has positive posterior path mean"
+		case confidenceScaleReady == 0:
+			d.Reason = "posterior-supported quantity is below exchange minimum"
+		default:
+			d.Reason = "no evaluable joint candidate"
+		}
+	}
 	if d.Enabled {
-		// Gross notional is only a tie-break among statistically profitable
-		// candidates. When every lower confidence bound is zero, selecting the
-		// largest order would convert absence of evidence into maximum capital
-		// deployment and reproduce the replay underperformance this optimizer
-		// is intended to prevent.
-		if d.LowerPnLJPYHour <= 0 {
+		if d.KellyUtilityJPYHour <= 0 {
 			d.Enabled = false
 			d.Applied = false
-			d.Reason = "no candidate has positive confidence-adjusted fee-net pnl"
+			d.Reason = "no candidate has positive posterior-scaled kelly utility"
 		} else {
 			d.Applied = !config.JointDistanceQuantity.ShadowOnly
 		}

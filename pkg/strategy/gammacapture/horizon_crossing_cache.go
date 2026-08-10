@@ -13,6 +13,10 @@ import (
 type marketMakerHorizonExposure struct {
 	At               time.Time
 	EndAt            time.Time
+	StartBid         float64
+	StartAsk         float64
+	TerminalBid      float64
+	TerminalAsk      float64
 	BuyExcursionBps  float64
 	SellExcursionBps float64
 	NextMinute       int
@@ -130,9 +134,15 @@ func (m *MarketMakerHorizonModel) crossingExposures(horizon time.Duration) []mar
 		}
 		maxBid := m.points[cache.MaxBidDeque[0]].bidPrice()
 		minAsk := m.points[cache.MinAskDeque[0]].askPrice()
+		terminalBid := m.points[right-1].bidPrice()
+		terminalAsk := m.points[right-1].askPrice()
 		cache.Exposures = append(cache.Exposures, marketMakerHorizonExposure{
 			At:               start.At,
 			EndAt:            endAt,
+			StartBid:         startBid,
+			StartAsk:         startAsk,
+			TerminalBid:      terminalBid,
+			TerminalAsk:      terminalAsk,
 			BuyExcursionBps:  math.Log(startAsk/minAsk) * 10_000,
 			SellExcursionBps: math.Log(maxBid/startBid) * 10_000,
 		})
@@ -179,7 +189,7 @@ func horizonExposureAtIndex(points []MarketMakerHorizonPoint, index int, horizon
 		return marketMakerHorizonExposure{}, false
 	}
 	endAt := start.At.Add(horizon)
-	maxBid, minAsk, futurePoints := 0.0, math.Inf(1), 0
+	maxBid, minAsk, terminalBid, terminalAsk, futurePoints := 0.0, math.Inf(1), 0.0, 0.0, 0
 	for future := index + 1; future < len(points) && points[future].At.Before(endAt); future++ {
 		point := points[future]
 		bid, ask := point.bidPrice(), point.askPrice()
@@ -189,6 +199,7 @@ func horizonExposureAtIndex(points []MarketMakerHorizonPoint, index int, horizon
 		futurePoints++
 		maxBid = math.Max(maxBid, bid)
 		minAsk = math.Min(minAsk, ask)
+		terminalBid, terminalAsk = bid, ask
 	}
 	if futurePoints == 0 || maxBid <= 0 || math.IsInf(minAsk, 1) {
 		return marketMakerHorizonExposure{}, false
@@ -196,6 +207,10 @@ func horizonExposureAtIndex(points []MarketMakerHorizonPoint, index int, horizon
 	return marketMakerHorizonExposure{
 		At:               start.At,
 		EndAt:            endAt,
+		StartBid:         startBid,
+		StartAsk:         startAsk,
+		TerminalBid:      terminalBid,
+		TerminalAsk:      terminalAsk,
 		BuyExcursionBps:  math.Log(startAsk/minAsk) * 10_000,
 		SellExcursionBps: math.Log(maxBid/startBid) * 10_000,
 	}, true

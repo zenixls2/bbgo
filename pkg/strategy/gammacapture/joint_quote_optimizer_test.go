@@ -24,6 +24,19 @@ func TestJointDistanceCandidatePlanOnlyMovesOutward(t *testing.T) {
 	}
 }
 
+func TestJointPathPositiveConfidence(t *testing.T) {
+	if got := jointPathPositiveConfidence(-1, 1); got != 0 {
+		t.Fatalf("negative path mean must deploy no directional confidence: %v", got)
+	}
+	if got := jointPathPositiveConfidence(1, 0); got != 1 {
+		t.Fatalf("certain positive path mean must deploy full confidence: %v", got)
+	}
+	want := 0.6826894921370859
+	if got := jointPathPositiveConfidence(1, 1); math.Abs(got-want) > 1e-12 {
+		t.Fatalf("one-standard-error posterior sign mismatch: got %v want %v", got, want)
+	}
+}
+
 func TestOptimizeJointDistanceQuantityProducesExecutableRiskProjection(t *testing.T) {
 	start := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
 	model := MarketMakerHorizonModel{}
@@ -31,11 +44,14 @@ func TestOptimizeJointDistanceQuantityProducesExecutableRiskProjection(t *testin
 		MakerFeeBps: 10, AdverseSelectionBps: 2, MinimumNetEdgeBps: 2,
 		MinimumHalfSpreadBps: 15, MaximumHalfSpreadBps: 80,
 		HorizonLookback:       types.Duration(40 * time.Minute),
-		HorizonMinSamples:     6,
+		HorizonMinSamples:     3,
 		JointDistanceQuantity: JointDistanceQuantityConfig{Enabled: true, CandidateCount: 5},
 	}
 	for second := 0; second <= 45*60; second++ {
-		phase := 2 * math.Pi * float64(second) / float64(8*60)
+		// One complete oscillation per holding horizon returns terminal wealth
+		// to the start while touching both sides, so a fee-net cycle should have
+		// a genuinely positive path-payoff lower bound.
+		phase := 2 * math.Pi * float64(second) / float64(5*60)
 		mid := 100 * math.Exp(0.006*math.Sin(phase))
 		model.ObserveBook(start.Add(time.Duration(second)*time.Second),
 			mid*math.Exp(-2.0/20_000), mid*math.Exp(2.0/20_000), config)
@@ -52,6 +68,8 @@ func TestOptimizeJointDistanceQuantityProducesExecutableRiskProjection(t *testin
 		Now: now, Horizon: 5 * time.Minute,
 		BestBid: bestBid, BestAsk: bestAsk, MidPrice: mid, BasePlan: base,
 		ConfidenceZScore: 1.282,
+		PairEquityJPY:    7000,
+		RiskAversion:     1,
 		Projection: ProbabilityCenteredQuoteInput{
 			CurrentInventoryNotionalJPY: 3500,
 			TargetInventoryNotionalJPY:  3500,
@@ -80,5 +98,37 @@ func TestOptimizeJointDistanceQuantityProducesExecutableRiskProjection(t *testin
 	}
 	if decision.LowerPnLJPYHour <= 0 {
 		t.Fatalf("promoted decision must have positive confidence-adjusted pnl: %+v", decision)
+	}
+}
+
+func TestOptimizeJointDistanceQuantityRejectsZeroGrossProjection(t *testing.T) {
+	config := MarketMakerConfig{
+		HorizonLookback:   types.Duration(time.Hour),
+		HorizonMinSamples: 2,
+		MakerFeeBps:       10,
+		MinimumNetEdgeBps: 1,
+		JointDistanceQuantity: JointDistanceQuantityConfig{
+			Enabled:        true,
+			CandidateCount: 3,
+		},
+	}
+	decision := OptimizeJointDistanceQuantity(
+		&MarketMakerHorizonModel{}, config, JointDistanceQuantityInput{
+			Now:           time.Unix(1_000, 0),
+			Horizon:       5 * time.Minute,
+			BestBid:       99,
+			BestAsk:       101,
+			MidPrice:      100,
+			PairEquityJPY: 10_000,
+			BasePlan: MarketMakerQuotePlan{
+				BidPrice: 98, AskPrice: 102,
+			},
+			Projection: ProbabilityCenteredQuoteInput{
+				FastBuyNotionalJPY:  100,
+				FastSellNotionalJPY: 100,
+			},
+		})
+	if decision.Enabled || decision.Applied {
+		t.Fatalf("zero-cap projection must not be executable: %+v", decision)
 	}
 }

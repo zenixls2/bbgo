@@ -1816,14 +1816,6 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 		modelCap := fixedpoint.NewFromFloat(orderCaps.BuyNotional * plan.BidPrice / mid)
 		hardCap := fixedpoint.NewFromFloat(
 			inventoryBuyHeadroomNotional(hardInventoryBand, inventoryBase, plan.BidPrice))
-		if quoteConfig.JointDistanceQuantity.Enabled &&
-			!quoteConfig.JointDistanceQuantity.ShadowOnly {
-			// The chance constraint below is the coherent stochastic risk cap.
-			// Dividing the soft band by InventoryMaxOrderLevels here created
-			// sub-minimum tranches and then rounded capital use down to one
-			// exchange-minimum order per side.
-			modelCap = hardCap
-		}
 		executableCap := makerBuyInventoryCapacity(s.Market, bidPrice, modelCap, hardCap)
 		projectionInput.MaxBuyNotionalJPY = math.Min(
 			quoteableQuote.Float64()*mid/plan.BidPrice,
@@ -1836,10 +1828,6 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	if plan.AllowAsk && plan.AskPrice > 0 {
 		projectionInput.FastSellNotionalJPY = plan.AskQuoteNotional * mid / plan.AskPrice
 		modelSellCap := orderCaps.SellQuantity
-		if quoteConfig.JointDistanceQuantity.Enabled &&
-			!quoteConfig.JointDistanceQuantity.ShadowOnly {
-			modelSellCap = hardSellInventoryHeadroom
-		}
 		executableCap := makerSellInventoryCapacity(
 			s.Market, fixedpoint.NewFromFloat(plan.AskPrice),
 			fixedpoint.NewFromFloat(modelSellCap),
@@ -1867,6 +1855,8 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 					BestBid: ticker.Buy.Float64(), BestAsk: ticker.Sell.Float64(),
 					MidPrice: mid, BasePlan: plan, Projection: jointProjectionInput,
 					ConfidenceZScore: quoteConfig.InventoryRiskZScore,
+					PairEquityJPY:    pairEquityJPY,
+					RiskAversion:     quoteConfig.MacroInventory.RiskAversion,
 				})
 			if jointQuoteDecision.Applied {
 				plan = jointQuoteDecision.Plan
@@ -2694,10 +2684,18 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"jointQuoteReason":                       jointQuoteDecision.Reason,
 			"jointQuoteCandidateCount":               jointQuoteDecision.CandidateCount,
 			"jointQuoteSelectedCandidate":            jointQuoteDecision.SelectedCandidate,
+			"jointQuoteSelectedQuantityCandidate":    jointQuoteDecision.SelectedQuantityCandidate,
+			"jointQuoteQuantityScale":                jointQuoteDecision.QuantityScale,
 			"jointQuoteExpectedCycleJPY":             jointQuoteDecision.ExpectedCycleJPY,
 			"jointQuoteExpectedPnLJPYHour":           jointQuoteDecision.ExpectedPnLJPYHour,
 			"jointQuoteLowerPnLJPYHour":              jointQuoteDecision.LowerPnLJPYHour,
+			"jointQuotePathStdErrorJPYHour":          jointQuoteDecision.PathStdErrorJPYHour,
+			"jointQuoteKellyPenaltyJPYHour":          jointQuoteDecision.KellyPenaltyJPYHour,
+			"jointQuoteKellyUtilityJPYHour":          jointQuoteDecision.KellyUtilityJPYHour,
+			"jointQuotePathPositiveConfidence":       jointQuoteDecision.PathPositiveConfidence,
+			"jointQuotePathEffectiveSamples":         jointQuoteDecision.PathEffectiveSamples,
 			"jointQuoteCapitalUtilization":           jointQuoteDecision.CapitalUtilization,
+			"jointQuotePairCapitalUtilization":       jointQuoteDecision.PairCapitalUtilization,
 			"postFillUtilityEnabled":                 postFillUtilityDecision.Enabled,
 			"postFillUtilityApplied":                 postFillUtilityDecision.Applied,
 			"postFillUtilityReason":                  postFillUtilityDecision.Reason,

@@ -2792,16 +2792,36 @@ create an impossible covariance matrix.
 The old `noTradeWidth/inventoryMaxOrderLevels` cap is removed only from this
 final stochastic projection. Available balances, hard portfolio min/max,
 exchange filters, the Fast gross budget, posterior bearish BUY restraint, and
-the existing second-moment inventory constraint remain binding. The objective
-for candidate selection is the lower-confidence fee-net cycle P&L rate:
+the existing second-moment inventory constraint remain binding.
 
-`min((pB-z*seB)+*qB,(pS-z*seS)+*qS)/H * (edge-fees-adverse-minEdge)/10000`.
+Candidate selection now uses completed-path terminal executable wealth rather
+than treating every touch as a completed cycle. A one-sided fill pays its one
+actual maker/adverse-selection cost and is marked at terminal bid/ask; a path
+that touches both quotes pays two fill costs plus `minimumNetEdgeBps`. This
+fixed an earlier accounting error that charged a hypothetical second fee to
+inventory still held at the end of the crossing horizon.
 
-Consequently the optimizer does not maximize deployed capital by itself. A
-farther level or larger order is selected only when its confidence-adjusted
-expected fee-net cycle value is at least as good; gross notional is merely the
-tie-breaker. `jointDistanceQuantity.shadowOnly` can retain the complete
-decision diagnostics without changing live orders.
+The path mean is exponentially weighted with a scale-derived half-life
+`sqrt(H * lookback)`. Effective-sample Bessel correction is applied to path
+variance. No second arbitrary `horizonMinSamples` gate is imposed: more than
+one independent path is required to identify variance, then sparse evidence
+widens the standard error continuously.
+
+Per candidate, the posterior expected sign of positive fee-net path payoff is
+
+`c = max(0, 2*Phi(muHat/SE(muHat)) - 1)`.
+
+The raw Fast quantity is multiplied by `c`, then the existing joint Bernoulli
+inventory chance constraint, balances, exchange minimums, and hard inventory
+headroom are applied. Among executable candidates the solver maximizes
+
+`CE = E[PnL] - gamma*Var(PnL)/(2*pairEquity)`.
+
+This separates online sizing from version promotion: a sparse live decision is
+shrunk continuously instead of requiring every quote to pass a significance
+test, while deployment still requires paired multi-regime replay. The selected
+distance remains one physical order per side; `candidateCount` is numerical
+resolution, not a simultaneous order ladder.
 
 The initial 2026-08-10 eight-hour ETHJPY replay exposed a promotion bug.
 Against the immediately preceding probability-centered allocator, the
@@ -2820,7 +2840,42 @@ The guarded rerun improved the unguarded joint result from 33.01 JPY to
 immediately preceding allocator's 37.42 JPY. This proves that a positive
 single-window cycle lower bound is necessary but not sufficient: repeated
 larger fills interact with the moving Macro target and create path-dependent
-inventory drift that the one-step constraint does not price. The production
-configuration therefore remains `shadowOnly: true`. Activation requires a
-multi-step target-transition/bootstrap test whose return lower bound is
-non-inferior to the accepted allocator, not merely a positive one-step edge.
+inventory drift that the one-step constraint does not price. That version
+therefore remained `shadowOnly: true` pending a multi-step target-transition
+test rather than a positive one-step edge alone.
+
+### Posterior-sign utilization canary (2026-08-10)
+
+The terminal-path/Kelly follow-up corrected three engineering/statistical
+problems before activation:
+
+1. one-sided terminal inventory had been charged a nonexistent second maker
+   fee;
+2. path sample scarcity duplicated the crossing-health hard gate instead of
+   entering the standard error; and
+3. setting `shadowOnly=false` changed the fallback allocator to hard headroom
+   even when the joint decision was rejected. Baseline soft caps and joint hard
+   caps are now separate inputs, so a rejected joint decision is exactly the
+   established allocator.
+
+The eight-hour ETHJPY replay on 2026-08-10 00:00--08:00 UTC improved as the
+distance/quantity numerical grid was refined:
+
+| policy | fills (B/S) | net P&L JPY | max DD | accepted pair-equity gross |
+| --- | ---: | ---: | ---: | ---: |
+| established allocator | 13 (5/8) | 37.4249 | 0.4800% | about 2.9% typical minimum pair |
+| posterior-sign, 5 candidates | 3 (1/2) | 37.8511 | 0.4823% | 7.88% mean when accepted |
+| posterior-sign, 9 candidates | 3 (1/2) | 38.4568 | 0.4674% | 8.34% mean when accepted |
+| posterior-sign, 13 candidates | 3 (1/2) | 38.8864 | 0.4695% | 8.44% mean when accepted |
+
+Six additional non-overlapping eight-hour blocks on August 8--9 were paired
+against the established allocator. Four were exactly identical because the
+joint posterior did not change a fill. One improved by `+0.0767 JPY`; one was
+worse by `-0.0812 JPY`. Together with the primary block, observed incremental
+P&L was approximately `+1.46 JPY`; the worst incremental drawdown was only
+`+0.0012` percentage points. This supports a bounded live canary with 13
+candidates, but the small number of changed fill paths does **not** establish a
+positive lower confidence bound. Live logs therefore retain posterior
+confidence, effective samples, expected/lower P&L, Kelly penalty/utility, and
+both Fast-relative and pair-equity-relative capital utilization for continued
+promotion review.

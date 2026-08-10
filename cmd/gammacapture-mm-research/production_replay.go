@@ -35,20 +35,21 @@ type productionYAML struct {
 }
 
 type productionConfigOverrides struct {
-	InventoryRiskBudgetRatio     float64
-	InventoryRiskZScore          float64
-	MinimumHalfSpreadBps         float64
-	VolatilityMultiplier         float64
-	MinimumNetEdgeBps            float64
-	MinimumNetEdgeSet            bool
-	MaxTradingWindow             time.Duration
-	HorizonLookback              time.Duration
-	HorizonMinSamples            int
-	MacroRiskAversion            float64
-	MacroCarryRiskBudget         float64
-	MacroBarInterval             time.Duration
-	DisableJointDistanceQuantity bool
-	JointDistanceCandidateCount  int
+	InventoryRiskBudgetRatio      float64
+	InventoryRiskZScore           float64
+	MinimumHalfSpreadBps          float64
+	VolatilityMultiplier          float64
+	MinimumNetEdgeBps             float64
+	MinimumNetEdgeSet             bool
+	MaxTradingWindow              time.Duration
+	HorizonLookback               time.Duration
+	HorizonMinSamples             int
+	MacroRiskAversion             float64
+	MacroCarryRiskBudget          float64
+	MacroBarInterval              time.Duration
+	DisableJointDistanceQuantity  bool
+	ActivateJointDistanceQuantity bool
+	JointDistanceCandidateCount   int
 }
 
 var activeProductionConfigOverrides productionConfigOverrides
@@ -89,6 +90,10 @@ func (o productionConfigOverrides) apply(c gammacapture.MarketMakerConfig) gamma
 	}
 	if o.DisableJointDistanceQuantity {
 		c.JointDistanceQuantity.Enabled = false
+	}
+	if o.ActivateJointDistanceQuantity {
+		c.JointDistanceQuantity.Enabled = true
+		c.JointDistanceQuantity.ShadowOnly = false
 	}
 	if o.JointDistanceCandidateCount > 0 {
 		c.JointDistanceQuantity.CandidateCount = o.JointDistanceCandidateCount
@@ -183,6 +188,17 @@ type productionReplayResult struct {
 	BuyFills                           int                             `json:"buyFills"`
 	SellFills                          int                             `json:"sellFills"`
 	RoundTrips                         int                             `json:"roundTrips"`
+	JointQuoteEvaluations              int                             `json:"jointQuoteEvaluations"`
+	JointQuoteAccepted                 int                             `json:"jointQuoteAccepted"`
+	JointQuoteApplied                  int                             `json:"jointQuoteApplied"`
+	JointQuoteReasons                  map[string]int                  `json:"jointQuoteReasons,omitempty"`
+	AverageJointCapitalUtilization     float64                         `json:"averageJointCapitalUtilization"`
+	AverageJointPairCapitalUtilization float64                         `json:"averageJointPairCapitalUtilization"`
+	AverageJointCandidateUtilization   float64                         `json:"averageJointCandidateUtilization"`
+	MaximumJointExpectedPnLJPYHour     float64                         `json:"maximumJointExpectedPnLJPYHour"`
+	MaximumJointLowerPnLJPYHour        float64                         `json:"maximumJointLowerPnLJPYHour"`
+	MinimumJointPathEffectiveSamples   float64                         `json:"minimumJointPathEffectiveSamples"`
+	JointQuoteDecisions                []productionReplayJointDecision `json:"jointQuoteDecisions,omitempty"`
 	PostFillUtilityEvaluations         int                             `json:"postFillUtilityEvaluations"`
 	PostFillUtilityApplied             int                             `json:"postFillUtilityApplied"`
 	PostFillUtilityReasons             map[string]int                  `json:"postFillUtilityReasons,omitempty"`
@@ -264,6 +280,24 @@ type productionReplayMacroIOC struct {
 	closedBarAt time.Time
 }
 
+type productionReplayJointDecision struct {
+	At                 time.Time     `json:"at"`
+	Horizon            time.Duration `json:"horizon"`
+	Reason             string        `json:"reason"`
+	DistanceCandidate  int           `json:"distanceCandidate"`
+	QuantityCandidate  int           `json:"quantityCandidate"`
+	QuantityScale      float64       `json:"quantityScale"`
+	CapitalUtilization float64       `json:"capitalUtilization"`
+	PairUtilization    float64       `json:"pairCapitalUtilization"`
+	ExpectedJPYHour    float64       `json:"expectedJPYHour"`
+	LowerJPYHour       float64       `json:"lowerJPYHour"`
+	StdErrorJPYHour    float64       `json:"stdErrorJPYHour"`
+	KellyPenaltyHour   float64       `json:"kellyPenaltyJPYHour"`
+	KellyUtilityHour   float64       `json:"kellyUtilityJPYHour"`
+	PositiveConfidence float64       `json:"positiveConfidence"`
+	EffectiveSamples   float64       `json:"effectiveSamples"`
+}
+
 type productionReplayState struct {
 	cfg                                                                            gammacapture.MarketMakerConfig
 	artifact                                                                       *gammacapture.HorizonTouchArtifact
@@ -292,6 +326,14 @@ type productionReplayState struct {
 	maxPostFillIncrementalMeanBps, maxPostFillIncrementalLowerBps                  float64
 	fillRefreshPending                                                             bool
 	postFillUtilityEvaluations, postFillUtilityApplied                             int
+	jointQuoteEvaluations, jointQuoteAccepted, jointQuoteApplied                   int
+	jointQuoteReasons                                                              map[string]int
+	jointCapitalUtilizationSum, jointPairCapitalUtilizationSum                     float64
+	maximumJointLowerPnLJPYHour                                                    float64
+	jointCandidateCount, jointBestObserved                                         int
+	jointCandidateUtilizationSum, maximumJointExpectedPnLJPYHour                   float64
+	minimumJointPathEffectiveSamples                                               float64
+	jointQuoteDecisions                                                            []productionReplayJointDecision
 	bidOrder, askOrder                                                             productionReplayOrder
 	pendingMacroIOC                                                                productionReplayMacroIOC
 	lastQuoteAt, windowEndsAt                                                      time.Time
@@ -1028,6 +1070,7 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 	hardSellMarkNotional := math.Max(0, s.inventory-hardBand.MinInventory) * mid
 	orderCaps := gammacapture.TargetCenteredInventoryOrderCaps(
 		band, s.inventory, mid, actuationLevels)
+	jointMaxBuyNotionalJPY, jointMaxSellNotionalJPY := 0.0, 0.0
 	projectionInput := gammacapture.ProbabilityCenteredQuoteInput{
 		CurrentInventoryNotionalJPY: s.inventory * mid,
 		TargetInventoryNotionalJPY:  band.Target * mid,
@@ -1045,38 +1088,90 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 	if plan.AllowBid && plan.BidPrice > 0 {
 		projectionInput.FastBuyNotionalJPY = plan.BidQuoteNotional * mid / plan.BidPrice
 		modelBuyCap := orderCaps.BuyNotional * plan.BidPrice / mid
-		if cfg.JointDistanceQuantity.Enabled && !cfg.JointDistanceQuantity.ShadowOnly {
-			modelBuyCap = hardBuyMarkNotional * plan.BidPrice / mid
-		}
 		buyExecutionCap := replayCappedInventoryCapacity(
 			modelBuyCap,
 			hardBuyMarkNotional*plan.BidPrice/mid, 100)
 		projectionInput.MaxBuyNotionalJPY = math.Min(
 			preCancelQuote*mid/plan.BidPrice, buyExecutionCap*mid/plan.BidPrice)
+		jointBuyExecutionCap := replayCappedInventoryCapacity(
+			hardBuyMarkNotional*plan.BidPrice/mid,
+			hardBuyMarkNotional*plan.BidPrice/mid, 100)
+		jointMaxBuyNotionalJPY = math.Min(
+			preCancelQuote*mid/plan.BidPrice,
+			jointBuyExecutionCap*mid/plan.BidPrice)
 	}
 	if plan.AllowAsk && plan.AskPrice > 0 {
 		projectionInput.FastSellNotionalJPY = plan.AskQuoteNotional * mid / plan.AskPrice
 		modelSellCap := orderCaps.SellQuantity
-		if cfg.JointDistanceQuantity.Enabled && !cfg.JointDistanceQuantity.ShadowOnly {
-			modelSellCap = hardSellMarkNotional / mid
-		}
 		sellQuantityCap := replayCappedInventoryCapacity(
 			modelSellCap, hardSellMarkNotional/mid, 100/plan.AskPrice)
 		projectionInput.MaxSellNotionalJPY = math.Min(
 			preCancelBase*mid, sellQuantityCap*mid)
+		jointSellQuantityCap := replayCappedInventoryCapacity(
+			hardSellMarkNotional/mid, hardSellMarkNotional/mid, 100/plan.AskPrice)
+		jointMaxSellNotionalJPY = math.Min(preCancelBase*mid, jointSellQuantityCap*mid)
 	}
 	projection := gammacapture.ProbabilityCenteredQuoteDecision{Reason: "staged replay baseline"}
 	if s.useProbabilityProjection {
 		projection = gammacapture.ProbabilityCenteredQuoteNotionals(projectionInput)
 		if cfg.JointDistanceQuantity.Enabled {
+			jointProjectionInput := projectionInput
+			jointProjectionInput.MaxBuyNotionalJPY = jointMaxBuyNotionalJPY
+			jointProjectionInput.MaxSellNotionalJPY = jointMaxSellNotionalJPY
 			joint := gammacapture.OptimizeJointDistanceQuantity(
 				&s.horizonModel, cfg, gammacapture.JointDistanceQuantityInput{
 					Now: book.time, Horizon: horizon,
 					BestBid: book.bid, BestAsk: book.ask, MidPrice: mid,
-					BasePlan: plan, Projection: projectionInput,
+					BasePlan: plan, Projection: jointProjectionInput,
 					ConfidenceZScore: cfg.InventoryRiskZScore,
+					PairEquityJPY:    pairEquity,
+					RiskAversion:     cfg.MacroInventory.RiskAversion,
 				})
+			s.jointQuoteEvaluations++
+			if s.jointQuoteReasons == nil {
+				s.jointQuoteReasons = make(map[string]int)
+			}
+			s.jointQuoteReasons[joint.Reason]++
+			s.jointQuoteDecisions = append(s.jointQuoteDecisions,
+				productionReplayJointDecision{
+					At: book.time, Horizon: horizon, Reason: joint.Reason,
+					DistanceCandidate:  joint.SelectedCandidate,
+					QuantityCandidate:  joint.SelectedQuantityCandidate,
+					QuantityScale:      joint.QuantityScale,
+					CapitalUtilization: joint.CapitalUtilization,
+					PairUtilization:    joint.PairCapitalUtilization,
+					ExpectedJPYHour:    joint.ExpectedPnLJPYHour,
+					LowerJPYHour:       joint.LowerPnLJPYHour,
+					StdErrorJPYHour:    joint.PathStdErrorJPYHour,
+					KellyPenaltyHour:   joint.KellyPenaltyJPYHour,
+					KellyUtilityHour:   joint.KellyUtilityJPYHour,
+					PositiveConfidence: joint.PathPositiveConfidence,
+					EffectiveSamples:   joint.PathEffectiveSamples,
+				})
+			if joint.PathEffectiveSamples > 0 {
+				s.jointCandidateCount++
+				s.jointCandidateUtilizationSum += joint.CapitalUtilization
+				if s.jointBestObserved == 0 ||
+					joint.ExpectedPnLJPYHour > s.maximumJointExpectedPnLJPYHour {
+					s.maximumJointExpectedPnLJPYHour = joint.ExpectedPnLJPYHour
+				}
+				if s.jointBestObserved == 0 ||
+					joint.LowerPnLJPYHour > s.maximumJointLowerPnLJPYHour {
+					s.maximumJointLowerPnLJPYHour = joint.LowerPnLJPYHour
+				}
+				if s.jointBestObserved == 0 ||
+					joint.PathEffectiveSamples < s.minimumJointPathEffectiveSamples {
+					s.minimumJointPathEffectiveSamples = joint.PathEffectiveSamples
+				}
+				s.jointBestObserved++
+			}
+			if joint.Enabled {
+				s.jointQuoteAccepted++
+				s.jointCapitalUtilizationSum += joint.CapitalUtilization
+				s.jointPairCapitalUtilizationSum += joint.PairCapitalUtilization
+			}
 			if joint.Applied {
+				s.jointQuoteApplied++
 				plan = joint.Plan
 				projection = joint.Projection
 				decision = joint.Crossing
@@ -1436,6 +1531,24 @@ func (s *productionReplayState) result(books []bboSnapshot) productionReplayResu
 	r.PostFillUtilityApplied = s.postFillUtilityApplied
 	r.EquityCurve = s.equityCurve
 	r.PostFillUtilityReasons = s.postFillUtilityReasons
+	r.JointQuoteEvaluations = s.jointQuoteEvaluations
+	r.JointQuoteAccepted = s.jointQuoteAccepted
+	r.JointQuoteApplied = s.jointQuoteApplied
+	r.JointQuoteReasons = s.jointQuoteReasons
+	r.JointQuoteDecisions = s.jointQuoteDecisions
+	if s.jointQuoteAccepted > 0 {
+		r.AverageJointCapitalUtilization = s.jointCapitalUtilizationSum /
+			float64(s.jointQuoteAccepted)
+		r.AverageJointPairCapitalUtilization = s.jointPairCapitalUtilizationSum /
+			float64(s.jointQuoteAccepted)
+	}
+	if s.jointCandidateCount > 0 {
+		r.AverageJointCandidateUtilization = s.jointCandidateUtilizationSum /
+			float64(s.jointCandidateCount)
+	}
+	r.MaximumJointExpectedPnLJPYHour = s.maximumJointExpectedPnLJPYHour
+	r.MaximumJointLowerPnLJPYHour = s.maximumJointLowerPnLJPYHour
+	r.MinimumJointPathEffectiveSamples = s.minimumJointPathEffectiveSamples
 	r.MaxPostFillIncrementalMeanBps = s.maxPostFillIncrementalMeanBps
 	r.MaxPostFillIncrementalLowerBps = s.maxPostFillIncrementalLowerBps
 	r.MacroActiveDecisions = s.macroActiveDecisions

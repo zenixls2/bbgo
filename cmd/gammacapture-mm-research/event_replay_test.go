@@ -2,6 +2,9 @@ package main
 
 import (
 	"math"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -145,5 +148,26 @@ func TestSummarizeHorizonVolatilityUsesNonOverlappingMidReturns(t *testing.T) {
 	want30 := math.Log(102.0/101.0) * 10_000
 	if math.Abs(stats[1].RMSReturnBps-math.Abs(want30)) > 1e-12 {
 		t.Fatalf("30-minute RMS mismatch: got %.12f want %.12f", stats[1].RMSReturnBps, math.Abs(want30))
+	}
+}
+
+func TestReadBBOUsesSparseMinuteIndex(t *testing.T) {
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "ETHJPY-bookticker-test.csv")
+	data := "received_at,bid,bid_quantity,ask,ask_quantity,gap_before_ms\n" +
+		"2026-08-03T17:41:00.100Z,100,1,101,2,0\n" +
+		"2026-08-03T17:42:00.100Z,102,1,103,2,0\n" +
+		"2026-08-03T17:43:00.100Z,104,1,105,2,0\n"
+	if err := os.WriteFile(filename, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rowOffset := len("received_at,bid,bid_quantity,ask,ask_quantity,gap_before_ms\n2026-08-03T17:41:00.100Z,100,1,101,2,0\n")
+	index := "minute_utc,byte_offset\n2026-08-03T17:41:00Z,0\n2026-08-03T17:42:00Z," + strconv.Itoa(rowOffset) + "\n"
+	if err := os.WriteFile(filename+".index.csv", []byte(index), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	books := readBBO(dir, "ETHJPY", parseTime("2026-08-03T17:42:00Z"), parseTime("2026-08-03T17:44:00Z"))
+	if len(books) != 2 || books[0].bid != 102 {
+		t.Fatalf("sparse index seek returned wrong rows: %+v", books)
 	}
 }

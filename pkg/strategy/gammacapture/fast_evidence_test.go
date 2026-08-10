@@ -145,6 +145,44 @@ func TestFastEvidenceWarmupFromCapture(t *testing.T) {
 	require.Equal(t, HealthHealthy, snapshot.Health)
 }
 
+func TestFastEvidenceWarmupPrefersCurrentDailyArchiveAcrossRoots(t *testing.T) {
+	now := time.Date(2026, 8, 5, 5, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	live := filepath.Join(root, "live")
+	collector := filepath.Join(root, "SOLJPY")
+	require.NoError(t, os.MkdirAll(live, 0o755))
+	require.NoError(t, os.MkdirAll(collector, 0o755))
+
+	stale := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	require.NoError(t, os.WriteFile(filepath.Join(live, "SOLJPY-trades-20260715T000000Z.csv"),
+		[]byte(fmt.Sprintf("event_time,received_at,id,price,quantity,side\n%s,%s,1,100,1,BUY\n", stale, stale)), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(live, "SOLJPY-bookticker-20260715T000000Z.csv"),
+		[]byte(fmt.Sprintf("received_at,bid,bid_quantity,ask,ask_quantity\n%s,99,1,101,1\n", stale)), 0o600))
+
+	recent1 := now.Add(-30 * time.Second).Format(time.RFC3339Nano)
+	recent2 := now.Add(-5 * time.Second).Format(time.RFC3339Nano)
+	require.NoError(t, os.WriteFile(filepath.Join(collector, "SOLJPY-trades-2026-08-05.csv"),
+		[]byte(fmt.Sprintf("event_time,received_at,id,price,quantity,side\n%s,%s,11,100,1,BUY\n%s,%s,12,101,1,SELL\n",
+			recent1, recent1, recent2, recent2)), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(collector, "SOLJPY-bookticker-2026-08-05.csv"),
+		[]byte(fmt.Sprintf("received_at,bid,bid_quantity,ask,ask_quantity\n%s,99,1,101,1\n%s,100,1,102,1\n",
+			recent1, recent2)), 0o600))
+
+	s := &Strategy{
+		Config: Config{
+			Symbol:         "SOLJPY",
+			MarketMaker:    MarketMakerConfig{FastEvidenceWindow: types.Duration(time.Minute)},
+			AggTradeWarmup: AggTradeWarmupConfig{Path: root, LivePath: live},
+		},
+		fastEvidence: NewFastEvidenceModel(FastEvidenceConfig{Window: time.Minute, MinTrades: 2, MinBBOUpdates: 2}),
+	}
+	require.NoError(t, s.warmFastEvidenceFromCapture(now))
+	snapshot := s.fastEvidence.Snapshot(now)
+	require.Equal(t, 2, snapshot.TradeCount)
+	require.Equal(t, 2, snapshot.BBOCount)
+	require.Equal(t, HealthHealthy, snapshot.Health)
+}
+
 func TestFastEvidenceMeasuresReboundOFIAndMicroprice(t *testing.T) {
 	now := time.Unix(7000, 0)
 	m := NewFastEvidenceModel(FastEvidenceConfig{Window: 10 * time.Minute, MinTrades: 1, MinBBOUpdates: 1})

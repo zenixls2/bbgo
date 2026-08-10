@@ -127,14 +127,82 @@ exchangeStrategies:
         inventoryRiskBudgetJPY: 10
         inventoryRiskBudgetRatio: 0.0025
         inventoryRiskZScore: 1.645
-        inventoryMaxOrderLevels: 32 # also divides target-centered band capacity into per-fill tranches
-        # Target-centered capital band: risk capacity is a half-width around
-        # 50% ETH / 50% JPY, bounded by the configured minimum reserve and a 100% maximum.
-        # Actual order quantities are additionally capped by remaining headroom.
+        inventoryMaxOrderLevels: 6 # staged correction levels used by both legacy and no-trade paths
+        probabilityCenteredQuantity:
+          enabled: true
+          # Live canary enabled after paired-replay review; retain quantityProjection diagnostics.
+          shadowOnly: false
+        # Portfolio policy bounds: 50% ETH / 50% JPY is the strategic prior,
+        # while 0% and 100% are outer limits before the macro controller derives
+        # a tighter target/cap. Orders are also capped by remaining headroom.
         inventoryTargetRatio: 0.5 # legacy fallback without pair-equity balances
         inventoryCapitalMinRatio: 0.0
         inventoryCapitalTargetRatio: 0.50
         inventoryCapitalMaxRatio: 1.0
+        # A single signed first-passage posterior supplies drift per unit QV.
+        # Executable ask/bid volatility and one-way cost solve asymmetric
+        # no-trade boundaries. Inside them Macro adds zero turnover; outside,
+        # the nearest boundary becomes the execution target. This supersedes
+        # 3h/6h/24h target weighting and reversal lease. Staged order-level
+        # contraction remains active; bounded Macro IOC is enabled only when
+        # its confidence-adjusted waiting loss exceeds crossing cost. The rolling horizons remain only as carrying-loss and
+        # drawdown hard-risk intersections. Fast still owns two-sided price and
+        # gross risk sizing; probability-centered quantity allocates that risk.
+        macroInventory:
+          enabled: true
+          noTradeRegion:
+            enabled: true
+            # If enabled, Macro may leave the hold inventory only when the
+            # one-sided executable forecast lower bound clears round-trip cost.
+            holdProtectionEnabled: true
+            holdProtectionZScore: 1.645
+            holdProtectionMinEdgeBps: 0
+            # Research-only: the causal long-window pivot model improved
+            # drawdown but did not yet deliver early strong entry after fees.
+            trendExcursionEnabled: false
+            # The legacy one-sided continuation cap remains disabled. The
+            # complete same-ticker continuation posterior owns the single Macro
+            # target when healthy; QV crossing is its causal fallback.
+            continuationEnabled: false
+            continuationMixtureEnabled: true
+          barInterval: 10m
+          lookback: 240h
+          riskHorizons: [3h, 6h, 24h]
+          minimumSamples: 8
+          riskAversion: 1.0
+          priorStrength: 0.05
+          driftPriorSamples: 20
+          downsideZScore: 2.326347874
+          carryRiskBudgetRatio: 0.01
+          maxWealthDrawdownRatio: 0.05
+          reversalAccumulation:
+            # Decode-compatible fallback used only when noTradeRegion is off.
+            enabled: true
+            # A fixed-endpoint sequential test compares the newest two closed
+            # executable-price bars with at least six preceding bars. This
+            # reduces detection from four posterior bars to two (normally
+            # 10-20 minutes depending on bar alignment). Its target shift is
+            # automatically shrunk by posterior sample reliability; the full
+            # BIC change-point path remains responsible for confirmed sizing.
+            earlyDetection: true
+            earlyPosteriorBars: 2
+            earlyMinimumPriorBars: 6
+            # When noTradeRegion is off, a marketable LIMIT IOC is allowed at
+            # most once per new closed
+            # Macro bar. It compares a BBO maker benchmark over the selected
+            # Fast 10/15/30-minute window against confidence-adjusted waiting
+            # loss. The IOC is a probability-sized tactical tranche capped by
+            # free balance, exchange filters, and opposite-side BBO depth. Its
+            # remaining economic surplus bounds the worst executable price.
+            # Resting maker orders stay live unless the IOC actually fills.
+            activeExecution:
+              enabled: false
+        hawkesDirection:
+          enabled: true
+          halfLife: 45s
+          selfExcitation: 0.35
+          crossExcitation: 0.05
+          minEvents: 8
         # The joint quote policy derives reservation price, spread, and side
         # quantity from the same normalized evidence and hazard inputs. Legacy
         # coefficient keys are intentionally omitted from the live profile.
@@ -153,24 +221,12 @@ exchangeStrategies:
         maxTradingWindow: 30m
         horizonLookback: 6h
         horizonUpdateInterval: 1m
-        horizonMinSamples: 20
-        # Train every 10/15/30-minute distance outcome from live BBO only. The
-        # fast regime adapts intraday; the persisted slow baseline prevents a
-        # sparse quote distance from falling off a hard six-hour cliff.
-        onlineArrival:
-          enabled: true
-          distanceStepBps: 5
-          fastHalfLife: 6h
-          slowHalfLife: 72h
-          persistenceInterval: 10m
-          # Reconstruct the rolling models and complete live training before
-          # any order lifecycle starts. Persisted horizon cursors make replay
-          # idempotent across restarts.
-          startupLookback: 72h
-          startupMaxAge: 15m
-          requireStartupHistory: true
-        # No horizonTouchModel block: the live-only online arrival estimator
-        # above is the exclusive fill-rate source.
+        # Effective exposure is overlap-adjusted. Posterior uncertainty,
+        # rather than non-zero touches on both sides, gates realignment.
+        horizonMinSamples: 6
+        # Arrival optimization is intentionally removed from this profile;
+        # Macro uses the existing horizon/crossing model without an online
+        # distance learner or startup BBO replay.
         refreshMoveBps: 8
         # Reprice a side that has moved materially away from the current BBO
         # only after its modeled keep window; this is directional, not a
@@ -191,6 +247,15 @@ exchangeStrategies:
           minOFI: 0.10
           minVolume: 0.10
           suppressOnDisagreement: true
+        acquisitionQuote:
+          # Shadow-only first-passage accommodation; it reports a dynamic
+          # confidence-bounded bid delta without changing live orders.
+          enabled: true
+          shadowOnly: true
+          maxDeltaBps: 15
+          minDriftBps: 2
+          driftConfidenceZScore: 1.645
+          minDirection: 0.25
         inventoryReset:
           enabled: true
           maxAskAge: 3m

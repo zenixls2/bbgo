@@ -181,7 +181,7 @@ type fastEvidenceWarmupEvent struct {
 // separate gap-aware path. Capture files can be rotated while this runs, so
 // malformed or partially written rows are skipped and the live stream remains
 // authoritative afterwards.
-func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
+func (s *Strategy) warmFastEvidenceFromCapture(now time.Time, replayAfter ...time.Time) error {
 	if s.fastEvidence == nil && len(s.fastEvidenceModels) == 0 {
 		return nil
 	}
@@ -190,28 +190,26 @@ func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
 		return fmt.Errorf("fast evidence window must be positive")
 	}
 	cutoff := now.Add(-window)
-	tradeFiles, err := filepath.Glob(filepath.Join(s.AggTradeWarmup.LivePath, s.Symbol+"-trades-*.csv"))
-	if err != nil {
-		return fmt.Errorf("list live trade capture files: %w", err)
+	var deltaCursor time.Time
+	if len(replayAfter) > 0 && replayAfter[0].After(cutoff) {
+		deltaCursor = replayAfter[0]
+		cutoff = replayAfter[0]
 	}
-	bookFiles, err := filepath.Glob(filepath.Join(s.AggTradeWarmup.LivePath, s.Symbol+"-bookticker-*.csv"))
+	tradeFiles, err := s.fastEvidenceCaptureFiles("trades")
 	if err != nil {
-		return fmt.Errorf("list live BBO capture files: %w", err)
+		return err
 	}
-	if len(tradeFiles) == 0 && len(bookFiles) == 0 {
-		collectorRoot := filepath.Join(s.AggTradeWarmup.Path, s.Symbol)
-		tradeFiles, err = filepath.Glob(filepath.Join(collectorRoot, s.Symbol+"-trades-*.csv"))
-		if err != nil {
-			return fmt.Errorf("list collector trade capture files: %w", err)
-		}
-		bookFiles, err = filepath.Glob(filepath.Join(collectorRoot, s.Symbol+"-bookticker-*.csv"))
-		if err != nil {
-			return fmt.Errorf("list collector BBO capture files: %w", err)
-		}
+	bookFiles, err := s.fastEvidenceCaptureFiles("bookticker")
+	if err != nil {
+		return err
 	}
 	if len(tradeFiles) == 0 && len(bookFiles) == 0 {
 		return fmt.Errorf("no live capture files for %s under %s", s.Symbol, s.AggTradeWarmup.LivePath)
 	}
+	tradeFiles = captureFilesOverlapping(tradeFiles, s.Symbol, "trades", cutoff, now)
+	tradeFiles = captureFilesChangedSinceCheckpoint(tradeFiles, s.makerCheckpointCaptureFiles)
+	bookFiles = captureFilesChangedSinceCheckpoint(bookFiles, s.makerCheckpointCaptureFiles)
+	bookFiles = captureFilesOverlapping(bookFiles, s.Symbol, "bookticker", cutoff, now)
 
 	events := make([]fastEvidenceWarmupEvent, 0, 4096)
 	seenTradeIDs := make(map[uint64]struct{})
@@ -220,8 +218,7 @@ func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
 		if openErr != nil {
 			continue
 		}
-		reader := csv.NewReader(file)
-		_, readErr := reader.Read()
+		reader, readErr := newIndexedCaptureReader(file, filename, cutoff)
 		if readErr != nil {
 			_ = file.Close()
 			continue
@@ -235,7 +232,7 @@ func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
 				continue
 			}
 			when, parseErr := time.Parse(time.RFC3339Nano, record[0])
-			if parseErr != nil || when.Before(cutoff) || when.After(now) {
+			if parseErr != nil || when.Before(cutoff) || !deltaCursor.IsZero() && !when.After(deltaCursor) || when.After(now) {
 				continue
 			}
 			id, idErr := strconv.ParseUint(record[2], 10, 64)
@@ -271,8 +268,7 @@ func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
 		if openErr != nil {
 			continue
 		}
-		reader := csv.NewReader(file)
-		_, readErr := reader.Read()
+		reader, readErr := newIndexedCaptureReader(file, filename, cutoff)
 		if readErr != nil {
 			_ = file.Close()
 			continue
@@ -286,7 +282,7 @@ func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
 				continue
 			}
 			when, parseErr := time.Parse(time.RFC3339Nano, record[0])
-			if parseErr != nil || when.Before(cutoff) || when.After(now) {
+			if parseErr != nil || when.Before(cutoff) || !deltaCursor.IsZero() && !when.After(deltaCursor) || when.After(now) {
 				continue
 			}
 			bid, bidErr := fixedpoint.NewFromString(record[1])
@@ -307,6 +303,9 @@ func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
 		_ = file.Close()
 	}
 	if len(events) == 0 {
+		if !deltaCursor.IsZero() {
+			return nil
+		}
 		return fmt.Errorf("no recent capture events for %s in %s", s.Symbol, window)
 	}
 	sort.SliceStable(events, func(i, j int) bool { return events[i].when.Before(events[j].when) })
@@ -334,15 +333,39 @@ func (s *Strategy) warmFastEvidenceFromCapture(now time.Time) error {
 	return nil
 }
 
+func (s *Strategy) fastEvidenceCaptureFiles(stream string) ([]string, error) {
+	roots := []string{
+		s.AggTradeWarmup.LivePath,
+		filepath.Join(s.AggTradeWarmup.Path, s.Symbol),
+	}
+	seen := make(map[string]struct{})
+	var files []string
+	for _, root := range roots {
+		matches, err := filepath.Glob(filepath.Join(root, s.Symbol+"-"+stream+"-*.csv"))
+		if err != nil {
+			return nil, fmt.Errorf("list %s capture files under %s: %w", stream, root, err)
+		}
+		for _, filename := range matches {
+			if _, ok := seen[filename]; ok {
+				continue
+			}
+			seen[filename] = struct{}{}
+			files = append(files, filename)
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
 func readLiveWarmupFile(filename string, cutoff, now time.Time, trades *[]warmupTrade) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		return fmt.Errorf("open live aggregate-trade file %s: %w", filename, err)
 	}
 	defer file.Close()
-	reader := csv.NewReader(file)
-	if _, err := reader.Read(); err != nil {
-		return fmt.Errorf("read live aggregate-trade header %s: %w", filename, err)
+	reader, err := newIndexedCaptureReader(file, filename, cutoff)
+	if err != nil {
+		return fmt.Errorf("initialize live aggregate-trade reader %s: %w", filename, err)
 	}
 	for {
 		record, readErr := reader.Read()

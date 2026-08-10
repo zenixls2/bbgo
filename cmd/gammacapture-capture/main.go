@@ -5,12 +5,10 @@ package main
 
 import (
 	"context"
-	"encoding/csv"
 	"flag"
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -22,6 +20,7 @@ func main() {
 	symbol := flag.String("symbol", "BTCJPY", "Binance spot symbol")
 	duration := flag.Duration("duration", 2*time.Hour, "capture duration")
 	output := flag.String("output", "data/gammacapture/live", "directory for timestamped CSV files")
+	migrateLegacy := flag.Bool("migrate-legacy", false, "copy legacy timestamped CSVs into verified UTC-daily files, then exit")
 	flag.Parse()
 	if *symbol == "" || *duration <= 0 {
 		fatalf("symbol and positive duration are required")
@@ -29,13 +28,20 @@ func main() {
 	if err := os.MkdirAll(*output, 0o755); err != nil {
 		fatalf("create output directory: %v", err)
 	}
-	stamp := time.Now().UTC().Format("20060102T150405Z")
-	trades, err := newCSV(filepath.Join(*output, *symbol+"-trades-"+stamp+".csv"), []string{"event_time", "received_at", "id", "price", "quantity", "side", "aggregate_id", "first_trade_id", "last_trade_id", "gap_before_ms", "source"})
+	if *migrateLegacy {
+		result, err := migrateLegacyCaptureFiles(*output, *symbol)
+		if err != nil {
+			fatalf("migrate legacy capture: %v", err)
+		}
+		fmt.Printf("migrated public %s capture: files=%d rows=%d dailyFiles=%d\n", *symbol, result.InputFiles, result.Rows, result.DailyFiles)
+		return
+	}
+	trades, err := newDailyCSV(*output, *symbol, "trades", []string{"event_time", "received_at", "id", "price", "quantity", "side", "aggregate_id", "first_trade_id", "last_trade_id", "gap_before_ms", "source"})
 	if err != nil {
 		fatalf("open trade output: %v", err)
 	}
 	defer trades.close()
-	books, err := newCSV(filepath.Join(*output, *symbol+"-bookticker-"+stamp+".csv"), []string{"received_at", "bid", "bid_quantity", "ask", "ask_quantity", "gap_before_ms"})
+	books, err := newDailyCSV(*output, *symbol, "bookticker", []string{"received_at", "bid", "bid_quantity", "ask", "ask_quantity", "gap_before_ms"})
 	if err != nil {
 		fatalf("open book output: %v", err)
 	}
@@ -63,12 +69,14 @@ func main() {
 		if gap >= captureGapThreshold {
 			log.Printf("WARN aggregate-trade capture gap=%s", gap)
 		}
-		trades.write([]string{
+		if err := trades.write(received, []string{
 			trade.Time.Time().UTC().Format(time.RFC3339Nano), received.Format(time.RFC3339Nano),
 			fmt.Sprintf("%d", trade.ID), trade.Price.String(), trade.Quantity.String(), trade.Side.String(),
 			fmt.Sprintf("%d", trade.AggregateTradeID), fmt.Sprintf("%d", trade.FirstTradeID), fmt.Sprintf("%d", trade.LastTradeID),
 			fmt.Sprintf("%d", gap.Milliseconds()), "stream",
-		})
+		}); err != nil {
+			log.Printf("ERROR write aggregate-trade capture: %v", err)
+		}
 	})
 	marketStream.OnBookTickerUpdate(func(book types.BookTicker) {
 		if book.Symbol != *symbol {
@@ -79,7 +87,9 @@ func main() {
 		if gap >= captureGapThreshold {
 			log.Printf("WARN bookticker capture gap=%s", gap)
 		}
-		books.write([]string{received.Format(time.RFC3339Nano), book.Buy.String(), book.BuySize.String(), book.Sell.String(), book.SellSize.String(), fmt.Sprintf("%d", gap.Milliseconds())})
+		if err := books.write(received, []string{received.Format(time.RFC3339Nano), book.Buy.String(), book.BuySize.String(), book.Sell.String(), book.SellSize.String(), fmt.Sprintf("%d", gap.Milliseconds())}); err != nil {
+			log.Printf("ERROR write bookticker capture: %v", err)
+		}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
 	defer cancel()
@@ -92,12 +102,6 @@ func main() {
 	if ctx.Err() != context.DeadlineExceeded {
 		fatalf("capture stopped: %v", ctx.Err())
 	}
-}
-
-type csvFile struct {
-	mu sync.Mutex
-	f  *os.File
-	w  *csv.Writer
 }
 
 const captureGapThreshold = 5 * time.Second
@@ -116,39 +120,6 @@ func (g *captureGapTracker) Observe(now time.Time) time.Duration {
 	}
 	g.last = now
 	return gap
-}
-
-func newCSV(path string, header []string) (*csvFile, error) {
-	f, err := os.Create(path)
-	if err != nil {
-		return nil, err
-	}
-	w := csv.NewWriter(f)
-	if err := w.Write(header); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	w.Flush()
-	if err := w.Error(); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	return &csvFile{f: f, w: w}, nil
-}
-
-func (f *csvFile) write(record []string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if err := f.w.Write(record); err == nil {
-		f.w.Flush()
-	}
-}
-
-func (f *csvFile) close() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.w.Flush()
-	_ = f.f.Close()
 }
 
 func fatalf(format string, args ...any) {

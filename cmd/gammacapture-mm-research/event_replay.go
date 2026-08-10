@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/c9s/bbgo/pkg/strategy/gammacapture"
@@ -417,15 +418,18 @@ func percentile(values []float64, q float64) float64 {
 }
 
 func readBBO(path, symbol string, from, to time.Time) []bboSnapshot {
-	files, _ := filepath.Glob(filepath.Join(path, symbol+"-bookticker-*.csv"))
+	files := replayCaptureFilesOverlapping(replayCaptureFiles(path, symbol, "bookticker"), symbol, "bookticker", from, to)
+	return readBBOFiles(files, from, to)
+}
+
+func readBBOFiles(files []string, from, to time.Time) []bboSnapshot {
 	var out []bboSnapshot
 	for _, filename := range files {
 		file, err := os.Open(filename)
 		if err != nil {
 			continue
 		}
-		reader := csv.NewReader(file)
-		_, _ = reader.Read() // header
+		reader := newReplayIndexedCaptureReader(file, filename, from)
 		for {
 			row, readErr := reader.Read()
 			if readErr == io.EOF {
@@ -457,15 +461,18 @@ func readBBO(path, symbol string, from, to time.Time) []bboSnapshot {
 // used by the archive reader. Binance BUY is aggressive buyer flow and SELL is
 // aggressive seller flow, which is exactly what a passive quote needs to test.
 func readLiveTrades(path, symbol string, from, to time.Time) []tick {
-	files, _ := filepath.Glob(filepath.Join(path, symbol+"-trades-*.csv"))
+	files := replayCaptureFilesOverlapping(replayCaptureFiles(path, symbol, "trades"), symbol, "trades", from, to)
+	return readLiveTradesFiles(files, from, to)
+}
+
+func readLiveTradesFiles(files []string, from, to time.Time) []tick {
 	var out []tick
 	for _, filename := range files {
 		file, err := os.Open(filename)
 		if err != nil {
 			continue
 		}
-		reader := csv.NewReader(file)
-		_, _ = reader.Read() // header
+		reader := newReplayIndexedCaptureReader(file, filename, from)
 		for {
 			row, readErr := reader.Read()
 			if readErr == io.EOF {
@@ -494,6 +501,114 @@ func readLiveTrades(path, symbol string, from, to time.Time) []tick {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].time.Before(out[j].time) })
 	return out
+}
+
+func replayCaptureFiles(path, symbol, stream string) []string {
+	roots := []string{path}
+	if filepath.Base(filepath.Clean(path)) != symbol {
+		roots = append(roots, filepath.Join(path, symbol))
+	}
+	seen := make(map[string]struct{})
+	var files []string
+	for _, root := range roots {
+		matches, _ := filepath.Glob(filepath.Join(root, symbol+"-"+stream+"-*.csv"))
+		for _, filename := range matches {
+			if strings.HasSuffix(filename, ".index.csv") {
+				continue
+			}
+			if _, ok := seen[filename]; ok {
+				continue
+			}
+			seen[filename] = struct{}{}
+			files = append(files, filename)
+		}
+	}
+	daily := make([]string, 0, len(files))
+	for _, filename := range files {
+		stamp := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(filename), symbol+"-"+stream+"-"), ".csv")
+		if len(stamp) == len(time.DateOnly) {
+			if _, err := time.Parse(time.DateOnly, stamp); err == nil {
+				daily = append(daily, filename)
+			}
+		}
+	}
+	if len(daily) > 0 {
+		sort.Strings(daily)
+		return daily
+	}
+	sort.Strings(files)
+	return files
+}
+
+// replayCaptureFilesOverlapping avoids opening every daily file for a bounded
+// replay. Legacy timestamped files have no reliable filename date and are kept.
+func replayCaptureFilesOverlapping(files []string, symbol, stream string, from, to time.Time) []string {
+	if from.IsZero() || !from.Before(to) {
+		return files
+	}
+	out := make([]string, 0, len(files))
+	for _, filename := range files {
+		stamp := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(filename), symbol+"-"+stream+"-"), ".csv")
+		day, err := time.Parse(time.DateOnly, stamp)
+		if err != nil {
+			out = append(out, filename)
+			continue
+		}
+		start := day.UTC()
+		if start.Before(to) && start.Add(24*time.Hour).After(from) {
+			out = append(out, filename)
+		}
+	}
+	return out
+}
+
+// newReplayIndexedCaptureReader seeks to the sparse minute index when one is
+// available. The index stores byte offsets at the beginning of data rows; a
+// missing/stale index safely falls back to reading the CSV header.
+func newReplayIndexedCaptureReader(file *os.File, filename string, cutoff time.Time) *csv.Reader {
+	if offset, ok := replayCaptureIndexOffset(filename+".index.csv", cutoff); ok && offset > 0 {
+		if _, err := file.Seek(offset, io.SeekStart); err == nil {
+			return csv.NewReader(file)
+		}
+	}
+	_, _ = file.Seek(0, io.SeekStart)
+	reader := csv.NewReader(file)
+	_, _ = reader.Read()
+	return reader
+}
+
+func replayCaptureIndexOffset(indexPath string, cutoff time.Time) (int64, bool) {
+	index, err := os.Open(indexPath)
+	if err != nil {
+		return 0, false
+	}
+	defer index.Close()
+	reader := csv.NewReader(index)
+	_, _ = reader.Read()
+	target := cutoff.UTC().Truncate(time.Minute)
+	var best int64
+	var bestMinute time.Time
+	found := false
+	for {
+		row, readErr := reader.Read()
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil || len(row) < 2 {
+			continue
+		}
+		minute, err := time.Parse(time.RFC3339Nano, row[0])
+		if err != nil || minute.After(target) {
+			continue
+		}
+		offset, err := strconv.ParseInt(row[1], 10, 64)
+		if err == nil && offset >= 0 && (!found || minute.After(bestMinute) || (minute.Equal(bestMinute) && offset < best)) {
+			best = offset
+			bestMinute = minute
+			found = true
+		}
+	}
+	return best, found && best > 0
 }
 
 // simulateEventReplay uses captured BBO and aggressive trades. A quote starts

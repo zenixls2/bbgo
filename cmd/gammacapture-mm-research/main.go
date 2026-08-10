@@ -64,22 +64,24 @@ type result struct {
 }
 
 type report struct {
-	Mode               string      `json:"mode"`
-	Symbol             string      `json:"symbol"`
-	TrainFrom          string      `json:"trainFrom"`
-	TrainTo            string      `json:"trainTo"`
-	HoldoutFrom        string      `json:"holdoutFrom"`
-	HoldoutTo          string      `json:"holdoutTo"`
-	TrainHistoricalBBO bool        `json:"trainHistoricalBBOAvailable"`
-	HistoricalBBO      bool        `json:"historicalBBOAvailable"`
-	BBOEvents          int         `json:"bboEvents"`
-	AggTradeEvents     int         `json:"aggTradeEvents"`
-	SampleHours        float64     `json:"sampleHours"`
-	Warning            string      `json:"warning"`
-	Selected           result      `json:"selected"`
-	TrainCandidates    []result    `json:"trainCandidates"`
-	Holdout            result      `json:"holdout"`
-	TickerStats        tickerStats `json:"tickerStats"`
+	Mode                  string      `json:"mode"`
+	Symbol                string      `json:"symbol"`
+	TrainFrom             string      `json:"trainFrom"`
+	TrainTo               string      `json:"trainTo"`
+	HoldoutFrom           string      `json:"holdoutFrom"`
+	HoldoutTo             string      `json:"holdoutTo"`
+	TrainHistoricalBBO    bool        `json:"trainHistoricalBBOAvailable"`
+	HistoricalBBO         bool        `json:"historicalBBOAvailable"`
+	BBOEvents             int         `json:"bboEvents"`
+	AggTradeEvents        int         `json:"aggTradeEvents"`
+	TrainReplayCacheHit   bool        `json:"trainReplayCacheHit"`
+	HoldoutReplayCacheHit bool        `json:"holdoutReplayCacheHit"`
+	SampleHours           float64     `json:"sampleHours"`
+	Warning               string      `json:"warning"`
+	Selected              result      `json:"selected"`
+	TrainCandidates       []result    `json:"trainCandidates"`
+	Holdout               result      `json:"holdout"`
+	TickerStats           tickerStats `json:"tickerStats"`
 }
 
 func main() {
@@ -114,6 +116,33 @@ func main() {
 	fixedInventorySkew := flag.Float64("fixed-inventory-skew-bps", -1, "evaluate only this inventory skew; negative keeps the training grid")
 	fixedVolatilityMult := flag.Float64("fixed-volatility-multiplier", 0, "evaluate only this volatility multiplier; zero keeps the training grid")
 	productionCompare := flag.Bool("production-compare", false, "compare legacy and horizon-touch policies with the production-state event replay")
+	macroReversalCompare := flag.Bool("macro-reversal-compare", false, "compare confirmed-only and early-sequential Macro reversal paths")
+	quantityProjectionCompare := flag.Bool("quantity-projection-compare", false, "compare staged and probability-centered quantity policies")
+	quantityProjectionCurrentOnly := flag.Bool("quantity-projection-current-only", false, "run only the current probability-centered policy")
+	noTradeIOCCompare := flag.Bool("no-trade-ioc-compare", false, "comparison of trend/QV no-trade, legacy Macro, and bounded IOC")
+	trendQVOnly := flag.Bool("trend-qv-only", false, "with --no-trade-ioc-compare, run only trend-excursion+ioc and qv-only+ioc")
+	continuationQVOnly := flag.Bool("continuation-qv-only", false, "with --no-trade-ioc-compare, run only qv-continuation+ioc and qv-only+ioc")
+	fastVarianceQVOnly := flag.Bool("fast-variance-qv-only", false, "with --no-trade-ioc-compare, run only qv-fast-variance+ioc and qv-only+ioc")
+	continuationMixtureOnly := flag.Bool("continuation-mixture-only", false, "with --no-trade-ioc-compare, run only the single-target QV+continuation predictive mixture")
+	continuationMixtureQVOnly := flag.Bool("continuation-mixture-qv-only", false, "with --no-trade-ioc-compare, compare continuation posterior with QV fallback")
+	holdProtectionOnly := flag.Bool("hold-protection-only", false, "with --no-trade-ioc-compare, compare QV no-trade with and without hold protection")
+	liveNoTradeToggleOnly := flag.Bool("live-no-trade-toggle-only", false, "with --no-trade-ioc-compare, compare current legacy maker with hold-protected no-trade maker")
+	fastOnlyFixedHalf := flag.Bool("fast-only-fixed-half", false, "with --no-trade-ioc-compare, run only Fast quoting around a fixed 50/50 inventory target with Macro and IOC disabled")
+	fastOnlyFixedHalfCompare := flag.Bool("fast-only-fixed-half-compare", false, "with --no-trade-ioc-compare, compare fixed-half fast with and without Hawkes")
+	multiscaleRegimeStudy := flag.Bool("multiscale-regime-study", false, "evaluate the standalone one-minute Bayesian regime model without Macro or order simulation")
+	multiscaleVarianceStudy := flag.Bool("multiscale-variance-study", false, "evaluate standalone side-specific online HAR variance forecasts without Macro or orders")
+	drawdownEProcessStudy := flag.Bool("drawdown-eprocess-study", false, "evaluate the standalone QV-time drawdown/recovery e-process without Macro or orders")
+	consolidationHazardStudy := flag.Bool("consolidation-hazard-study", false, "evaluate causal short-consolidation down/up competing risks without Macro or orders")
+	rangeRegimeStudy := flag.Bool("range-regime-study", false, "select non-overlapping ETHJPY ranging windows without using strategy P&L")
+	rangeWindow := flag.Duration("range-window", 12*time.Hour, "window length for blind ranging-regime selection")
+	rangeStep := flag.Duration("range-step", 6*time.Hour, "candidate step for blind ranging-regime selection")
+	rangeCount := flag.Int("range-count", 6, "maximum non-overlapping ranging windows to report")
+	regimeHorizon := flag.Duration("regime-horizon", 3*time.Hour, "executable first-passage horizon for the standalone regime study")
+	regimeAnchorStep := flag.Duration("regime-anchor-step", 3*time.Hour, "non-overlapping prediction anchor spacing for the standalone regime study")
+	maxDrawdownStopPct := flag.Float64("max-drawdown-stop-pct", 0, "stop production replay when equity drawdown reaches this percentage; zero disables")
+	replayCacheDir := flag.String("replay-cache-dir", "data/gammacapture/state/replay-cache", "deterministic parsed replay cache; empty disables")
+	replayFrom := flag.String("replay-from", "", "exact Macro replay start (RFC3339)")
+	replayTo := flag.String("replay-to", "", "exact Macro replay end (RFC3339)")
 	configPath := flag.String("config", "config/gammacapture.yaml", "GammaCapture YAML configuration used by production replay")
 	horizonTouchPath := flag.String("horizon-touch-model", "config/gammacapture-horizon-touch-soljpy.json", "accepted horizon-touch artifact used by production replay")
 	pairEquity := flag.Float64("pair-equity-jpy", 7_255, "starting SOLJPY quote-equivalent equity for production replay")
@@ -130,6 +159,69 @@ func main() {
 	holdStart, holdEnd := parseDate(*holdoutFrom), parseDate(*holdoutTo)
 	if !trainStart.Before(trainEnd) || !holdStart.Before(holdEnd) || *fee < 0 || *takerFee < 0 || *acquisitionSlippage < 0 || *adverse < 0 || *inventoryLimit <= 0 || *inventoryTargetRatio < 0 || *inventoryTargetRatio > 1 || *quoteNotional <= 0 || *minOrderNotional <= 0 || *statsQuoteDistance <= 0 || *minTradingWindow <= 0 || *maxTradingWindow < *minTradingWindow {
 		fatalf("invalid date or fee/inventory configuration")
+	}
+	if *rangeRegimeStudy {
+		if *replayFrom == "" || *replayTo == "" || *rangeWindow <= 0 || *rangeStep <= 0 || *rangeCount <= 0 {
+			fatalf("--range-regime-study requires replay bounds and positive range parameters")
+		}
+		runRangeRegimeStudy(rangeRegimeStudyInput{
+			DataPath: *bboData, Symbol: *symbol, From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			Window: *rangeWindow, Step: *rangeStep, MaximumWindows: *rangeCount,
+		})
+		return
+	}
+	if *consolidationHazardStudy {
+		if *regimeHorizon <= 0 {
+			fatalf("consolidation hazard horizon must be positive")
+		}
+		_, _, maker := loadProductionConfig(*configPath, *symbol)
+		windows := maker.FastModelWindows()
+		if len(windows) < 2 {
+			fatalf("consolidation hazard requires at least two fast-model windows")
+		}
+		runConsolidationHazardStudy(consolidationHazardStudyInput{
+			DataPath: *bboData, Symbol: *symbol, From: holdStart, To: holdEnd,
+			Horizon: *regimeHorizon, ShortWindow: windows[0], LongWindow: windows[len(windows)-1],
+			DecisionStep:     10 * time.Minute,
+			RoundTripCostBps: 2*maker.MakerFeeBps + 2*maker.AdverseSelectionBps + maker.MinimumNetEdgeBps,
+			ConfidenceZ:      maker.InventoryRiskZScore, MinimumSamples: 8,
+		})
+		return
+	}
+	if *drawdownEProcessStudy {
+		if *regimeHorizon <= 0 {
+			fatalf("drawdown e-process horizon must be positive")
+		}
+		barrier, _, maker := loadProductionConfig(*configPath, *symbol)
+		runDrawdownEProcessStudy(drawdownEProcessStudyInput{
+			DataPath: *bboData, Symbol: *symbol, From: holdStart, To: holdEnd,
+			Horizon:          *regimeHorizon,
+			RoundTripCostBps: 2*maker.MakerFeeBps + 2*maker.AdverseSelectionBps + maker.MinimumNetEdgeBps,
+			BarrierWidth:     barrier.Width, ConfidenceZ: maker.InventoryRiskZScore, Windows: maker.FastModelWindows(),
+		})
+		return
+	}
+	if *multiscaleVarianceStudy {
+		if *regimeHorizon <= 0 || *regimeAnchorStep < *regimeHorizon {
+			fatalf("variance horizon must be positive and anchor step must be at least the horizon")
+		}
+		runMultiscaleVarianceStudy(multiscaleVarianceStudyInput{
+			DataPath: *bboData, Symbol: *symbol, From: holdStart, To: holdEnd,
+			Horizon: *regimeHorizon, AnchorStep: *regimeAnchorStep,
+		})
+		return
+	}
+	if *multiscaleRegimeStudy {
+		if *regimeHorizon <= 0 || *regimeAnchorStep < *regimeHorizon {
+			fatalf("regime horizon must be positive and anchor step must be at least the horizon")
+		}
+		runMultiscaleRegimeStudy(multiscaleRegimeStudyInput{
+			DataPath: *bboData, Symbol: *symbol, From: holdStart, To: holdEnd,
+			Horizon: *regimeHorizon, AnchorStep: *regimeAnchorStep,
+			RoundTripCostBps: 2 * *fee,
+			HazardMeans:      []time.Duration{time.Hour, 3 * time.Hour, 6 * time.Hour},
+		})
+		return
 	}
 	if *earlyBumpStudy {
 		testFrom := time.Time{}
@@ -174,6 +266,47 @@ func main() {
 		}
 		return
 	}
+	if *noTradeIOCCompare {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--no-trade-ioc-compare requires --replay-from and --replay-to")
+		}
+		runNoTradeIOCComparison(noTradeIOCComparisonInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			QueueMultiplier: *queueMultiplier, MaxDrawdownStopPct: *maxDrawdownStopPct,
+			ReplayCacheDir: *replayCacheDir, TrendQVOnly: *trendQVOnly,
+			ContinuationQVOnly: *continuationQVOnly, FastVarianceQVOnly: *fastVarianceQVOnly, ContinuationMixtureOnly: *continuationMixtureOnly, ContinuationMixtureQVOnly: *continuationMixtureQVOnly, HoldProtectionOnly: *holdProtectionOnly, LiveNoTradeToggleOnly: *liveNoTradeToggleOnly, FastOnlyFixedHalf: *fastOnlyFixedHalf, FastOnlyFixedHalfCompare: *fastOnlyFixedHalfCompare,
+		})
+		return
+	}
+	if *quantityProjectionCompare {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--quantity-projection-compare requires --replay-from and --replay-to")
+		}
+		runQuantityProjectionComparison(quantityProjectionComparisonInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			QueueMultiplier: *queueMultiplier,
+			ReplayCacheDir:  *replayCacheDir,
+			CurrentOnly:     *quantityProjectionCurrentOnly, MaxDrawdownStopPct: *maxDrawdownStopPct,
+		})
+		return
+	}
+	if *macroReversalCompare {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--macro-reversal-compare requires --replay-from and --replay-to")
+		}
+		runMacroReversalComparison(macroReversalComparisonInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			QueueMultiplier: *queueMultiplier,
+			ReplayCacheDir:  *replayCacheDir,
+		})
+		return
+	}
 	if *productionCompare {
 		if *pairEquity <= 0 || *startingBase < 0 || *actualBuyFills < 0 || *actualSellFills < 0 {
 			fatalf("invalid production replay balance or fill calibration")
@@ -185,20 +318,17 @@ func main() {
 			QueueMultiplier: *queueMultiplier,
 			CalibrationFrom: parseTime(*calibrationFrom), CalibrationTo: parseTime(*calibrationTo),
 			ActualBuyFills: *actualBuyFills, ActualSellFills: *actualSellFills,
-			JournalPath: *journalData,
+			JournalPath:    *journalData,
+			ReplayCacheDir: *replayCacheDir,
 		})
 		return
 	}
-	trainTicks := mergeReplayTrades(
-		readTicks(*dataPath, trainStart, trainEnd),
-		readLiveTrades(*bboData, *symbol, trainStart, trainEnd),
-	)
-	holdoutTicks := mergeReplayTrades(
-		readTicks(*dataPath, holdStart, holdEnd),
-		readLiveTrades(*bboData, *symbol, holdStart, holdEnd),
-	)
-	trainBBO := compactBBO(readBBO(*bboData, *symbol, trainStart, trainEnd))
-	holdoutBBO := compactBBO(readBBO(*bboData, *symbol, holdStart, holdEnd))
+	trainBBO, trainCapturedTrades, trainReplayCacheHit := loadExactReplayDataset(*bboData, *symbol, trainStart, trainEnd, "", *replayCacheDir)
+	holdoutBBO, holdoutCapturedTrades, holdoutReplayCacheHit := loadExactReplayDataset(*bboData, *symbol, holdStart, holdEnd, "", *replayCacheDir)
+	trainTicks := mergeReplayTrades(readTicks(*dataPath, trainStart, trainEnd), trainCapturedTrades)
+	holdoutTicks := mergeReplayTrades(readTicks(*dataPath, holdStart, holdEnd), holdoutCapturedTrades)
+	trainBBO = compactBBO(trainBBO)
+	holdoutBBO = compactBBO(holdoutBBO)
 	trainHistoricalBBO := len(trainBBO) > 1
 	historicalBBO := len(holdoutBBO) > 1
 	if trainHistoricalBBO != historicalBBO {
@@ -294,6 +424,7 @@ func main() {
 		HoldoutFrom: holdStart.Format(time.DateOnly), HoldoutTo: holdEnd.Format(time.DateOnly),
 		TrainHistoricalBBO: trainHistoricalBBO, HistoricalBBO: historicalBBO,
 		BBOEvents: len(holdoutBBO), AggTradeEvents: len(holdoutTicks), SampleHours: sampleHours,
+		TrainReplayCacheHit: trainReplayCacheHit, HoldoutReplayCacheHit: holdoutReplayCacheHit,
 		Warning: warning, Selected: selected, TrainCandidates: candidates, Holdout: holdout,
 	}
 	r.TickerStats = summarizeTicker(holdoutTicks, holdoutBBO, *statsQuoteDistance, *fee)

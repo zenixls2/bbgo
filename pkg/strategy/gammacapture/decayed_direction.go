@@ -109,6 +109,12 @@ func fastEvidenceCoverage(snapshot FastEvidenceSnapshot, minTrades, minBBOUpdate
 	return math.Min(tradeCoverage, bboCoverage)
 }
 
+// FastEvidenceCoverage exposes the live public-data coverage weighting to
+// deterministic replay and research tooling.
+func FastEvidenceCoverage(snapshot FastEvidenceSnapshot, minTrades, minBBOUpdates int) float64 {
+	return fastEvidenceCoverage(snapshot, minTrades, minBBOUpdates)
+}
+
 func evidenceCountCoverage(count, minimum int) float64 {
 	if minimum <= 0 {
 		return 1

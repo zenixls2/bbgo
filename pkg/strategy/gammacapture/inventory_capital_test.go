@@ -41,6 +41,133 @@ func TestDynamicInventoryBandUsesPairCapital(t *testing.T) {
 	}
 }
 
+func TestProbabilisticInventoryVariationCentersExpectedPosition(t *testing.T) {
+	c := MarketMakerConfig{
+		InventoryRiskZScore:         1.645,
+		InventoryCapitalMinRatio:    0,
+		InventoryCapitalTargetRatio: 0.5,
+		InventoryCapitalMaxRatio:    1,
+	}
+	const (
+		equityJPY       = 6808.0
+		targetRatio     = 0.151431186
+		buyRatePerHour  = 0.4744
+		sellRatePerHour = 0.3667
+		executableJPY   = 101.7
+	)
+	d := c.ProbabilisticInventoryVariation(
+		equityJPY, targetRatio, 30*time.Minute,
+		buyRatePerHour, sellRatePerHour, executableJPY)
+	wantEvents := (buyRatePerHour + sellRatePerHour) * 0.5
+	wantStdDev := executableJPY * math.Sqrt(wantEvents)
+	wantHalfWidth := math.Max(1.5*executableJPY, c.InventoryRiskZScore*wantStdDev)
+	if !d.Enabled {
+		t.Fatalf("expected stochastic inventory variation: %+v", d)
+	}
+	if math.Abs(d.ExpectedFillEvents-wantEvents) > 1e-12 || math.Abs(d.InventoryStdDevJPY-wantStdDev) > 1e-9 {
+		t.Fatalf("unexpected compound-Poisson moments: got=%+v events=%f stddev=%f", d, wantEvents, wantStdDev)
+	}
+	if math.Abs(d.HalfWidthJPY-wantHalfWidth) > 1e-9 {
+		t.Fatalf("unexpected confidence half-width: got=%f want=%f", d.HalfWidthJPY, wantHalfWidth)
+	}
+	if math.Abs((d.LowerRatio+d.UpperRatio)/2-targetRatio) > 1e-12 {
+		t.Fatalf("variation band must preserve macro target as its expectation: %+v", d)
+	}
+	if (d.UpperRatio-targetRatio)*equityJPY+1e-9 < 1.5*executableJPY ||
+		(targetRatio-d.LowerRatio)*equityJPY+1e-9 < 1.5*executableJPY {
+		t.Fatalf("both sides must admit one fill plus half-lattice centering error: %+v", d)
+	}
+}
+
+func TestInventoryVariationHorizonTracksAdaptiveFastWindow(t *testing.T) {
+	c := MarketMakerConfig{MinTradingWindow: types.Duration(10 * time.Minute)}
+	horizon, source := c.InventoryVariationHorizon(15*time.Minute, 30*time.Minute)
+	if horizon != 15*time.Minute || source != "adaptive-fast" {
+		t.Fatalf("inventory window must follow selected fast model: horizon=%s source=%s", horizon, source)
+	}
+	horizon, source = c.InventoryVariationHorizon(0, 30*time.Minute)
+	if horizon != 30*time.Minute || source != "maker-horizon-fallback" {
+		t.Fatalf("missing fast window should use maker fallback: horizon=%s source=%s", horizon, source)
+	}
+	horizon, source = c.InventoryVariationHorizon(0, 0)
+	if horizon != 10*time.Minute || source != "configured-minimum-fallback" {
+		t.Fatalf("missing both windows should use configured minimum: horizon=%s source=%s", horizon, source)
+	}
+}
+
+func TestInventoryActuationHorizonUsesShortestCausalClock(t *testing.T) {
+	c := MarketMakerConfig{MinTradingWindow: types.Duration(10 * time.Minute)}
+	horizon, source := c.InventoryActuationHorizon(15*time.Minute, 3*time.Hour)
+	if horizon != 15*time.Minute || source != "shortest-fast-regime" {
+		t.Fatalf("long Macro lease must not stretch one correction: horizon=%s source=%s", horizon, source)
+	}
+	horizon, source = c.InventoryActuationHorizon(30*time.Minute, 15*time.Minute)
+	if horizon != 15*time.Minute || source != "shortest-regime-fast" {
+		t.Fatalf("shorter regime forecast must remain the safety clock: horizon=%s source=%s", horizon, source)
+	}
+	horizon, source = c.InventoryActuationHorizon(0, 0)
+	if horizon != 10*time.Minute || source != "configured-minimum-fallback" {
+		t.Fatalf("missing clocks must use configured fallback: horizon=%s source=%s", horizon, source)
+	}
+}
+
+func TestProbabilisticInventoryVariationUsesOneFillBootstrapAndPolicyBoundary(t *testing.T) {
+	c := MarketMakerConfig{
+		InventoryRiskZScore:         1.645,
+		InventoryCapitalMinRatio:    0,
+		InventoryCapitalTargetRatio: 0.5,
+		InventoryCapitalMaxRatio:    1,
+	}
+	d := c.ProbabilisticInventoryVariation(10_000, 0.25, 30*time.Minute, 0, 0, 100)
+	if !d.Enabled || math.Abs(d.HalfWidthJPY-150) > 1e-9 {
+		t.Fatalf("missing fill-rate data should retain one jump plus half-lattice centering error: %+v", d)
+	}
+	atBoundary := c.ProbabilisticInventoryVariation(10_000, 0, 30*time.Minute, 2, 2, 100)
+	if atBoundary.Enabled || atBoundary.LowerRatio != 0 || atBoundary.UpperRatio != 0 {
+		t.Fatalf("absolute outer policy boundary must collapse the symmetric band: %+v", atBoundary)
+	}
+}
+
+func TestDynamicInventoryBandWithRuntimeBoundsPreservesExpectedTarget(t *testing.T) {
+	c := MarketMakerConfig{
+		QuoteNotional: 120, InventoryRiskBudgetJPY: 100,
+		InventoryRiskZScore: 1.645, InventoryMaxOrderLevels: 32,
+		InventoryCapitalMinRatio: 0, InventoryCapitalTargetRatio: 0.5, InventoryCapitalMaxRatio: 1,
+	}
+	band := c.DynamicInventoryBandWithCapitalPolicyBounds(
+		290_000, 0.1, 30*time.Minute, 6808,
+		0.1355, 0.1514, 0.1673)
+	if math.Abs(band.CapitalTargetNotionalJPY-6808*0.1514) > 1e-9 {
+		t.Fatalf("runtime band shifted the expected target: %+v", band)
+	}
+	if band.CapitalMinNotionalJPY < 6808*0.1355-1e-9 || band.CapitalCapNotionalJPY > 6808*0.1673+1e-9 {
+		t.Fatalf("runtime band escaped supplied stochastic bounds: %+v", band)
+	}
+	if math.Abs((band.MinInventory+band.MaxInventory)/2-band.Target) > 1e-12 {
+		t.Fatalf("effective inventory region must remain centered: %+v", band)
+	}
+}
+
+func TestMakerMinimumExecutableNotionalUsesBothSideLattices(t *testing.T) {
+	market := types.Market{
+		MinNotional: fixedpoint.MustNewFromString("100"),
+		MinQuantity: fixedpoint.MustNewFromString("0.00001"),
+		StepSize:    fixedpoint.MustNewFromString("0.00001"),
+		TickSize:    fixedpoint.MustNewFromString("1"),
+	}
+	got := makerMinimumExecutableNotional(
+		market,
+		fixedpoint.MustNewFromString("290364"),
+		fixedpoint.MustNewFromString("293223"))
+	if got < 100 {
+		t.Fatalf("minimum executable notional fell below exchange minimum: %.8f", got)
+	}
+	buyCapacity, buyOK := makerMinimumExecutableBuyCapacity(market, fixedpoint.MustNewFromString("290364"))
+	if !buyOK || got+1e-9 < buyCapacity.Float64() {
+		t.Fatalf("minimum notional does not cover executable BUY lattice: got=%f buy=%s", got, buyCapacity)
+	}
+}
+
 func TestInventoryOrderHeadroomCapsBothSides(t *testing.T) {
 	band := InventoryBand{MinInventory: 0.15, Target: 0.30, MaxInventory: 0.45}
 	if got := inventoryBuyHeadroomNotional(band, 0.287, 12_000); math.Abs(got-1_956) > 1e-9 {
@@ -57,7 +184,7 @@ func TestInventoryOrderHeadroomCapsBothSides(t *testing.T) {
 	}
 }
 
-func TestTargetCenteredOrderCapsPreventFullBandTraversal(t *testing.T) {
+func TestTargetCenteredOrderCapsStageCorrectionAcrossLevels(t *testing.T) {
 	const price = 10_000.0
 	band := InventoryBand{
 		MinInventory: 0, Target: 0.5, MaxInventory: 1,
@@ -65,19 +192,19 @@ func TestTargetCenteredOrderCapsPreventFullBandTraversal(t *testing.T) {
 	}
 
 	atCash := targetCenteredInventoryOrderCaps(band, 0, price, 10)
-	if math.Abs(atCash.TrancheNotional-500) > 1e-9 || math.Abs(atCash.BuyNotional-5_000) > 1e-9 {
-		t.Fatalf("cash-edge cap should stop at target: %+v", atCash)
+	if math.Abs(atCash.TrancheNotional-500) > 1e-9 || math.Abs(atCash.BuyNotional-500) > 1e-9 {
+		t.Fatalf("cash-edge correction should use one staged tranche: %+v", atCash)
 	}
-	if ending := atCash.BuyNotional / price; math.Abs(ending-band.Target) > 1e-12 {
-		t.Fatalf("one corrective buy crossed target: ending=%f target=%f", ending, band.Target)
+	if ending := atCash.BuyNotional / price; math.Abs(ending-0.05) > 1e-12 {
+		t.Fatalf("one corrective buy should close one tenth of the target error: ending=%f", ending)
 	}
 
 	atBase := targetCenteredInventoryOrderCaps(band, 1, price, 10)
-	if math.Abs(atBase.TrancheNotional-500) > 1e-9 || math.Abs(atBase.SellQuantity-0.5) > 1e-12 {
-		t.Fatalf("base-edge cap should stop at target: %+v", atBase)
+	if math.Abs(atBase.TrancheNotional-500) > 1e-9 || math.Abs(atBase.SellQuantity-0.05) > 1e-12 {
+		t.Fatalf("base-edge correction should use one staged tranche: %+v", atBase)
 	}
-	if ending := 1 - atBase.SellQuantity; math.Abs(ending-band.Target) > 1e-12 {
-		t.Fatalf("one corrective sell crossed target: ending=%f target=%f", ending, band.Target)
+	if ending := 1 - atBase.SellQuantity; math.Abs(ending-0.95) > 1e-12 {
+		t.Fatalf("one corrective sell should close one tenth of the target error: ending=%f", ending)
 	}
 
 	atTarget := targetCenteredInventoryOrderCaps(band, band.Target, price, 10)
@@ -144,6 +271,34 @@ func TestExchangeFeasibleInventoryCapsNeverCrossHardBand(t *testing.T) {
 	if _, ok := market.GreaterThanMinimalOrderQuantity(types.SideTypeSell, price,
 		makerSellInventoryCapacity(market, price, modelSellCap, hardSellCap)); ok {
 		t.Fatal("SELL side must remain omitted when hard headroom cannot fit exchange minimum")
+	}
+}
+
+func TestBuyInventoryCapacityAcceptsValidHardHeadroomBelowPaddedMinimum(t *testing.T) {
+	market := types.Market{
+		MinNotional: fixedpoint.MustNewFromString("100"),
+		MinQuantity: fixedpoint.MustNewFromString("0.00001"),
+		StepSize:    fixedpoint.MustNewFromString("0.00001"),
+		TickSize:    fixedpoint.MustNewFromString("1"),
+	}
+	price := fixedpoint.MustNewFromString("290238")
+	modelCap := fixedpoint.MustNewFromString("3.21149218")
+	hardCap := fixedpoint.MustNewFromString("102.34")
+	paddedMinimum, minimumOK := makerMinimumExecutableBuyCapacity(market, price)
+	if !minimumOK || hardCap.Compare(paddedMinimum) >= 0 {
+		t.Fatalf("test requires valid headroom below padded minimum: hard=%s padded=%s", hardCap, paddedMinimum)
+	}
+	if _, hardOK := market.GreaterThanMinimalOrderQuantity(types.SideTypeBuy, price, hardCap); !hardOK {
+		t.Fatalf("test hard headroom must be directly exchange-valid: %s", hardCap)
+	}
+	capacity := makerBuyInventoryCapacity(market, price, modelCap, hardCap)
+	quantity, ok := market.GreaterThanMinimalOrderQuantity(types.SideTypeBuy, price, capacity)
+	if !ok || quantity.String() != "0.00035" {
+		t.Fatalf("valid hard headroom should floor to one executable BUY: capacity=%s quantity=%s ok=%v",
+			capacity, quantity, ok)
+	}
+	if capacity.Compare(hardCap) > 0 {
+		t.Fatalf("BUY capacity crossed the inventory band: capacity=%s hard=%s", capacity, hardCap)
 	}
 }
 
@@ -234,6 +389,8 @@ func TestCalculateMakerQuoteBalancesRecoversOwnReservations(t *testing.T) {
 	}
 
 	got := calculateMakerQuoteBalances(base, quote, orders)
+	assertFixedpointEqual(t, "total base", got.TotalBase, "0.1292253")
+	assertFixedpointEqual(t, "total quote", got.TotalQuote, "580")
 	assertFixedpointEqual(t, "available base", got.AvailableBase, "0.0002253")
 	assertFixedpointEqual(t, "quoteable base", got.QuoteableBase, "0.1292253")
 	assertFixedpointEqual(t, "available quote", got.AvailableQuote, "100")
@@ -299,5 +456,26 @@ func assertFixedpointEqual(t *testing.T, name string, got fixedpoint.Value, want
 	expected := fixedpoint.MustNewFromString(want)
 	if got.Compare(expected) != 0 {
 		t.Fatalf("%s: got %s, want %s", name, got, expected)
+	}
+}
+
+func TestDynamicInventoryBandAllowsTargetAtMacroCap(t *testing.T) {
+	c := MarketMakerConfig{
+		QuoteNotional: 120, InventoryRiskBudgetJPY: 10, InventoryRiskBudgetRatio: 0.0025,
+		InventoryRiskZScore: 1.645, InventoryMaxOrderLevels: 32,
+		InventoryCapitalMinRatio: 0, InventoryCapitalTargetRatio: 0.5, InventoryCapitalMaxRatio: 1,
+	}
+	band := c.DynamicInventoryBandWithCapitalPolicy(10_000, 0.5, 10*time.Minute, 10_000, 0.20, 0.20)
+	if math.Abs(band.Target*10_000-2_000) > 1e-9 || math.Abs(band.MaxInventory-band.Target) > 1e-12 {
+		t.Fatalf("macro target at cap must close new inventory headroom: %+v", band)
+	}
+	if band.MinInventory >= band.Target {
+		t.Fatalf("corrective asks must retain a lower-side band: %+v", band)
+	}
+	if got := inventoryBuyHeadroomNotional(band, band.Target, 10_000); got != 0 {
+		t.Fatalf("buy headroom must be zero at the carrying cap, got %.8f", got)
+	}
+	if got := inventorySellHeadroomQuantity(band, band.Target); got <= 0 {
+		t.Fatalf("sell headroom must remain positive at the carrying cap, got %.8f", got)
 	}
 }

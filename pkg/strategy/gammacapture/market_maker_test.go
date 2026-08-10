@@ -1,7 +1,6 @@
 package gammacapture
 
 import (
-	"encoding/json"
 	"math"
 	"strings"
 	"testing"
@@ -121,6 +120,23 @@ func TestMarketMakerQuoteInventorySkewAndMakerOnly(t *testing.T) {
 	}
 }
 
+func TestMarketMakerQuoteSoftBandDoesNotSuppressFastSide(t *testing.T) {
+	c := MarketMakerConfig{
+		MakerFeeBps: 1, AdverseSelectionBps: 1,
+		MinimumHalfSpreadBps: 5, MaximumHalfSpreadBps: 20,
+		InventoryTarget: 0.5, InventoryLimit: 0.1,
+	}
+	p := c.Quote(MarketMakerQuoteInput{
+		MidPrice: 100, BestBid: 99, BestAsk: 101,
+		Inventory: 0.7, InventoryMin: 0.4, InventoryMax: 0.6,
+		HardInventoryMin: 0, HardInventoryMax: 1,
+		CanBuy: true, CanSell: true,
+	})
+	if p.Reason != "quoted" || !p.AllowBid || !p.AllowAsk {
+		t.Fatalf("soft Macro variation must size, not hard-gate, Fast sides: %+v", p)
+	}
+}
+
 func TestMarketMakerQuoteAdaptsToDirectionAndImbalance(t *testing.T) {
 	c := MarketMakerConfig{MakerFeeBps: 1, AdverseSelectionBps: 1, MinimumHalfSpreadBps: 10, MaximumHalfSpreadBps: 50, InventoryLimit: 1, DirectionSkewBps: 10, ImbalanceSkewBps: 10}
 	neutral := c.Quote(MarketMakerQuoteInput{MidPrice: 100, BestBid: 99, BestAsk: 101, CanBuy: true, CanSell: true})
@@ -134,7 +150,7 @@ func TestMarketMakerQuoteAdaptsToDirectionAndImbalance(t *testing.T) {
 	}
 }
 
-func TestJointQuotePolicyUsesOnePressureForPriceAndQuantity(t *testing.T) {
+func TestQuotePressureDoesNotDuplicateSignalsIntoQuantity(t *testing.T) {
 	c := MarketMakerConfig{MakerFeeBps: 10, AdverseSelectionBps: 2, MinimumNetEdgeBps: 2, MinimumHalfSpreadBps: 15, MaximumHalfSpreadBps: 80, InventoryTarget: 0.5, InventoryLimit: 0.5}
 	plan := c.Quote(MarketMakerQuoteInput{
 		MidPrice: 100, BestBid: 99.99, BestAsk: 100.01, Inventory: 0.8, InventoryMin: 0.25, InventoryMax: 0.75,
@@ -144,11 +160,9 @@ func TestJointQuotePolicyUsesOnePressureForPriceAndQuantity(t *testing.T) {
 	if plan.SidePressure <= 0 || plan.BidDistanceBps <= plan.AskDistanceBps {
 		t.Fatalf("long inventory and bid-heavy hazard must make the bid the riskier side: %+v", plan)
 	}
-	if !(plan.BidQuoteFactor < 1 && plan.AskQuoteFactor == 1) {
-		t.Fatalf("the same pressure must reduce only the exposed side quantity: %+v", plan)
-	}
-	if math.Abs(plan.BidQuoteNotional-1000*plan.BidQuoteFactor) > 1e-9 || math.Abs(plan.AskQuoteNotional-1000*plan.AskQuoteFactor) > 1e-9 {
-		t.Fatalf("joint quantity output is inconsistent with factors: %+v", plan)
+	if plan.BidQuoteFactor != 1 || plan.AskQuoteFactor != 1 ||
+		math.Abs(plan.BidQuoteNotional-1000) > 1e-9 || math.Abs(plan.AskQuoteNotional-1000) > 1e-9 {
+		t.Fatalf("price pressure must not duplicate the same evidence through quantity: %+v", plan)
 	}
 }
 
@@ -190,13 +204,16 @@ func TestMarketMakerRefreshIntervalsUseFirstPassageScale(t *testing.T) {
 	}
 }
 
-func TestOrderKeepDistanceCoversFarthestPairedSide(t *testing.T) {
-	c := MarketMakerConfig{MakerFeeBps: 7.5, MinimumNetEdgeBps: 2, MaximumHalfSpreadBps: 80}
-	if got := c.OrderKeepDistanceBps(25); got != 80 {
-		t.Fatalf("paired lifecycle must cover the maximum ordinary side distance: got %.2f", got)
+func TestOrderKeepDistanceUsesActualExecutableDistance(t *testing.T) {
+	c := MarketMakerConfig{MakerFeeBps: 7.5, MinimumNetEdgeBps: 2, MinimumHalfSpreadBps: 15, MaximumHalfSpreadBps: 80}
+	if got := c.OrderKeepDistanceBps(25); got != 25 {
+		t.Fatalf("lifecycle must use the actual side distance, not the configured maximum: got %.2f", got)
 	}
 	if got := c.OrderKeepDistanceBps(95); got != 95 {
 		t.Fatalf("selected distance beyond configured side maximum must be retained: got %.2f", got)
+	}
+	if got := c.OrderKeepDistanceBps(0); got != 15 {
+		t.Fatalf("invalid distance must use the economic minimum fallback: got %.2f", got)
 	}
 }
 
@@ -254,13 +271,13 @@ func TestTradingHorizonsIncludeFiveToThirtyMinutes(t *testing.T) {
 
 func TestMakerQuoteRefreshSignalsRespectDynamicKeepDuration(t *testing.T) {
 	keep := 10 * time.Minute
-	if makerQuoteRefreshRequired(19*time.Second, 20*time.Second, keep, false, false, false, true, true, true) {
+	if makerQuoteRefreshRequired(19*time.Second, 20*time.Second, keep, false, false, false, true, true, true, false, true) {
 		t.Fatal("signals must not bypass the minimum transport resting interval")
 	}
-	if !makerQuoteRefreshRequired(20*time.Second, 20*time.Second, keep, true, false, false, false, false, false) {
+	if !makerQuoteRefreshRequired(20*time.Second, 20*time.Second, keep, true, false, false, false, false, false, false, false) {
 		t.Fatal("a crossed quote must remain a hard lifecycle transition")
 	}
-	if !makerQuoteRefreshRequired(20*time.Second, 20*time.Second, keep, false, false, false, false, false, true) {
+	if !makerQuoteRefreshRequired(20*time.Second, 20*time.Second, keep, false, false, false, false, false, true, false, false) {
 		t.Fatal("a missing or policy-mismatched side must remain actionable")
 	}
 	for name, signal := range map[string][4]bool{
@@ -269,15 +286,43 @@ func TestMakerQuoteRefreshSignalsRespectDynamicKeepDuration(t *testing.T) {
 		"material move":      {false, false, true, false},
 		"material imbalance": {false, false, false, true},
 	} {
-		if makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, signal[0], signal[1], signal[2], signal[3], false) {
+		if makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, signal[0], signal[1], signal[2], signal[3], false, false, false) {
 			t.Fatalf("%s must not destroy queue age before the modeled keep duration", name)
 		}
-		if !makerQuoteRefreshRequired(keep, 20*time.Second, keep, false, signal[0], signal[1], signal[2], signal[3], false) {
+		if !makerQuoteRefreshRequired(keep, 20*time.Second, keep, false, signal[0], signal[1], signal[2], signal[3], false, false, false) {
 			t.Fatalf("%s should refresh once the modeled keep duration resolves", name)
 		}
 	}
-	if makerQuoteRefreshRequired(keep, 20*time.Second, keep, false, false, false, false, false, false) {
+	if !makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, false, false, false, false, false, true, false) {
+		t.Fatal("a healthy fast-edge evidence lease should permit one bounded reprice before the generic keep duration")
+	}
+	if !makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, false, false, false, false, false, false, true) {
+		t.Fatal("a statistically significant edge improvement should re-align inside the generic keep duration")
+	}
+	if makerQuoteRefreshRequired(keep, 20*time.Second, keep, false, false, false, false, false, false, false, false) {
 		t.Fatal("no refresh signal should retain the existing quote")
+	}
+}
+
+func TestMakerQuoteStatisticalRealignmentRequiresSignificantImprovement(t *testing.T) {
+	active := MarketMakerHorizonDecision{
+		EstimatorSource: "online-bbo", ScoreBpsPerHour: 5, ScoreStdErrorBpsHour: 1,
+	}
+	candidate := MarketMakerHorizonDecision{
+		EstimatorSource: "online-bbo", ScoreBpsPerHour: 10, ScoreStdErrorBpsHour: 1,
+	}
+	refresh, improvement, threshold := makerQuoteStatisticalRealignment(candidate, active, 1.645)
+	if !refresh || math.Abs(improvement-5) > 1e-12 || threshold <= 2 || threshold >= 3 {
+		t.Fatalf("expected significant improvement: refresh=%v improvement=%f threshold=%f", refresh, improvement, threshold)
+	}
+	candidate.ScoreBpsPerHour = 7
+	if refresh, _, _ := makerQuoteStatisticalRealignment(candidate, active, 1.645); refresh {
+		t.Fatal("uncertain two-score improvement must preserve queue age")
+	}
+	active.ScoreStdErrorBpsHour = 0
+	candidate.ScoreBpsPerHour = 10
+	if refresh, _, threshold := makerQuoteStatisticalRealignment(candidate, active, 1.645); !refresh || threshold <= 0 {
+		t.Fatal("a zero-edge active quote should use candidate uncertainty rather than disable re-alignment")
 	}
 }
 
@@ -372,20 +417,44 @@ func TestMakerFillRebalanceFailureInvalidatesGeneration(t *testing.T) {
 	}
 }
 
-func TestMakerQuoteNearFillProtectsQueueAtWindowExpiry(t *testing.T) {
-	plan := MarketMakerQuotePlan{AllowBid: true, AllowAsk: true, BidDistanceBps: 30, AskDistanceBps: 30}
-	if !makerQuoteNearFill(99.8, 100.2, 99, 101, 100, plan, 10) {
-		t.Fatal("quotes closer than the replacement target should retain queue priority")
+func TestMakerQuoteNearFillProtectsETHJPYQueueAtWindowExpiry(t *testing.T) {
+	plan := MarketMakerQuotePlan{
+		AllowBid: true, AllowAsk: true,
+		BidTouchDistanceBps: 15, AskTouchDistanceBps: 15,
 	}
-	if makerQuoteNearFill(99.5, 100.5, 99, 101, 100, plan, 10) {
-		t.Fatal("quotes farther than the replacement target should be repriced")
+	// The 302158 bid was about 0.5 bps below the later 302173 best ask. The
+	// opposite side is farther away, but the pair still has enough gross edge;
+	// refreshing both sides here would destroy the near-fill queue position.
+	if !makerQuoteNearFill(302158, 303427, 302172, 302173, plan, 26) {
+		t.Fatal("fee-safe ETHJPY bid approaching best ask should retain queue priority")
 	}
-	if makerQuoteNearFill(99.99, 100.01, 99, 101, 100, plan, 10) {
-		t.Fatal("quotes inside the fee/adverse-selection floor must not be retained")
+	retainBid, retainAsk := makerQuoteNearFillSides(302158, 303427, 302172, 302173, plan, 26)
+	if !retainBid || retainAsk {
+		t.Fatalf("expected to retain only the approaching bid: retainBid=%t retainAsk=%t", retainBid, retainAsk)
 	}
-	plan.AllowAsk = false
-	if !makerQuoteNearFill(99.8, 100.2, 99, 101, 100, plan, 10) {
-		t.Fatal("a valid one-sided quote should still receive near-fill protection")
+	if makerQuoteNearFill(302158, 303427, 302700, 302710, plan, 26) {
+		t.Fatal("pair with neither side near the proposed executable distance should be reviewed for replacement")
+	}
+	if makerQuoteNearFill(302158, 302500, 302172, 302173, plan, 26) {
+		t.Fatal("pair inside the round-trip fee/adverse-selection floor must not be retained")
+	}
+	if makerQuoteNearFill(302180, 303427, 302172, 302173, plan, 26) {
+		t.Fatal("marketable/crossed bid must not be retained")
+	}
+}
+
+func TestMakerOrdersToCancelPreservesApproachingSide(t *testing.T) {
+	active := []types.Order{
+		{OrderID: 1, SubmitOrder: types.SubmitOrder{Side: types.SideTypeBuy}},
+		{OrderID: 2, SubmitOrder: types.SubmitOrder{Side: types.SideTypeSell}},
+	}
+	orders := makerOrdersToCancelForReplacement(active, true, false)
+	if len(orders) != 1 || orders[0].OrderID != 2 {
+		t.Fatalf("retained bid must not be cancelled: %+v", orders)
+	}
+	orders = makerOrdersToCancelForReplacement(active, false, true)
+	if len(orders) != 1 || orders[0].OrderID != 1 {
+		t.Fatalf("retained ask must not be cancelled: %+v", orders)
 	}
 }
 
@@ -491,6 +560,47 @@ func TestCrossingDecisionAtDistanceUsesActualQuoteDistance(t *testing.T) {
 	}
 	if far.UpCrosses != 0 || far.UpCrossesPerHour != 0 {
 		t.Fatalf("farther ask must not inherit the near-distance crossing rate: near=%+v far=%+v", near, far)
+	}
+}
+
+func TestCrossingDecisionTreatsZeroTouchesAsExposure(t *testing.T) {
+	start := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
+	model := MarketMakerHorizonModel{}
+	for minute := 0; minute <= 390; minute++ {
+		model.points = append(model.points, MarketMakerHorizonPoint{
+			At: start.Add(time.Duration(minute) * time.Minute), Bid: 100, Ask: 100.01,
+		})
+	}
+	config := MarketMakerConfig{
+		HorizonLookback: types.Duration(6 * time.Hour), HorizonMinSamples: 6,
+		MakerFeeBps: 1, AdverseSelectionBps: 0.5, MinimumNetEdgeBps: 1,
+	}
+	decision := model.CrossingDecisionAtSideDistances(
+		start.Add(390*time.Minute), config, 30*time.Minute, 15, 15, 30)
+	if decision.UpCrosses != 0 || decision.DownCrosses != 0 {
+		t.Fatalf("flat book should have zero raw touches: %+v", decision)
+	}
+	if decision.EffectiveSamples < 11 || decision.EffectiveSamples > 13 {
+		t.Fatalf("six hours should contain about twelve overlap-adjusted 30m exposures: %+v", decision)
+	}
+	if decision.BuyTouchProbability <= 0 || decision.SellTouchProbability <= 0 ||
+		decision.BuyTouchProbability >= 0.1 || decision.SellTouchProbability >= 0.1 {
+		t.Fatalf("zero touches must produce a small finite Jeffreys posterior: %+v", decision)
+	}
+	if !decision.HasSufficientCrossings(config.HorizonMinSamples) {
+		t.Fatalf("valid zero-touch exposure must not be classified as missing data: %+v", decision)
+	}
+}
+
+func TestTouchRateUsesDiscreteWindowPosteriorWithoutPoissonTransform(t *testing.T) {
+	decision := MarketMakerHorizonDecision{
+		Horizon: 30 * time.Minute, BuyTouchProbability: 0.2, SellTouchProbability: 0.3,
+	}
+	if got := decision.BuyTouchRatePerHour(); math.Abs(got-0.4) > 1e-12 {
+		t.Fatalf("buy renewal rate must equal p/H: got %f", got)
+	}
+	if got := decision.SellTouchRatePerHour(); math.Abs(got-0.6) > 1e-12 {
+		t.Fatalf("sell renewal rate must equal p/H: got %f", got)
 	}
 }
 
@@ -773,149 +883,8 @@ func TestHealthyDirectionSignalFailsClosed(t *testing.T) {
 	}
 }
 
-func onlineArrivalTestConfig() MarketMakerConfig {
-	return MarketMakerConfig{
-		MakerFeeBps: 7.5, AdverseSelectionBps: 2, MinimumNetEdgeBps: 2,
-		MinimumHalfSpreadBps: 15, MaximumHalfSpreadBps: 50,
-		MinTradingWindow: types.Duration(10 * time.Minute), MaxTradingWindow: types.Duration(10 * time.Minute),
-		HorizonLookback: types.Duration(6 * time.Hour), HorizonMinSamples: 4,
-		OnlineArrival: OnlineArrivalConfig{
-			Enabled: true, DistanceStepBps: 5,
-			FastHalfLife: types.Duration(time.Hour), SlowHalfLife: types.Duration(24 * time.Hour),
-		},
-	}
-}
-
-func observeOnlineArrivalCycles(model *MarketMakerHorizonModel, c MarketMakerConfig, start time.Time, cycles int, amplitude float64) time.Time {
-	for minute := 0; minute <= cycles*10; minute++ {
-		phase := 2 * math.Pi * float64(minute%10) / 10
-		mid := 100 + amplitude*math.Sin(phase)
-		model.Observe(start.Add(time.Duration(minute)*time.Minute), mid, c)
-	}
-	return start.Add(time.Duration(cycles*10) * time.Minute)
-}
-
-func TestOnlineArrivalLearnsFromColdLiveBBOAndSurvivesRestart(t *testing.T) {
-	c := onlineArrivalTestConfig()
-	state := NewOnlineArrivalState()
-	model := MarketMakerHorizonModel{}
-	model.bindOnlineArrival(state)
-	start := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
-
-	before := model.CrossingDecisionAtDistance(start, c, 10*time.Minute, 20)
-	if before.HasSufficientCrossings(c.HorizonMinSamples) {
-		t.Fatalf("cold model must not invent pre-trained evidence: %+v", before)
-	}
-	now := observeOnlineArrivalCycles(&model, c, start, 6, 0.5)
-	after := model.CrossingDecisionAtDistance(now, c, 10*time.Minute, 20)
-	if !after.HasSufficientCrossings(c.HorizonMinSamples) || after.EstimatorSource != "online-bbo" {
-		t.Fatalf("expected sufficient live-only BBO evidence: %+v", after)
-	}
-	if after.UpCrossesPerHour <= 0 || after.DownCrossesPerHour <= 0 || after.EffectiveSamples < 4 {
-		t.Fatalf("expected two-sided online rates and exposure: %+v", after)
-	}
-
-	encoded, err := json.Marshal(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var restored OnlineArrivalState
-	if err := json.Unmarshal(encoded, &restored); err != nil {
-		t.Fatal(err)
-	}
-	restarted := MarketMakerHorizonModel{}
-	restarted.bindOnlineArrival(&restored)
-	restoredDecision := restarted.CrossingDecisionAtDistance(now, c, 10*time.Minute, 20)
-	if !restoredDecision.HasSufficientCrossings(c.HorizonMinSamples) ||
-		math.Abs(restoredDecision.UpCrossesPerHour-after.UpCrossesPerHour) > 1e-12 ||
-		math.Abs(restoredDecision.DownCrossesPerHour-after.DownCrossesPerHour) > 1e-12 {
-		t.Fatalf("persisted sufficient statistics changed across restart: before=%+v after=%+v", after, restoredDecision)
-	}
-	stale := restarted.CrossingDecisionAtDistance(now.Add(10*24*time.Hour), c, 10*time.Minute, 20)
-	if stale.HasSufficientCrossings(c.HorizonMinSamples) {
-		t.Fatalf("long-stale persisted evidence must decay below the effective-sample gate: %+v", stale)
-	}
-}
-
-func TestOnlineArrivalSlowBaselineOutlivesFastRegime(t *testing.T) {
-	c := onlineArrivalTestConfig()
-	c.HorizonMinSamples = 3
-	state := NewOnlineArrivalState()
-	model := MarketMakerHorizonModel{}
-	model.bindOnlineArrival(state)
-	start := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
-	now := observeOnlineArrivalCycles(&model, c, start, 12, 0.5)
-
-	// Continue with a quiet market. The one-hour fast component should forget
-	// the old events much faster than the 24-hour slow component, without the
-	// hard six-hour cliff of the former rolling estimator.
-	for minute := 1; minute <= 6*60; minute++ {
-		now = now.Add(time.Minute)
-		model.ObserveWithGap(now, 100, c, false)
-	}
-	cell := state.Cells[onlineArrivalCellKey(10*time.Minute, 20)]
-	if cell == nil || cell.FastExposure <= 0 || cell.SlowExposure <= 0 {
-		t.Fatalf("missing online arrival cell: %+v", cell)
-	}
-	fastRate := (cell.FastUpEvents + cell.FastDownEvents) / cell.FastExposure
-	slowRate := (cell.SlowUpEvents + cell.SlowDownEvents) / cell.SlowExposure
-	if !(fastRate < slowRate) {
-		t.Fatalf("fast regime did not decay below slow baseline: fast=%f slow=%f cell=%+v", fastRate, slowRate, cell)
-	}
-	decision := model.CrossingDecisionAtDistance(now, c, 10*time.Minute, 20)
-	if !decision.HasSufficientCrossings(c.HorizonMinSamples) || decision.UpCrossesPerHour <= 0 || decision.DownCrossesPerHour <= 0 {
-		t.Fatalf("slow live baseline should remain usable after fast decay: %+v", decision)
-	}
-}
-
-func TestOnlineArrivalTrainsUnquotedDistanceBuckets(t *testing.T) {
-	c := onlineArrivalTestConfig()
-	state := NewOnlineArrivalState()
-	model := MarketMakerHorizonModel{}
-	model.bindOnlineArrival(state)
-	start := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
-	now := observeOnlineArrivalCycles(&model, c, start, 6, 0.3)
-
-	near := model.CrossingDecisionAtDistance(now, c, 10*time.Minute, 20)
-	far := model.CrossingDecisionAtDistance(now, c, 10*time.Minute, 45)
-	if !near.HasSufficientCrossings(c.HorizonMinSamples) {
-		t.Fatalf("near bucket should learn without having been quoted: %+v", near)
-	}
-	if far.UpCrossesPerHour != 0 || far.DownCrossesPerHour != 0 || far.HasSufficientCrossings(c.HorizonMinSamples) {
-		t.Fatalf("far bucket must learn the observed no-touch outcome independently: %+v", far)
-	}
-}
-
-func TestOnlineArrivalDoesNotBorrowLegacyOrOutOfGridRates(t *testing.T) {
-	c := onlineArrivalTestConfig()
-	state := NewOnlineArrivalState()
-	model := MarketMakerHorizonModel{}
-	model.bindOnlineArrival(state)
-	start := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
-	for minute := 0; minute <= 8*60; minute++ {
-		mid := 100 + 0.5*math.Sin(float64(minute)*math.Pi/4)
-		model.points = append(model.points, MarketMakerHorizonPoint{At: start.Add(time.Duration(minute) * time.Minute), Mid: mid})
-	}
-
-	// The raw points would satisfy the legacy rolling estimator. Explicit online
-	// mode must still start empty because they were not observed by the live
-	// online state machine.
-	decision := model.CrossingDecisionAtDistance(start.Add(8*time.Hour), c, 10*time.Minute, 20)
-	if decision.EstimatorSource != "online-bbo" || decision.UpCrossesPerHour != 0 || decision.DownCrossesPerHour != 0 {
-		t.Fatalf("online mode borrowed legacy/preloaded evidence: %+v", decision)
-	}
-
-	model.points = nil
-	now := observeOnlineArrivalCycles(&model, c, start.Add(9*time.Hour), 6, 0.5)
-	outside := model.CrossingDecisionAtDistance(now, c, 10*time.Minute, 105)
-	if outside.EstimatorSource != "online-bbo" || outside.HasSufficientCrossings(c.HorizonMinSamples) ||
-		outside.UpCrossesPerHour != 0 || outside.DownCrossesPerHour != 0 {
-		t.Fatalf("distance outside the trained grid borrowed a nearer rate: %+v", outside)
-	}
-}
-
 func TestMarketMakerHorizonDistinguishesQuietBBOFromOutage(t *testing.T) {
-	c := onlineArrivalTestConfig()
+	c := MarketMakerConfig{}
 	start := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
 	model := MarketMakerHorizonModel{}
 	model.Observe(start, 100, c)
@@ -1043,16 +1012,98 @@ func TestMarketMakerQuoteUsesSeparateExecutionVolatility(t *testing.T) {
 	}
 }
 
-func TestOnlineArrivalVersionOneMidpointStateIsDiscarded(t *testing.T) {
-	state := OnlineArrivalState{
-		Version:               1,
-		LastResolvedByHorizon: map[string]time.Time{"600": time.Now()},
-		Cells: map[string]*OnlineArrivalCell{
-			"600:20.000000": {HorizonSeconds: 600, DistanceBps: 20, SlowUpEvents: 10, SlowDownEvents: 10, SlowExposure: 1},
-		},
+func TestBrownianAcquisitionTouchProbabilityFallsWithPositiveDrift(t *testing.T) {
+	withoutDrift := brownianLowerBarrierTouchProbability(30, 0, 0.5, 15*60)
+	withDrift := brownianLowerBarrierTouchProbability(30, 15, 0.5, 15*60)
+	if withoutDrift <= withDrift || withoutDrift < 0 || withoutDrift > 1 || withDrift < 0 || withDrift > 1 {
+		t.Fatalf("unexpected first-passage probabilities: zero=%.8f positive=%.8f", withoutDrift, withDrift)
 	}
-	state.ensure()
-	if state.Version != onlineArrivalStateVersion || len(state.Cells) != 0 || len(state.LastResolvedByHorizon) != 0 {
-		t.Fatalf("midpoint-labeled state survived executable-BBO migration: %+v", state)
+}
+
+func TestAcquisitionQuoteDeltaUsesConfidenceBoundAndShadowMode(t *testing.T) {
+	cfg := AcquisitionQuoteConfig{Enabled: true, ShadowOnly: true, MaxDeltaBps: 15, MinDriftBps: 2, DriftConfidenceZScore: 1, MinDirection: 0.25}
+	delta, probability := acquisitionQuoteDeltaBps(35, 20, 30, 0.5, 15*60, cfg)
+	if math.Abs(delta-15) > 1e-9 || probability <= 0 || probability > 1 {
+		t.Fatalf("unexpected confidence-bounded acquisition delta: delta=%.8f probability=%.8f", delta, probability)
+	}
+	noConfidence, _ := acquisitionQuoteDeltaBps(35, 20, 10, 0.5, 15*60, cfg)
+	if noConfidence != 0 {
+		t.Fatalf("delta must fail closed when the lower confidence drift is below the minimum: %.8f", noConfidence)
+	}
+
+	base := MarketMakerConfig{MakerFeeBps: 10, AdverseSelectionBps: 2, MinimumNetEdgeBps: 2, MinimumHalfSpreadBps: 15, MaximumHalfSpreadBps: 80, InventoryLimit: 1}
+	input := MarketMakerQuoteInput{MidPrice: 100, BestBid: 99.9, BestAsk: 100.1, TradingHorizonSeconds: 15 * 60,
+		BuyVolatilityPerSqrtSec: 0.5, SellVolatilityPerSqrtSec: 0.5, AcquisitionDriftBps: 30,
+		AcquisitionVolatilityPerSqrtSecBps: 0.5, AcquisitionHorizonSeconds: 15 * 60, AcquisitionDirection: 1,
+		CanBuy: true, CanSell: true}
+	shadow := base
+	shadow.AcquisitionQuote = cfg
+	shadowPlan := shadow.Quote(input)
+	if shadowPlan.AcquisitionDeltaBps <= 0 || shadowPlan.AcquisitionApplied || shadowPlan.BidPrice <= 0 {
+		t.Fatalf("shadow plan should report but not apply the delta: %+v", shadowPlan)
+	}
+	live := base
+	cfg.ShadowOnly = false
+	live.AcquisitionQuote = cfg
+	livePlan := live.Quote(input)
+	if !livePlan.AcquisitionApplied || livePlan.BidPrice <= shadowPlan.BidPrice || livePlan.BidPrice >= input.BestAsk {
+		t.Fatalf("live acquisition plan must improve a maker bid without crossing: shadow=%+v live=%+v", shadowPlan, livePlan)
+	}
+	if livePlan.BidDistanceBps < live.MinimumHalfSpreadBps-1e-9 {
+		t.Fatalf("live acquisition plan crossed the fee floor: %+v", livePlan)
+	}
+}
+
+func TestInventoryActuationMovesTargetSideInwardWithoutSpendingRoundTripEdge(t *testing.T) {
+	c := MarketMakerConfig{
+		MakerFeeBps: 10, AdverseSelectionBps: 2, MinimumNetEdgeBps: 2,
+		MinimumHalfSpreadBps: 15, MaximumHalfSpreadBps: 80,
+		InventoryTarget: 1, InventoryLimit: 1,
+	}
+	in := MarketMakerQuoteInput{
+		MidPrice: 100, BestBid: 99.99, BestAsk: 100.01,
+		Inventory: 1, CanBuy: true, CanSell: true,
+	}
+	neutral := c.Quote(in)
+	in.InventoryActuationDirection = 1
+	in.InventoryActuationStrength = 1
+	actuated := c.Quote(in)
+	if !actuated.AllowBid || !actuated.AllowAsk {
+		t.Fatalf("actuation must retain both quote sides: %+v", actuated)
+	}
+	if actuated.BidPrice <= neutral.BidPrice || math.Abs(actuated.AskPrice-neutral.AskPrice) > 1e-12 {
+		t.Fatalf("buy actuation must move only the target bid inward: neutral=%+v actuated=%+v", neutral, actuated)
+	}
+	_, _, grossEdge := MakerTouchDistances(in.BestBid, in.BestAsk, actuated.BidPrice, actuated.AskPrice)
+	wantFloor := 2*c.MakerFeeBps + 2*c.AdverseSelectionBps + c.MinimumNetEdgeBps
+	if grossEdge+1e-9 < wantFloor || actuated.InventoryActuationInwardBps <= 0 {
+		t.Fatalf("actuated quote spent required round-trip edge: edge=%.8f floor=%.8f plan=%+v", grossEdge, wantFloor, actuated)
+	}
+}
+
+func TestInventoryActuationMovesSellTargetInwardAndKeepsBid(t *testing.T) {
+	c := MarketMakerConfig{
+		MakerFeeBps: 10, AdverseSelectionBps: 2, MinimumNetEdgeBps: 2,
+		MinimumHalfSpreadBps: 15, MaximumHalfSpreadBps: 80,
+		InventoryTarget: 1, InventoryLimit: 1,
+	}
+	in := MarketMakerQuoteInput{
+		MidPrice: 100, BestBid: 99.99, BestAsk: 100.01,
+		Inventory: 1, CanBuy: true, CanSell: true,
+	}
+	neutral := c.Quote(in)
+	in.InventoryActuationDirection = -1
+	in.InventoryActuationStrength = 1
+	actuated := c.Quote(in)
+	if !actuated.AllowBid || !actuated.AllowAsk {
+		t.Fatalf("sell actuation must retain both quote sides: %+v", actuated)
+	}
+	if actuated.AskPrice >= neutral.AskPrice || math.Abs(actuated.BidPrice-neutral.BidPrice) > 1e-12 {
+		t.Fatalf("sell actuation must move only the target ask inward: neutral=%+v actuated=%+v", neutral, actuated)
+	}
+	_, _, grossEdge := MakerTouchDistances(in.BestBid, in.BestAsk, actuated.BidPrice, actuated.AskPrice)
+	wantFloor := 2*c.MakerFeeBps + 2*c.AdverseSelectionBps + c.MinimumNetEdgeBps
+	if grossEdge+1e-9 < wantFloor || actuated.InventoryActuationInwardBps <= 0 {
+		t.Fatalf("sell actuation spent required round-trip edge: edge=%.8f floor=%.8f plan=%+v", grossEdge, wantFloor, actuated)
 	}
 }

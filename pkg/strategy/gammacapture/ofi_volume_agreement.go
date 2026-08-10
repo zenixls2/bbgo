@@ -51,3 +51,9 @@ func evaluateOFIVolumeAgreement(cfg OFIVolumeAgreementConfig, ofi, volume float6
 	s.Reason = "insufficient-evidence"
 	return s
 }
+
+// EvaluateOFIVolumeAgreement exposes the live auxiliary flow gate to
+// deterministic replay and research tooling.
+func EvaluateOFIVolumeAgreement(cfg OFIVolumeAgreementConfig, ofi, volume float64) OFIVolumeAgreementSnapshot {
+	return evaluateOFIVolumeAgreement(cfg, ofi, volume)
+}

@@ -330,6 +330,11 @@ func (s *Config) Validate() error {
 	if reset.DriftContinuationWeight < 0 || reset.DriftContinuationWeight > 1 {
 		return fmt.Errorf("inventory reset driftContinuationWeight must be between zero and one")
 	}
+	if s.MarketMaker.MacroInventory.Enabled {
+		if err := s.MarketMaker.MacroInventory.validate(); err != nil {
+			return err
+		}
+	}
 	acquisition := s.MarketMaker.AcquisitionReset
 	if acquisition.MinDeficitAge < 0 || acquisition.AdverseMoveBps < 0 || acquisition.MaxSlippageBps < 0 ||
 		acquisition.Cooldown < 0 || acquisition.MinSamples < 0 || acquisition.ConfidenceZScore < 0 ||

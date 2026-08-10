@@ -10,12 +10,14 @@ import (
 	"github.com/c9s/bbgo/pkg/types"
 )
 
-type adaptiveFastSnapshot struct {
+type AdaptiveFastSnapshot struct {
 	Window        time.Duration
 	Model         ModelSnapshot
 	Evidence      FastEvidenceSnapshot
 	HealthSummary string
 }
+
+type adaptiveFastSnapshot = AdaptiveFastSnapshot
 
 type FastCrossingActivity string
 
@@ -29,7 +31,7 @@ const (
 // fastCrossingInference separates observable data coverage from crossing
 // activity. In a sparse market, a fully observed window with no crossings is
 // information about a low event rate, not missing data.
-type fastCrossingInference struct {
+type FastCrossingInference struct {
 	Activity            FastCrossingActivity
 	DataHealth          ModelHealth
 	RateUsable          bool
@@ -42,6 +44,14 @@ type fastCrossingInference struct {
 	Observed            time.Duration
 	PriorExposure       time.Duration
 	RateSource          string
+}
+
+type fastCrossingInference = FastCrossingInference
+
+// InferFastCrossing exposes the same pure inference used by the live strategy
+// to deterministic replay and research tooling.
+func InferFastCrossing(window time.Duration, fast ModelSnapshot, evidence FastEvidenceSnapshot, slow ModelSnapshot) FastCrossingInference {
+	return inferFastCrossing(window, fast, evidence, slow)
 }
 
 // inferFastCrossing applies an online empirical-Bayes update to the selected
@@ -188,6 +198,9 @@ func (s *Strategy) makerDirectionSnapshot(window time.Duration, now time.Time) D
 }
 
 func (s *Strategy) observeFastEvidenceTrade(at time.Time, trade types.Trade) {
+	if s.makerHawkesDirectionModel != nil {
+		s.makerHawkesDirectionModel.ObserveTrade(at, trade)
+	}
 	if len(s.fastEvidenceModels) > 0 {
 		for _, model := range s.fastEvidenceModels {
 			model.ObserveTrade(at, trade)
@@ -255,9 +268,22 @@ func (s *Strategy) adaptiveFastSnapshot(now time.Time) adaptiveFastSnapshot {
 			HealthSummary: fmt.Sprintf("%s=%s/%s", window, model.Health, evidence.Health),
 		}
 	}
+	return SelectAdaptiveFastSnapshot(now, s.fastModels, s.fastEvidenceModels)
+}
 
-	windows := make([]time.Duration, 0, len(s.fastModels))
-	for window := range s.fastModels {
+// SelectAdaptiveFastSnapshot applies the live strategy's adaptive-window
+// selection to a supplied set of models. Keeping this logic shared prevents
+// offline production replay from silently testing a different fast window.
+func SelectAdaptiveFastSnapshot(now time.Time, fastModels map[time.Duration]*IntensityModel, fastEvidenceModels map[time.Duration]*FastEvidenceModel) AdaptiveFastSnapshot {
+	if len(fastModels) == 0 {
+		return AdaptiveFastSnapshot{
+			Model:    ModelSnapshot{Health: HealthInsufficient},
+			Evidence: FastEvidenceSnapshot{Health: HealthInsufficient},
+		}
+	}
+
+	windows := make([]time.Duration, 0, len(fastModels))
+	for window := range fastModels {
 		windows = append(windows, window)
 	}
 	sort.Slice(windows, func(i, j int) bool { return windows[i] < windows[j] })
@@ -271,9 +297,9 @@ func (s *Strategy) adaptiveFastSnapshot(now time.Time) adaptiveFastSnapshot {
 	summary := make([]string, 0, len(windows))
 	selected := -1
 	for _, window := range windows {
-		model := s.fastModels[window].Snapshot(now)
+		model := fastModels[window].Snapshot(now)
 		evidence := FastEvidenceSnapshot{Health: HealthInsufficient}
-		if evidenceModel := s.fastEvidenceModels[window]; evidenceModel != nil {
+		if evidenceModel := fastEvidenceModels[window]; evidenceModel != nil {
 			evidence = evidenceModel.Snapshot(now)
 		}
 		candidates = append(candidates, candidate{window: window, model: model, evidence: evidence})
@@ -300,7 +326,7 @@ func (s *Strategy) adaptiveFastSnapshot(now time.Time) adaptiveFastSnapshot {
 		}
 	}
 	chosen := candidates[selected]
-	return adaptiveFastSnapshot{
+	return AdaptiveFastSnapshot{
 		Window: chosen.window, Model: chosen.model, Evidence: chosen.evidence,
 		HealthSummary: strings.Join(summary, ","),
 	}

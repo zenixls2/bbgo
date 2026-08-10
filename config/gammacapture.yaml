@@ -156,21 +156,9 @@ exchangeStrategies:
         maxTradingWindow: 10m
         horizonLookback: 6h
         horizonUpdateInterval: 1m
-        horizonMinSamples: 20
-        # Train every 10/15-minute distance outcome from live BBO only. The
-        # fast regime adapts intraday; the persisted slow baseline prevents a
-        # sparse quote distance from falling off a hard six-hour cliff.
-        onlineArrival:
-          enabled: true
-          distanceStepBps: 5
-          fastHalfLife: 6h
-          slowHalfLife: 72h
-          persistenceInterval: 10m
-        # Disabled: the existing v1 artifact was trained on midpoint touch
-        # labels. Version 2 requires BUY labels from future ask minima, SELL
-        # labels from future bid maxima, and priceBasis=executable-bbo. The
-        # online-arrival model learns those semantics directly from raw BBO
-        # without pre-training.
+        horizonMinSamples: 6
+        # Horizon distances are estimated directly from side-specific BBO
+        # history; the retired online-arrival learner is intentionally omitted.
         horizonTouchModel:
           enabled: false
           path: config/gammacapture-horizon-touch-soljpy.json

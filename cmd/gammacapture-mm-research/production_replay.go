@@ -20,6 +20,7 @@ type productionComparisonInput struct {
 	PairEquityJPY, StartingBase, QueueMultiplier float64
 	CalibrationFrom, CalibrationTo               time.Time
 	ActualBuyFills, ActualSellFills              int
+	ReplayCacheDir                               string
 }
 
 type productionYAML struct {
@@ -46,46 +47,116 @@ type productionReplayDay struct {
 	BuyFills  int    `json:"buyFills"`
 	SellFills int    `json:"sellFills"`
 }
+
+type productionEquityPoint struct {
+	At                             time.Time     `json:"at"`
+	MidJPY                         float64       `json:"midJPY"`
+	EquityJPY                      float64       `json:"equityJPY"`
+	HoldEquityJPY                  float64       `json:"holdEquityJPY"`
+	Inventory                      float64       `json:"inventory"`
+	RiskyWeight                    float64       `json:"riskyWeight"`
+	TargetRatio                    float64       `json:"targetRatio"`
+	ReversalDirection              int           `json:"reversalDirection"`
+	EarlyReversal                  bool          `json:"earlyReversal"`
+	ReversalApplied                bool          `json:"reversalApplied"`
+	TrendDirection                 int           `json:"trendDirection,omitempty"`
+	TrendModelProbability          float64       `json:"trendModelProbability,omitempty"`
+	TrendTerminalReturnBps         float64       `json:"trendTerminalReturnBps,omitempty"`
+	TrendExpectedReturnBps         float64       `json:"trendExpectedReturnBps,omitempty"`
+	TrendRemainingExcursionBps     float64       `json:"trendRemainingExcursionBps,omitempty"`
+	TrendExpectedPivot             time.Duration `json:"trendExpectedPivot,omitempty"`
+	ContinuationRecentDirection    int           `json:"continuationRecentDirection,omitempty"`
+	ContinuationDirection          int           `json:"continuationDirection,omitempty"`
+	ContinuationConsolidationScore float64       `json:"continuationConsolidationScore,omitempty"`
+	ContinuationUpProbability      float64       `json:"continuationUpProbability,omitempty"`
+	ContinuationDownProbability    float64       `json:"continuationDownProbability,omitempty"`
+	ContinuationCensorProbability  float64       `json:"continuationCensorProbability,omitempty"`
+	ContinuationDownGivenMove      float64       `json:"continuationDownGivenMove,omitempty"`
+	ContinuationDownLower          float64       `json:"continuationDownLower,omitempty"`
+	ContinuationExpectedReturnBps  float64       `json:"continuationExpectedReturnBps,omitempty"`
+	ContinuationModelProbability   float64       `json:"continuationModelProbability,omitempty"`
+	NoTradeRawAimRatio             float64       `json:"noTradeRawAimRatio,omitempty"`
+	NoTradeAimRatio                float64       `json:"noTradeAimRatio,omitempty"`
+	NoTradeLowerRatio              float64       `json:"noTradeLowerRatio,omitempty"`
+	NoTradeUpperRatio              float64       `json:"noTradeUpperRatio,omitempty"`
+	NoTradeKalmanGain              float64       `json:"noTradeKalmanGain,omitempty"`
+	NoTradeEffectivePriorStrength  float64       `json:"noTradeEffectivePriorStrength,omitempty"`
+	NoTradeForecastReturnBps       float64       `json:"noTradeForecastReturnBps,omitempty"`
+	FastBuyRestraintEnabled        bool          `json:"fastBuyRestraintEnabled,omitempty"`
+	FastBuyRestraintForecastBps    float64       `json:"fastBuyRestraintForecastReturnBps,omitempty"`
+	FastBuyRestraintForecastSEBps  float64       `json:"fastBuyRestraintForecastSEBps,omitempty"`
+	FastBuyRestraintAdverseProb    float64       `json:"fastBuyRestraintAdverseProbability,omitempty"`
+	FastBuyRestraintStrength       float64       `json:"fastBuyRestraintStrength,omitempty"`
+	FastBuyRetention               float64       `json:"fastBuyRetention,omitempty"`
+	NoTradeContinuationCapApplied  bool          `json:"noTradeContinuationCapApplied,omitempty"`
+	NoTradeContinuationCapRatio    float64       `json:"noTradeContinuationCapRatio,omitempty"`
+}
+
+type productionReplayMacroDecision struct {
+	At                     time.Time `json:"at"`
+	ClosedBarAt            time.Time `json:"closedBarAt"`
+	Direction              int       `json:"direction"`
+	Trigger                bool      `json:"trigger"`
+	Reason                 string    `json:"reason"`
+	Quantity               float64   `json:"quantity"`
+	TargetGapBase          float64   `json:"targetGapBase"`
+	TacticalTargetGapBase  float64   `json:"tacticalTargetGapBase"`
+	ResidualMakerGapBase   float64   `json:"residualMakerGapBase"`
+	PassiveMissProbability float64   `json:"passiveMissProbability"`
+	UrgentFraction         float64   `json:"urgentFraction"`
+	WaitLossBps            float64   `json:"waitLossBps"`
+	CrossingCostBps        float64   `json:"crossingCostBps"`
+}
+
 type productionReplayResult struct {
 	Mode                               replayPolicyMode `json:"mode"`
 	From, To                           time.Time
-	ActiveHours                        float64               `json:"activeHours"`
-	BBOEvents                          int                   `json:"bboEvents"`
-	AggTradeEvents                     int                   `json:"aggTradeEvents"`
-	DataGaps                           int                   `json:"dataGaps"`
-	QueueMultiplier                    float64               `json:"queueMultiplier"`
-	QuoteRefreshes                     int                   `json:"quoteRefreshes"`
-	FullFills                          int                   `json:"fullFills"`
-	BuyFills                           int                   `json:"buyFills"`
-	SellFills                          int                   `json:"sellFills"`
-	RoundTrips                         int                   `json:"roundTrips"`
-	AcquisitionResets                  int                   `json:"acquisitionResets"`
-	AcquisitionQuantity                float64               `json:"acquisitionQuantity"`
-	TakerFeesJPY                       float64               `json:"takerFeesJPY"`
-	AcquisitionEvaluations             int                   `json:"acquisitionEvaluations"`
-	AcquisitionRejections              map[string]int        `json:"acquisitionRejections,omitempty"`
-	AcquisitionDrawdownLimitSamples    int                   `json:"acquisitionDrawdownLimitSamples"`
-	MinimumAcquisitionDrawdownLimitBps float64               `json:"minimumAcquisitionDrawdownLimitBps"`
-	MeanAcquisitionDrawdownLimitBps    float64               `json:"meanAcquisitionDrawdownLimitBps"`
-	MaximumAcquisitionDrawdownLimitBps float64               `json:"maximumAcquisitionDrawdownLimitBps"`
-	MaxUpProbabilityLower              float64               `json:"maxUpProbabilityLower"`
-	MaxAcquisitionIOCValueBps          float64               `json:"maxAcquisitionIOCValueBps"`
-	MaxAcquisitionImprovementBps       float64               `json:"maxAcquisitionImprovementBps"`
-	FillsPerHour                       float64               `json:"fillsPerHour"`
-	FillsPerDay                        float64               `json:"fillsPerDay"`
-	RoundTripsPerDay                   float64               `json:"roundTripsPerDay"`
-	QuoteUptimePct                     float64               `json:"quoteUptimePct"`
-	AverageBidDistanceBps              float64               `json:"averageBidDistanceBps"`
-	AverageAskDistanceBps              float64               `json:"averageAskDistanceBps"`
-	AverageQuoteLifeSeconds            float64               `json:"averageQuoteLifeSeconds"`
-	HorizonTouchFeatureReadyPct        float64               `json:"horizonTouchFeatureReadyPct"`
-	MakerFeesJPY                       float64               `json:"makerFeesJPY"`
-	NetPnLJPY                          float64               `json:"netPnLJPY"`
-	MeanMarkout1mBps                   float64               `json:"meanMarkout1mBps"`
-	MeanMarkout5mBps                   float64               `json:"meanMarkout5mBps"`
-	MeanMarkout10mBps                  float64               `json:"meanMarkout10mBps"`
-	DayResults                         []productionReplayDay `json:"dayResults"`
-	Limitations                        []string              `json:"limitations"`
+	ActiveHours                        float64                         `json:"activeHours"`
+	BBOEvents                          int                             `json:"bboEvents"`
+	AggTradeEvents                     int                             `json:"aggTradeEvents"`
+	DataGaps                           int                             `json:"dataGaps"`
+	QueueMultiplier                    float64                         `json:"queueMultiplier"`
+	QuoteRefreshes                     int                             `json:"quoteRefreshes"`
+	FullFills                          int                             `json:"fullFills"`
+	BuyFills                           int                             `json:"buyFills"`
+	SellFills                          int                             `json:"sellFills"`
+	RoundTrips                         int                             `json:"roundTrips"`
+	AcquisitionResets                  int                             `json:"acquisitionResets"`
+	AcquisitionQuantity                float64                         `json:"acquisitionQuantity"`
+	MacroActiveAttempts                int                             `json:"macroActiveAttempts"`
+	MacroActiveFills                   int                             `json:"macroActiveFills"`
+	MacroActiveQuantity                float64                         `json:"macroActiveQuantity"`
+	MacroActiveDecisions               []productionReplayMacroDecision `json:"macroActiveDecisions,omitempty"`
+	TakerFeesJPY                       float64                         `json:"takerFeesJPY"`
+	AcquisitionEvaluations             int                             `json:"acquisitionEvaluations"`
+	AcquisitionRejections              map[string]int                  `json:"acquisitionRejections,omitempty"`
+	AcquisitionDrawdownLimitSamples    int                             `json:"acquisitionDrawdownLimitSamples"`
+	MinimumAcquisitionDrawdownLimitBps float64                         `json:"minimumAcquisitionDrawdownLimitBps"`
+	MeanAcquisitionDrawdownLimitBps    float64                         `json:"meanAcquisitionDrawdownLimitBps"`
+	MaximumAcquisitionDrawdownLimitBps float64                         `json:"maximumAcquisitionDrawdownLimitBps"`
+	MaxUpProbabilityLower              float64                         `json:"maxUpProbabilityLower"`
+	MaxAcquisitionIOCValueBps          float64                         `json:"maxAcquisitionIOCValueBps"`
+	MaxAcquisitionImprovementBps       float64                         `json:"maxAcquisitionImprovementBps"`
+	FillsPerHour                       float64                         `json:"fillsPerHour"`
+	FillsPerDay                        float64                         `json:"fillsPerDay"`
+	RoundTripsPerDay                   float64                         `json:"roundTripsPerDay"`
+	QuoteUptimePct                     float64                         `json:"quoteUptimePct"`
+	AverageBidDistanceBps              float64                         `json:"averageBidDistanceBps"`
+	AverageAskDistanceBps              float64                         `json:"averageAskDistanceBps"`
+	AverageQuoteLifeSeconds            float64                         `json:"averageQuoteLifeSeconds"`
+	HorizonTouchFeatureReadyPct        float64                         `json:"horizonTouchFeatureReadyPct"`
+	MakerFeesJPY                       float64                         `json:"makerFeesJPY"`
+	NetPnLJPY                          float64                         `json:"netPnLJPY"`
+	MeanMarkout1mBps                   float64                         `json:"meanMarkout1mBps"`
+	MeanMarkout5mBps                   float64                         `json:"meanMarkout5mBps"`
+	MeanMarkout10mBps                  float64                         `json:"meanMarkout10mBps"`
+	DayResults                         []productionReplayDay           `json:"dayResults"`
+	EquityCurve                        []productionEquityPoint         `json:"equityCurve,omitempty"`
+	StoppedEarly                       bool                            `json:"stoppedEarly"`
+	StopAt                             time.Time                       `json:"stopAt,omitempty"`
+	StopReason                         string                          `json:"stopReason,omitempty"`
+	MaximumDrawdownPct                 float64                         `json:"maximumDrawdownPct"`
+	Limitations                        []string                        `json:"limitations"`
 }
 
 type productionComparisonReport struct {
@@ -102,10 +173,12 @@ type productionComparisonReport struct {
 	JournalLifecycle        *orderLifecycleReport    `json:"journalLifecycle,omitempty"`
 	FullAcquisitionReset    productionReplayResult   `json:"fullAcquisitionReset"`
 	Decision                string                   `json:"decision"`
+	ReplayCacheHit          bool                     `json:"replayCacheHit"`
 }
 
 type productionReplayOrder struct {
 	active                       bool
+	eligible                     bool
 	side                         types.SideType
 	price, remaining, queueAhead float64
 	placedAt                     time.Time
@@ -116,27 +189,49 @@ type replayFill struct {
 	price float64
 }
 
+type productionReplayMacroIOC struct {
+	active      bool
+	direction   int
+	quantity    float64
+	worstPrice  float64
+	closedBarAt time.Time
+}
+
 type productionReplayState struct {
 	cfg                                                                            gammacapture.MarketMakerConfig
 	artifact                                                                       *gammacapture.HorizonTouchArtifact
 	mode                                                                           replayPolicyMode
 	symbol                                                                         string
 	queueFactor                                                                    float64
+	barrierWidth                                                                   float64
 	engine                                                                         *gammacapture.CrossingEngine
-	slowModel, fastModel                                                           *gammacapture.IntensityModel
-	fastEvidence                                                                   *gammacapture.FastEvidenceModel
+	slowModel                                                                      *gammacapture.IntensityModel
+	executableCrossingModel                                                        *gammacapture.ExecutableCrossingModel
+	fastModels                                                                     map[time.Duration]*gammacapture.IntensityModel
+	fastEvidenceModels                                                             map[time.Duration]*gammacapture.FastEvidenceModel
+	hawkesDirectionModel                                                           *gammacapture.HawkesDirectionModel
 	horizonModel                                                                   gammacapture.MarketMakerHorizonModel
-	inventory, quote, initialEquity                                                float64
+	macroInventoryModel                                                            gammacapture.MacroInventoryModel
+	macroInventoryState                                                            gammacapture.MacroInventoryState
+	inventory, quote, initialEquity, initialInventory, initialQuote                float64
 	inventoryBand                                                                  gammacapture.InventoryBand
 	sideAllocationBias, sideDistanceBias                                           float64
 	sideAllocationReady, sideDistanceReady                                         bool
+	useProbabilityProjection                                                       bool
+	quotedTargetRatio                                                              float64
+	quotedTargetSet                                                                bool
 	bidOrder, askOrder                                                             productionReplayOrder
+	pendingMacroIOC                                                                productionReplayMacroIOC
 	lastQuoteAt, windowEndsAt                                                      time.Time
 	lastBestBid, lastBestAsk, lastMid, lastImbalance                               float64
 	acquisitionCooldownUntil                                                       time.Time
 	acquisitionDeficitSince                                                        time.Time
 	acquisitionDeficitAnchorMid                                                    float64
 	acquisitionResets                                                              int
+	macroActiveAttempts, macroActiveFills                                          int
+	macroActiveQuantity                                                            float64
+	lastMacroActiveDecisionBarAt                                                   time.Time
+	macroActiveDecisions                                                           []productionReplayMacroDecision
 	books, trades, gaps, refreshes, quoteActive                                    int
 	fills, buys, sells, roundTrips, unmatchedBuys, unmatchedSells                  int
 	featureChecks, featureReady                                                    int
@@ -161,6 +256,11 @@ type productionReplayState struct {
 	activeDuration                                                                 time.Duration
 	fillsByDay                                                                     map[string]*productionReplayDay
 	fillEvents                                                                     []replayFill
+	equityCurve                                                                    []productionEquityPoint
+	maxDrawdownStopPct, equityPeak, maximumDrawdownPct                             float64
+	stopped                                                                        bool
+	stopAt                                                                         time.Time
+	stopReason                                                                     string
 }
 
 func runProductionComparison(in productionComparisonInput) {
@@ -169,8 +269,9 @@ func runProductionComparison(in productionComparisonInput) {
 	if err != nil {
 		fatalf("load production horizon-touch model: %v", err)
 	}
-	books := compactBBO(readBBO(in.DataPath, in.Symbol, in.From, in.To))
-	trades := compactTrades(readLiveTrades(in.DataPath, in.Symbol, in.From, in.To))
+	books, trades, cacheHit := loadExactReplayDataset(in.DataPath, in.Symbol, in.From, in.To, replayConfigFingerprint(in.ConfigPath), in.ReplayCacheDir)
+	books = compactBBO(books)
+	trades = compactTrades(trades)
 	if len(books) < 2 || len(trades) == 0 {
 		fatalf("insufficient production replay events: bbo=%d trades=%d", len(books), len(trades))
 	}
@@ -207,7 +308,7 @@ func runProductionComparison(in productionComparisonInput) {
 	if lifecycle != nil && !lifecycle.CalibrationPassed {
 		calibrationPassed = false
 	}
-	report := productionComparisonReport{Symbol: in.Symbol, CalibrationActualBuy: actualBuyFills, CalibrationActualSell: actualSellFills, SelectedQueueMultiplier: selected, CalibrationPassed: calibrationPassed, CalibrationAbsError: calibrationError, CalibrationCandidates: candidates, CalibrationLegacy: calLegacy, FullLegacy: old, FullHorizonTouch: current, FullAcquisitionReset: acquisition, JournalLifecycle: lifecycle, Decision: compareReplayPolicies(old, current, calibrationPassed)}
+	report := productionComparisonReport{Symbol: in.Symbol, CalibrationActualBuy: actualBuyFills, CalibrationActualSell: actualSellFills, SelectedQueueMultiplier: selected, CalibrationPassed: calibrationPassed, CalibrationAbsError: calibrationError, CalibrationCandidates: candidates, CalibrationLegacy: calLegacy, FullLegacy: old, FullHorizonTouch: current, FullAcquisitionReset: acquisition, JournalLifecycle: lifecycle, Decision: compareReplayPolicies(old, current, calibrationPassed), ReplayCacheHit: cacheHit}
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(report); err != nil {
@@ -233,24 +334,42 @@ func loadProductionConfig(path, symbol string) (gammacapture.BarrierConfig, gamm
 	return gammacapture.BarrierConfig{}, gammacapture.IntensityConfig{}, gammacapture.MarketMakerConfig{}
 }
 
-func newProductionReplayState(cfg gammacapture.MarketMakerConfig, barrier gammacapture.BarrierConfig, intensity gammacapture.IntensityConfig, artifact *gammacapture.HorizonTouchArtifact, mode replayPolicyMode, symbol string, startQuote, startBase, queue float64, tradingFrom time.Time) *productionReplayState {
-	fastWindow := time.Duration(cfg.FastWindow)
-	if fastWindow <= 0 {
-		fastWindow = time.Minute
+func newProductionReplayState(cfg gammacapture.MarketMakerConfig, barrier gammacapture.BarrierConfig, intensity gammacapture.IntensityConfig, artifact *gammacapture.HorizonTouchArtifact, mode replayPolicyMode, symbol string, startQuote, startBase, queue float64, tradingFrom time.Time, useProbabilityProjection bool) *productionReplayState {
+	fastWindows := cfg.FastModelWindows()
+	fastModels := make(map[time.Duration]*gammacapture.IntensityModel, len(fastWindows))
+	fastEvidenceModels := make(map[time.Duration]*gammacapture.FastEvidenceModel, len(fastWindows))
+	for _, fastWindow := range fastWindows {
+		fastModels[fastWindow] = gammacapture.NewIntensityModel(gammacapture.IntensityConfig{
+			Window: types.Duration(fastWindow), VolatilityWindow: types.Duration(fastWindow),
+			PriorAlphaUp: 1, PriorBetaUp: 10, PriorAlphaDown: 1, PriorBetaDown: 10, MinEvents: 1,
+		})
+		evidenceWindow := fastWindow
+		if len(cfg.FastWindows) == 0 {
+			evidenceWindow = time.Duration(cfg.FastEvidenceWindow)
+		}
+		fastEvidenceModels[fastWindow] = gammacapture.NewFastEvidenceModel(gammacapture.FastEvidenceConfig{
+			Window: evidenceWindow, MinTrades: cfg.FastEvidenceMinTrades, MinBBOUpdates: cfg.FastEvidenceMinBBOUpdates,
+		})
 	}
-	return &productionReplayState{
-		cfg: cfg, artifact: artifact, mode: mode, symbol: symbol, queueFactor: queue,
-		engine:       gammacapture.NewCrossingEngine(barrier.Width, time.Duration(barrier.MinDwell), barrier.MaxCrossingsPerEvent),
-		slowModel:    gammacapture.NewIntensityModel(intensity),
-		fastModel:    gammacapture.NewIntensityModel(gammacapture.IntensityConfig{Window: types.Duration(fastWindow), VolatilityWindow: types.Duration(fastWindow), PriorAlphaUp: 1, PriorBetaUp: 10, PriorAlphaDown: 1, PriorBetaDown: 10, MinEvents: 1}),
-		fastEvidence: gammacapture.NewFastEvidenceModel(gammacapture.FastEvidenceConfig{Window: time.Duration(cfg.FastEvidenceWindow), MinTrades: cfg.FastEvidenceMinTrades, MinBBOUpdates: cfg.FastEvidenceMinBBOUpdates}),
-		inventory:    startBase, quote: startQuote, initialEquity: startQuote, tradingFrom: tradingFrom,
+	state := &productionReplayState{
+		cfg: cfg, artifact: artifact, mode: mode, symbol: symbol, queueFactor: queue, barrierWidth: barrier.Width, useProbabilityProjection: useProbabilityProjection,
+		engine:                  gammacapture.NewCrossingEngine(barrier.Width, time.Duration(barrier.MinDwell), barrier.MaxCrossingsPerEvent),
+		slowModel:               gammacapture.NewIntensityModel(intensity),
+		executableCrossingModel: gammacapture.NewExecutableCrossingModel(symbol, barrier, intensity),
+		fastModels:              fastModels, fastEvidenceModels: fastEvidenceModels, hawkesDirectionModel: gammacapture.NewHawkesDirectionModel(cfg.HawkesDirection),
+		inventory: startBase, quote: startQuote, initialEquity: startQuote,
+		initialInventory: startBase, initialQuote: startQuote, tradingFrom: tradingFrom,
 		fillsByDay:            make(map[string]*productionReplayDay),
 		acquisitionRejections: make(map[string]int),
 	}
+	return state
 }
 
 func simulateProductionPolicy(books []bboSnapshot, trades []tick, cfg gammacapture.MarketMakerConfig, barrier gammacapture.BarrierConfig, intensity gammacapture.IntensityConfig, artifact *gammacapture.HorizonTouchArtifact, mode replayPolicyMode, symbol string, pairEquity, startBase, queue float64, tradingFrom time.Time) productionReplayResult {
+	return simulateProductionPolicyWithQuantityProjection(books, trades, cfg, barrier, intensity, artifact, mode, symbol, pairEquity, startBase, queue, tradingFrom, true, 0)
+}
+
+func simulateProductionPolicyWithQuantityProjection(books []bboSnapshot, trades []tick, cfg gammacapture.MarketMakerConfig, barrier gammacapture.BarrierConfig, intensity gammacapture.IntensityConfig, artifact *gammacapture.HorizonTouchArtifact, mode replayPolicyMode, symbol string, pairEquity, startBase, queue float64, tradingFrom time.Time, useProbabilityProjection bool, maxDrawdownStopPct float64) productionReplayResult {
 	if len(books) < 2 {
 		return productionReplayResult{Mode: mode}
 	}
@@ -260,8 +379,10 @@ func simulateProductionPolicy(books []bboSnapshot, trades []tick, cfg gammacaptu
 	}
 	startMid := (books[startIndex].bid + books[startIndex].ask) / 2
 	startQuote := math.Max(0, pairEquity-startBase*startMid)
-	s := newProductionReplayState(cfg, barrier, intensity, artifact, mode, symbol, startQuote, startBase, queue, tradingFrom)
+	s := newProductionReplayState(cfg, barrier, intensity, artifact, mode, symbol, startQuote, startBase, queue, tradingFrom, useProbabilityProjection)
 	s.initialEquity = startQuote + startBase*startMid
+	s.maxDrawdownStopPct = math.Max(0, maxDrawdownStopPct)
+	s.equityPeak = s.initialEquity
 	bi, ti := 0, 0
 	var previous time.Time
 	for bi < len(books) || ti < len(trades) {
@@ -269,7 +390,7 @@ func simulateProductionPolicy(books []bboSnapshot, trades []tick, cfg gammacaptu
 		if useBook {
 			book := books[bi]
 			bi++
-			gap := !previous.IsZero() && book.time.Sub(previous) > 15*time.Minute
+			gap := !previous.IsZero() && book.time.Sub(previous) >= 15*time.Minute
 			if gap {
 				s.cancelQuotes(book.time)
 				if !book.time.Before(tradingFrom) {
@@ -284,6 +405,9 @@ func simulateProductionPolicy(books []bboSnapshot, trades []tick, cfg gammacaptu
 			}
 			previous = book.time
 			s.onBook(book, gap)
+			if s.stopped {
+				break
+			}
 		} else {
 			s.onTrade(trades[ti])
 			ti++
@@ -294,13 +418,24 @@ func simulateProductionPolicy(books []bboSnapshot, trades []tick, cfg gammacaptu
 }
 
 func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
+	// A quote decided from BBO[t] cannot execute against information that
+	// arrived before the next observable book. Activate it at BBO[t+1]; only
+	// subsequent public trades may consume its modeled queue.
+	s.activatePendingQuotesOnNextBBO()
+	macroIOCFilled := s.executePendingMacroIOC(book)
 	mid := (book.bid + book.ask) / 2
 	imbalance := replayBookImbalance(book)
 	ticker := types.BookTicker{Symbol: s.symbol, Buy: fixedpoint.NewFromFloat(book.bid), Sell: fixedpoint.NewFromFloat(book.ask), BuySize: fixedpoint.NewFromFloat(book.bidSize), SellSize: fixedpoint.NewFromFloat(book.askSize)}
-	s.fastEvidence.ObserveBBO(book.time, ticker)
+	for _, evidenceModel := range s.fastEvidenceModels {
+		evidenceModel.ObserveBBO(book.time, ticker)
+	}
 	micro := mid
 	if book.bidSize+book.askSize > 0 {
 		micro = (book.ask*book.bidSize + book.bid*book.askSize) / (book.bidSize + book.askSize)
+	}
+	s.slowModel.Observe(book.time, gap)
+	for _, fastModel := range s.fastModels {
+		fastModel.Observe(book.time, gap)
 	}
 	if gap {
 		s.engine.Reset(micro)
@@ -308,10 +443,14 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 		events := s.engine.Update(s.symbol, fixedpoint.NewFromFloat(micro), book.time, book.time, 0)
 		for _, event := range events {
 			s.slowModel.Update(event)
-			s.fastModel.Update(event)
+			for _, fastModel := range s.fastModels {
+				fastModel.Update(event)
+			}
 		}
 	}
 	s.horizonModel.ObserveBookWithGap(book.time, book.bid, book.ask, s.cfg, gap)
+	s.macroInventoryModel.ObserveBBO(book.time, mid, book.bid, book.ask, gap, s.cfg.MacroInventory)
+	s.executableCrossingModel.Observe(book.time, book.bid, book.ask, gap)
 	if book.time.Before(s.tradingFrom) {
 		return
 	}
@@ -325,10 +464,32 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 	}
 	s.lastDecisionSecond = decisionSecond
 	slow := s.slowModel.Snapshot(book.time)
-	fast := s.fastModel.Snapshot(book.time)
-	evidence := s.fastEvidence.Snapshot(book.time)
+	adaptiveFast := gammacapture.SelectAdaptiveFastSnapshot(book.time, s.fastModels, s.fastEvidenceModels)
+	fast := adaptiveFast.Model
+	evidence := adaptiveFast.Evidence
+	fastInference := gammacapture.InferFastCrossing(adaptiveFast.Window, fast, evidence, slow)
+	hawkesDirection := gammacapture.HawkesDirectionSnapshot{}
+	if s.hawkesDirectionModel != nil {
+		hawkesDirection = s.hawkesDirectionModel.Snapshot(book.time)
+	}
+	direction := fastInference.Direction * gammacapture.FastEvidenceCoverage(
+		evidence, s.cfg.FastEvidenceMinTrades, s.cfg.FastEvidenceMinBBOUpdates)
+	if hawkesDirection.Ready {
+		directionCoverage := gammacapture.FastEvidenceCoverage(evidence, s.cfg.FastEvidenceMinTrades, s.cfg.FastEvidenceMinBBOUpdates)
+		fastConfidence := math.Max(0, math.Min(1, fastInference.DirectionConfidence*directionCoverage))
+		combinedWeight := fastConfidence + hawkesDirection.Confidence
+		if combinedWeight > 0 {
+			direction = (direction*fastConfidence + hawkesDirection.Direction*hawkesDirection.Confidence) / combinedWeight
+		}
+	}
+	volumeSignal := evidence.VolumeBalance.Signal
+	agreement := gammacapture.EvaluateOFIVolumeAgreement(
+		s.cfg.OFIVolumeAgreement, evidence.OrderFlowImbalance30s, evidence.SignedTradeImbalance5m)
+	if agreement.Ready && !agreement.Agrees && s.cfg.OFIVolumeAgreement.SuppressOnDisagreement {
+		volumeSignal = 0
+	}
 	fastSideVolatility := s.horizonModel.EmpiricalSideVolatilityEstimate(
-		book.time, time.Duration(s.cfg.FastWindow))
+		book.time, adaptiveFast.Window)
 	minute := book.time.Truncate(time.Minute)
 	if !minute.Equal(s.volatilityMinute) {
 		s.cachedSideVolatility = s.horizonModel.EmpiricalSideVolatilityEstimate(
@@ -350,37 +511,29 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 	if selectedHorizon <= 0 {
 		selectedHorizon = time.Duration(s.cfg.MinTradingWindow)
 	}
-	neutralTouchDistance := func(selected time.Duration) (buyDistance, sellDistance, grossEdge float64) {
-		halfSpread := s.cfg.HalfSpreadForHorizon(selected, effectiveVolBps)
-		bidQuote := mid * math.Exp(-halfSpread/10_000)
-		askQuote := mid * math.Exp(halfSpread/10_000)
-		return gammacapture.MakerTouchDistances(book.bid, book.ask, bidQuote, askQuote)
-	}
-	initialBuyDistance, initialSellDistance, _ := neutralTouchDistance(selectedHorizon)
-	keepDecision := s.cfg.DynamicOrderKeepDecision(selectedHorizon,
-		s.cfg.OrderKeepDistanceBps(math.Max(initialBuyDistance, initialSellDistance)), effectiveVolBps)
-	for i := 0; i < 3; i++ {
-		buyDistance, sellDistance, _ := neutralTouchDistance(keepDecision.Duration)
-		distance := s.cfg.OrderKeepDistanceBps(math.Max(buyDistance, sellDistance))
-		next := s.cfg.DynamicOrderKeepDecision(selectedHorizon, distance, effectiveVolBps)
-		if next.Duration == keepDecision.Duration {
-			keepDecision = next
-			break
+	horizonDistance := func(selected time.Duration) (gammacapture.MarketMakerHorizonDecision, float64) {
+		candidate := s.horizonModel.DecisionForHorizon(book.time, s.cfg, effectiveVolBps, book.bid, book.ask, selected)
+		distance := math.Max(candidate.BuyTouchDistanceBps, candidate.SellTouchDistanceBps)
+		if distance <= 0 {
+			halfSpread := s.cfg.HalfSpreadForHorizon(selected, effectiveVolBps)
+			bidQuote := mid * math.Exp(-halfSpread/10_000)
+			askQuote := mid * math.Exp(halfSpread/10_000)
+			buyDistance, sellDistance, _ := gammacapture.MakerTouchDistances(book.bid, book.ask, bidQuote, askQuote)
+			distance = math.Max(buyDistance, sellDistance)
 		}
-		keepDecision = next
+		return candidate, distance
 	}
-	horizon := keepDecision.Duration
-	decision := selectedDecision
-	actualBuyDistance, actualSellDistance, actualGrossEdge := neutralTouchDistance(horizon)
-	if horizon != selectedHorizon ||
-		math.Abs(decision.BuyTouchDistanceBps-actualBuyDistance) > 1e-9 ||
-		math.Abs(decision.SellTouchDistanceBps-actualSellDistance) > 1e-9 {
-		decision = s.horizonModel.CrossingDecisionAtSideDistances(
-			book.time, s.cfg, horizon, actualBuyDistance, actualSellDistance, actualGrossEdge)
+	// Match live: the selected statistical model window is not silently
+	// replaced by the exchange-order review clock.
+	horizon := selectedHorizon
+	decision, _ := horizonDistance(horizon)
+	arrivalBuyDistance, arrivalSellDistance := 0.0, 0.0
+	if decision.DistanceOptimized && decision.HasSufficientCrossings(s.cfg.HorizonMinSamples) {
+		arrivalBuyDistance, arrivalSellDistance = decision.BuyTouchDistanceBps, decision.SellTouchDistanceBps
 	}
 	buyRate, sellRate := 0.0, 0.0
 	if decision.HasSufficientCrossings(s.cfg.HorizonMinSamples) {
-		buyRate, sellRate = decision.DownCrossesPerHour, decision.UpCrossesPerHour
+		buyRate, sellRate = decision.BuyTouchRatePerHour(), decision.SellTouchRatePerHour()
 	} else if s.mode != replayHorizonTouch && slow.Health == gammacapture.HealthHealthy && slow.Up > 0 && slow.Down > 0 && slow.Observed > 0 {
 		hours := slow.Observed.Hours()
 		if hours > 0 {
@@ -390,19 +543,178 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 	riskBuyRate, riskSellRate := buyRate, sellRate
 	pairEquity := s.quote + s.inventory*mid
 	cfg := s.cfg
+	effectiveTargetRatio := cfg.InventoryCapitalTargetRatio
+	baselineTargetRatio := effectiveTargetRatio
+	macroRegimeHorizon := time.Duration(0)
+	reversalDirection := 0
+	earlyReversal := false
+	reversalApplied := false
+	reversal := gammacapture.MacroReversalDecision{}
+	macroDecision := gammacapture.MacroInventoryDecision{
+		TargetRatio:       effectiveTargetRatio,
+		CapitalFloorRatio: cfg.InventoryCapitalMinRatio,
+		CapitalCapRatio:   cfg.InventoryCapitalMaxRatio,
+	}
+	noTradeInventoryEnabled := cfg.MacroInventory.Enabled && cfg.MacroInventory.NoTradeRegion.Enabled
+	if cfg.MacroInventory.Enabled {
+		s.macroInventoryState.ObserveWealth(book.time, pairEquity)
+		executableCrossing := s.executableCrossingModel.Snapshot(book.time)
+		macroDecision = cfg.MacroInventory.Decide(&s.macroInventoryModel, gammacapture.MacroInventoryInput{
+			Now: book.time, WealthJPY: pairEquity, WealthPeakJPY: s.macroInventoryState.WealthPeakJPY,
+			RiskyNotionalJPY: s.inventory * mid,
+			PriorTargetRatio: cfg.InventoryCapitalTargetRatio,
+			PolicyMinRatio:   cfg.InventoryCapitalMinRatio, PolicyMaxRatio: cfg.InventoryCapitalMaxRatio,
+			FallbackVolatilityBpsPerSqrtSec: effectiveVolBps,
+			CrossingSnapshot:                slow, ExecutableCrossingSnapshot: executableCrossing, BarrierWidth: s.barrierWidth,
+			CrossingQVRatePerSecond:      math.Pow(slow.GammaCaptureVolatility, 2),
+			FastVarianceRisk:             s.horizonModel.SideHARVarianceRisk(selectedHorizon),
+			BuyVolatilityBpsPerSqrtSec:   buyEffectiveVolBps,
+			SellVolatilityBpsPerSqrtSec:  sellEffectiveVolBps,
+			OneWayCostBps:                cfg.MakerFeeBps + cfg.AdverseSelectionBps,
+			ConfidenceZScore:             cfg.InventoryRiskZScore,
+			MinimumExecutableNotionalJPY: 100,
+			State:                        &s.macroInventoryState,
+			LatestClosedBarAt:            s.macroInventoryModel.LatestClosedBarAt(),
+		})
+		if noTradeInventoryEnabled {
+			baselineTargetRatio = macroDecision.NoTrade.AimRatio
+			effectiveTargetRatio = macroDecision.TargetRatio
+			macroRegimeHorizon = selectedHorizon
+			reversalDirection = macroDecision.NoTrade.Direction
+			reversal = gammacapture.MacroReversalDecision{
+				Reason:                "superseded by QV-time no-trade region",
+				BaselineTargetRatio:   baselineTargetRatio,
+				TargetRatio:           effectiveTargetRatio,
+				Direction:             macroDecision.NoTrade.Direction,
+				AggregateNetEdgeBps:   macroDecision.NoTrade.ExecutionEdgeBps(selectedHorizon),
+				SignalForecastHorizon: selectedHorizon,
+				CurrentRiskyWeight:    macroDecision.CurrentRiskyWeight,
+			}
+		} else {
+			policyMin := math.Max(cfg.InventoryCapitalMinRatio, macroDecision.CapitalFloorRatio)
+			policyMax := math.Min(cfg.InventoryCapitalMaxRatio,
+				math.Min(macroDecision.DrawdownCapRatio, macroDecision.CapitalCapRatio))
+			reversal = cfg.MacroInventory.DecideReversal(&s.macroInventoryModel, gammacapture.MacroReversalInput{
+				Now: book.time, BaselineTargetRatio: macroDecision.TargetRatio,
+				CurrentRiskyWeight: macroDecision.CurrentRiskyWeight,
+				PolicyMinRatio:     policyMin, PolicyMaxRatio: policyMax,
+				RoundTripCostBps:                2*cfg.MakerFeeBps + 2*cfg.AdverseSelectionBps + cfg.MinimumNetEdgeBps,
+				ConfidenceZScore:                cfg.InventoryRiskZScore,
+				RiskAversion:                    cfg.MacroInventory.RiskAversion,
+				FallbackVolatilityBpsPerSqrtSec: effectiveVolBps,
+			})
+			baselineTargetRatio = macroDecision.TargetRatio
+			reversal, _ = s.macroInventoryState.ApplyRegimeLease(
+				book.time, policyMin, policyMax, reversal)
+			effectiveTargetRatio = reversal.TargetRatio
+			macroRegimeHorizon = reversal.SignalForecastHorizon
+			reversalDirection = reversal.Direction
+			earlyReversal = reversal.EarlyHorizons > 0
+			reversalApplied = reversal.Applied || reversal.LeaseApplied
+		}
+	}
+	fastBuyRestraint := gammacapture.FastBuyRestraintDecision{Reason: "no-trade region inactive", BuyRetention: 1}
+	if noTradeInventoryEnabled {
+		fastBuyRestraint = macroDecision.NoTrade.FastBuyRestraint(horizon, cfg.InventoryRiskZScore)
+	}
+	s.recordEquity(book.time, mid, effectiveTargetRatio, reversalDirection, earlyReversal, reversalApplied)
+	if n := len(s.equityCurve); n > 0 {
+		trend := macroDecision.NoTrade.TrendExcursion
+		point := &s.equityCurve[n-1]
+		point.TrendDirection = trend.Direction
+		point.TrendModelProbability = trend.ModelProbability
+		point.TrendTerminalReturnBps = trend.TerminalExpectedReturn * 10_000
+		point.TrendExpectedReturnBps = trend.ExpectedReturn * 10_000
+		point.TrendRemainingExcursionBps = trend.RemainingExcursion * 10_000
+		point.TrendExpectedPivot = trend.ExpectedPivot
+		continuation := macroDecision.NoTrade.TrendContinuation
+		point.ContinuationRecentDirection = continuation.RecentDirection
+		point.ContinuationDirection = continuation.Direction
+		point.ContinuationConsolidationScore = continuation.ConsolidationScore
+		point.ContinuationUpProbability = continuation.UpProbability
+		point.ContinuationDownProbability = continuation.DownProbability
+		point.ContinuationCensorProbability = continuation.CensorProbability
+		point.ContinuationDownGivenMove = continuation.DownGivenMoveProbability
+		point.ContinuationDownLower = continuation.DownGivenMoveLower
+		point.ContinuationExpectedReturnBps = continuation.ExpectedReturn * 10_000
+		point.ContinuationModelProbability = continuation.ModelProbability
+		noTrade := macroDecision.NoTrade
+		point.NoTradeRawAimRatio = noTrade.RawAimRatio
+		point.NoTradeAimRatio = noTrade.AimRatio
+		point.NoTradeLowerRatio = noTrade.LowerRatio
+		point.NoTradeUpperRatio = noTrade.UpperRatio
+		point.NoTradeKalmanGain = noTrade.AimKalmanGain
+		point.NoTradeEffectivePriorStrength = noTrade.EffectivePriorStrength
+		point.NoTradeForecastReturnBps = noTrade.ForecastReturn * 10_000
+		point.FastBuyRestraintEnabled = fastBuyRestraint.Enabled
+		point.FastBuyRestraintForecastBps = fastBuyRestraint.ForecastReturnBps
+		point.FastBuyRestraintForecastSEBps = fastBuyRestraint.ForecastReturnSEBps
+		point.FastBuyRestraintAdverseProb = fastBuyRestraint.AdverseProbability
+		point.FastBuyRestraintStrength = fastBuyRestraint.Restraint
+		point.FastBuyRetention = fastBuyRestraint.BuyRetention
+		point.NoTradeContinuationCapApplied = noTrade.ContinuationCapApplied
+		point.NoTradeContinuationCapRatio = noTrade.ContinuationCapRatio
+	}
 	cfg.InventoryRiskBudgetJPY = cfg.EffectiveInventoryRiskBudgetJPY(pairEquity)
 	dynamicNotional := cfg.DynamicQuoteNotionalWithFillRates(effectiveVolBps, horizon, sellRate, buyRate)
 	if dynamicNotional <= 0 {
 		return
 	}
 	cfg.QuoteNotional = dynamicNotional
-	band := cfg.DynamicInventoryBandWithCapital(mid, effectiveVolBps, horizon, pairEquity)
-	if s.inventoryBand.MaxInventory > 0 && band.MaxInventory > 1.2*s.inventoryBand.MaxInventory {
+	var band gammacapture.InventoryBand
+	if cfg.MacroInventory.Enabled {
+		if noTradeInventoryEnabled {
+			band = cfg.InventoryBandFromPolicyRatios(
+				mid, pairEquity, macroDecision.NoTrade.LowerRatio,
+				macroDecision.NoTrade.ExecutionTargetRatio, macroDecision.NoTrade.UpperRatio)
+		} else {
+			variation := cfg.ProbabilisticInventoryVariation(
+				pairEquity, effectiveTargetRatio, horizon,
+				riskBuyRate, riskSellRate, 100)
+			band = cfg.DynamicInventoryBandWithCapitalPolicyBounds(
+				mid, effectiveVolBps, horizon, pairEquity,
+				variation.LowerRatio, variation.ExpectedTargetRatio, variation.UpperRatio)
+		}
+	} else {
+		band = cfg.DynamicInventoryBandWithCapital(mid, effectiveVolBps, horizon, pairEquity)
+	}
+	if !noTradeInventoryEnabled &&
+		s.inventoryBand.MaxInventory > 0 && band.MaxInventory > 1.2*s.inventoryBand.MaxInventory {
 		band.MaxInventory = 1.2 * s.inventoryBand.MaxInventory
 		band.Target = band.MaxInventory * band.TargetRatio
 		band.Limit = band.MaxInventory - band.Target
 	}
 	s.inventoryBand = band
+	hardBand := cfg.HardInventoryBand(band, mid, pairEquity)
+	if noTradeInventoryEnabled {
+		hardBand = cfg.InventoryBandFromPolicyRatios(
+			mid, pairEquity, macroDecision.CapitalFloorRatio,
+			band.TargetRatio, macroDecision.CapitalCapRatio)
+	}
+	// Use the same causal waiting clock as live trading. The Macro forecast may
+	// span hours, but a single staged maker correction must be sized for the
+	// shorter adaptive Fast/order window so replay cannot hide an under-used
+	// correction behind a long regime horizon.
+	actuationHorizon, _ := cfg.InventoryActuationHorizon(selectedHorizon, macroRegimeHorizon)
+	actuation := gammacapture.InventoryActuationDecision{Reason: "superseded by QV-time no-trade region"}
+	actuationLevels := 1.0
+	targetContraction := 1.0
+	actuation = gammacapture.InventoryActuation(gammacapture.InventoryActuationInput{
+		CurrentInventoryNotionalJPY: s.inventory * mid,
+		TargetInventoryNotionalJPY:  band.Target * mid,
+		ExpectedFillNotionalJPY:     100,
+		BuyFillRatePerHour:          riskBuyRate,
+		SellFillRatePerHour:         riskSellRate,
+		RegimeHorizon:               actuationHorizon,
+		MaximumOrderLevels:          cfg.InventoryMaxOrderLevels,
+		MomentumSignal:              direction,
+	})
+	actuationLevels = math.Max(1, cfg.InventoryMaxOrderLevels)
+	targetContraction = 1 / actuationLevels
+	if actuation.Enabled {
+		actuationLevels = actuation.EffectiveOrderLevels
+		targetContraction = actuation.TargetContraction
+	}
 	if s.inventory < band.Target {
 		if s.acquisitionDeficitSince.IsZero() {
 			s.acquisitionDeficitSince = book.time
@@ -415,7 +727,6 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 	cfg.InventoryTarget, cfg.InventoryLimit = band.Target, band.Limit
 	freeBase, freeQuote := s.freeBalances()
 	canBuy, canSell := freeQuote > 0, freeBase*mid >= 100
-	direction := replayDirection(fast)
 	if s.mode == replayHorizonTouch && s.artifact != nil {
 		s.featureChecks++
 		if !minute.Equal(s.featureMinute) {
@@ -425,14 +736,14 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 		features, ready := s.cachedFeatures, s.cachedFeaturesReady
 		if ready {
 			s.featureReady++
-			provisional := cfg.Quote(gammacapture.MarketMakerQuoteInput{MidPrice: mid, BestBid: book.bid, BestAsk: book.ask, VolatilityPerSqrtSec: effectiveVolBps, BuyVolatilityPerSqrtSec: buyEffectiveVolBps, SellVolatilityPerSqrtSec: sellEffectiveVolBps, TradingHorizonSeconds: horizon.Seconds(), Inventory: freeBase, DirectionSignal: direction, BookImbalance: imbalance, SideDistanceBias: s.sideDistanceBias, CanBuy: canBuy, CanSell: canSell})
+			provisional := cfg.Quote(gammacapture.MarketMakerQuoteInput{MidPrice: mid, BestBid: book.bid, BestAsk: book.ask, VolatilityPerSqrtSec: effectiveVolBps, BuyVolatilityPerSqrtSec: buyEffectiveVolBps, SellVolatilityPerSqrtSec: sellEffectiveVolBps, TradingHorizonSeconds: horizon.Seconds(), ArrivalBuyTouchDistanceBps: arrivalBuyDistance, ArrivalSellTouchDistanceBps: arrivalSellDistance, Inventory: freeBase, DirectionSignal: direction, VolumeSignal: volumeSignal, BookImbalance: imbalance, SideDistanceBias: s.sideDistanceBias, InventoryActuationDirection: actuation.Direction, InventoryActuationStrength: actuation.InwardStrength, CanBuy: canBuy, CanSell: canSell})
 			hpBuy, okBuy := s.artifact.Predict(types.SideTypeBuy, horizon, provisional.BidTouchDistanceBps, features)
 			hpSell, okSell := s.artifact.Predict(types.SideTypeSell, horizon, provisional.AskTouchDistanceBps, features)
 			if okBuy && okSell {
 				recentBuy, recentSell := 0.0, 0.0
 				if decision.HasSufficientCrossings(s.cfg.HorizonMinSamples) {
-					recentBuy = 1 - math.Exp(-decision.DownCrossesPerHour*horizon.Hours())
-					recentSell = 1 - math.Exp(-decision.UpCrossesPerHour*horizon.Hours())
+					recentBuy = decision.BuyTouchProbability
+					recentSell = decision.SellTouchProbability
 				}
 				pBuy := gammacapture.BlendTouchProbability(hpBuy, recentBuy, cfg.HorizonTouchModel.HistoricalWeight)
 				pSell := gammacapture.BlendTouchProbability(hpSell, recentSell, cfg.HorizonTouchModel.HistoricalWeight)
@@ -441,28 +752,107 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 			}
 		}
 	}
-	desiredAllocation := cfg.SideAllocationBias(gammacapture.SideQuoteAllocationInput{Inventory: freeBase, InventoryTarget: cfg.InventoryTarget, InventoryLimit: cfg.InventoryLimit, DirectionSignal: direction, BookImbalance: imbalance, BuyFillRate: buyRate, SellFillRate: sellRate})
-	alpha := cfg.SideAllocationSmoothing
-	if alpha <= 0 || alpha > 1 {
-		alpha = .25
+	plan := cfg.Quote(gammacapture.MarketMakerQuoteInput{
+		MidPrice: mid, BestBid: book.bid, BestAsk: book.ask,
+		VolatilityPerSqrtSec: effectiveVolBps, BuyVolatilityPerSqrtSec: buyEffectiveVolBps, SellVolatilityPerSqrtSec: sellEffectiveVolBps,
+		TradingHorizonSeconds: horizon.Seconds(), ArrivalBuyTouchDistanceBps: arrivalBuyDistance, ArrivalSellTouchDistanceBps: arrivalSellDistance,
+		Inventory: s.inventory, InventoryMin: band.MinInventory, InventoryMax: band.MaxInventory,
+		HardInventoryMin: hardBand.MinInventory, HardInventoryMax: hardBand.MaxInventory,
+		DirectionSignal: direction, VolumeSignal: volumeSignal, BookImbalance: imbalance, BuyFillRate: buyRate, SellFillRate: sellRate,
+		InventoryActuationDirection: actuation.Direction, InventoryActuationStrength: actuation.InwardStrength,
+		QuoteNotionalBase: dynamicNotional, CanBuy: canBuy, CanSell: canSell,
+	})
+	orderReviewDuration := time.Duration(0)
+	if plan.AllowBid {
+		buyReview := cfg.DynamicOrderKeepDecision(
+			horizon, cfg.OrderKeepDistanceBps(plan.BidTouchDistanceBps), buyEffectiveVolBps)
+		orderReviewDuration = buyReview.Duration
 	}
-	if !s.sideAllocationReady {
-		s.sideAllocationBias, s.sideAllocationReady = desiredAllocation, true
-	} else {
-		s.sideAllocationBias += alpha * (desiredAllocation - s.sideAllocationBias)
+	if plan.AllowAsk {
+		sellReview := cfg.DynamicOrderKeepDecision(
+			horizon, cfg.OrderKeepDistanceBps(plan.AskTouchDistanceBps), sellEffectiveVolBps)
+		if orderReviewDuration <= 0 || (sellReview.Duration > 0 && sellReview.Duration < orderReviewDuration) {
+			orderReviewDuration = sellReview.Duration
+		}
 	}
-	desiredDistance := cfg.SideQuoteDistanceBias(buyRate, sellRate)
-	if !s.sideDistanceReady {
-		s.sideDistanceBias, s.sideDistanceReady = desiredDistance, true
-	} else {
-		s.sideDistanceBias += alpha * (desiredDistance - s.sideDistanceBias)
+	if orderReviewDuration <= 0 {
+		orderReviewDuration = horizon
 	}
-	notionals := cfg.SideQuoteNotionals(dynamicNotional, s.sideAllocationBias)
-	plan := cfg.Quote(gammacapture.MarketMakerQuoteInput{MidPrice: mid, BestBid: book.bid, BestAsk: book.ask, VolatilityPerSqrtSec: effectiveVolBps, BuyVolatilityPerSqrtSec: buyEffectiveVolBps, SellVolatilityPerSqrtSec: sellEffectiveVolBps, TradingHorizonSeconds: horizon.Seconds(), Inventory: freeBase, DirectionSignal: direction, BookImbalance: imbalance, SideDistanceBias: s.sideDistanceBias, CanBuy: canBuy, CanSell: canSell})
+	finalDecision := s.horizonModel.CrossingDecisionAtSideDistances(
+		book.time, cfg, horizon, plan.BidTouchDistanceBps, plan.AskTouchDistanceBps,
+		math.Max(0, math.Log(plan.AskPrice/plan.BidPrice)*10_000))
+	if finalDecision.HasSufficientCrossings(cfg.HorizonMinSamples) {
+		finalDecision.DistanceOptimized = decision.DistanceOptimized
+		decision = finalDecision
+		buyRate, sellRate = decision.BuyTouchRatePerHour(), decision.SellTouchRatePerHour()
+	}
+	quantityActuation := actuation
+	quantityActuation = gammacapture.InventoryActuation(gammacapture.InventoryActuationInput{
+		CurrentInventoryNotionalJPY: s.inventory * mid,
+		TargetInventoryNotionalJPY:  band.Target * mid,
+		ExpectedFillNotionalJPY:     100,
+		BuyFillRatePerHour:          buyRate,
+		SellFillRatePerHour:         sellRate,
+		RegimeHorizon:               actuationHorizon,
+		MaximumOrderLevels:          cfg.InventoryMaxOrderLevels,
+		MomentumSignal:              direction,
+	})
+	if quantityActuation.Enabled {
+		actuationLevels = quantityActuation.EffectiveOrderLevels
+		targetContraction = quantityActuation.TargetContraction
+	}
+	notionals := gammacapture.SideQuoteNotionals{Buy: plan.BidQuoteNotional, Sell: plan.AskQuoteNotional}
 	_ = riskBuyRate
 	_ = riskSellRate
 	if plan.Reason != "quoted" {
 		s.cancelQuotes(book.time)
+		return
+	}
+	macroBuyDistance, macroSellDistance, macroGrossEdge := gammacapture.MakerTouchDistances(
+		book.bid, book.ask, book.bid, book.ask)
+	macroPassiveDecision := s.horizonModel.CrossingDecisionAtSideDistances(
+		book.time, cfg, adaptiveFast.Window,
+		macroBuyDistance, macroSellDistance, macroGrossEdge)
+	passiveTouchEvents := macroPassiveDecision.DownCrosses
+	passiveTouchRatePerHour := macroPassiveDecision.DownCrossesPerHour
+	if reversal.Direction < 0 {
+		passiveTouchEvents = macroPassiveDecision.UpCrosses
+		passiveTouchRatePerHour = macroPassiveDecision.UpCrossesPerHour
+	}
+	baselineInventoryBase := 0.0
+	if mid > 0 {
+		baselineInventoryBase = baselineTargetRatio * pairEquity / mid
+	}
+	if noTradeInventoryEnabled {
+		// The QV boundary is the correction target; active execution measures
+		// its tactical gap from the current inventory.
+		baselineInventoryBase = s.inventory
+	}
+	macroActiveConfig := cfg.MacroInventory.ReversalAccumulation.ActiveExecution
+	macroActive := gammacapture.EvaluateMacroActiveExecution(
+		macroActiveConfig,
+		gammacapture.MacroActiveExecutionInput{
+			Now: book.time, LatestClosedBarAt: s.macroInventoryModel.LatestClosedBarAt(),
+			LastExecutionBarAt: s.macroInventoryState.LastActiveExecutionBarAt,
+			Direction:          reversal.Direction, AggregateNetEdgeBps: reversal.AggregateNetEdgeBps,
+			ForecastHorizon:      reversal.SignalForecastHorizon,
+			ExecutionHorizon:     adaptiveFast.Window,
+			ConfidenceZScore:     cfg.InventoryRiskZScore,
+			CurrentInventoryBase: s.inventory, TargetInventoryBase: band.Target,
+			BaselineInventoryBase: baselineInventoryBase,
+			AvailableBase:         freeBase, AvailableQuote: freeQuote,
+			BestBid: book.bid, BestBidSize: book.bidSize,
+			BestAsk: book.ask, BestAskSize: book.askSize,
+			PassiveTouchEvents:      passiveTouchEvents,
+			PassiveTouchRatePerHour: passiveTouchRatePerHour,
+			MakerFeeBps:             cfg.MakerFeeBps, TakerFeeBps: cfg.TakerFeeBps,
+			MinimumQuantityBase: 0.00001,
+			MinimumNotionalJPY:  100,
+		})
+	s.recordMacroActiveDecision(
+		book.time, s.macroInventoryModel.LatestClosedBarAt(), macroActive)
+	if macroActive.Trigger {
+		s.scheduleMacroIOC(book.time, macroActive, s.macroInventoryModel.LatestClosedBarAt())
 		return
 	}
 	if s.mode == replayAcquisitionReset && s.tryAcquisitionReset(book, decision, horizon, effectiveVolBps, plan, notionals, evidence) {
@@ -473,15 +863,48 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 	s.bidDistanceSum += plan.BidDistanceBps
 	s.askDistanceSum += plan.AskDistanceBps
 	minRefresh, maxRefresh := cfg.RefreshIntervals(plan.HalfSpreadBps, effectiveVolBps)
-	minRefresh, _ = gammacapture.BoundRefreshIntervals(minRefresh, maxRefresh, horizon)
+	minRefresh, _ = gammacapture.BoundRefreshIntervals(minRefresh, maxRefresh, orderReviewDuration)
 	elapsed := book.time.Sub(s.lastQuoteAt)
 	quoteCrossed := (s.bidOrder.active && s.bidOrder.price >= book.ask) || (s.askOrder.active && s.askOrder.price <= book.bid)
 	missingSide := (plan.AllowBid && !s.bidOrder.active) || (plan.AllowAsk && !s.askOrder.active)
 	sideMismatch := (s.bidOrder.active != plan.AllowBid) || (s.askOrder.active != plan.AllowAsk)
 	windowExpired := s.windowEndsAt.IsZero() || !book.time.Before(s.windowEndsAt)
-	shouldRefresh := s.lastQuoteAt.IsZero()
+	statisticalRealignment := false
+	if s.bidOrder.active && s.askOrder.active && decision.HasSufficientCrossings(cfg.HorizonMinSamples) {
+		activeHorizon := s.windowEndsAt.Sub(s.lastQuoteAt)
+		if activeHorizon <= 0 {
+			activeHorizon = horizon
+		}
+		activeBuyDistance, activeSellDistance, activeGrossEdge := gammacapture.MakerTouchDistances(
+			book.bid, book.ask, s.bidOrder.price, s.askOrder.price)
+		activeDecision := s.horizonModel.CrossingDecisionAtSideDistances(
+			book.time, cfg, activeHorizon, activeBuyDistance, activeSellDistance, activeGrossEdge)
+		statisticalRealignment, _, _ = gammacapture.MakerQuoteStatisticalRealignment(
+			decision, activeDecision, cfg.InventoryRiskZScore)
+	}
+	currentRiskyWeight := 0.0
+	if pairEquity > 0 {
+		currentRiskyWeight = s.inventory * mid / pairEquity
+	}
+	macroTargetRealignment := s.quotedTargetSet && gammacapture.InventoryTargetRealignmentRequired(
+		effectiveTargetRatio, s.quotedTargetRatio, currentRiskyWeight, pairEquity, 100)
+	retainBid, retainAsk := false, false
+	cleanWindowExpiry := windowExpired && !quoteCrossed && !missingSide && !sideMismatch &&
+		!statisticalRealignment && !macroTargetRealignment && !macroIOCFilled
+	if cleanWindowExpiry {
+		retainBid, retainAsk = replayNearFillSides(
+			s.bidOrder, s.askOrder, book, plan,
+			2*cfg.MakerFeeBps+2*cfg.AdverseSelectionBps+cfg.MinimumNetEdgeBps)
+		allActiveSidesRetained := (!s.bidOrder.active || retainBid) && (!s.askOrder.active || retainAsk)
+		if (retainBid || retainAsk) && allActiveSidesRetained {
+			s.windowEndsAt = book.time.Add(orderReviewDuration)
+			s.quoteActive++
+			return
+		}
+	}
+	shouldRefresh := s.lastQuoteAt.IsZero() || macroIOCFilled
 	if !shouldRefresh && elapsed >= minRefresh {
-		hardTransition := quoteCrossed || missingSide || sideMismatch
+		hardTransition := quoteCrossed || missingSide || sideMismatch || statisticalRealignment || macroTargetRealignment
 		ordinaryReprice := windowExpired
 		shouldRefresh = hardTransition || ordinaryReprice
 	}
@@ -491,24 +914,174 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 		}
 		return
 	}
-	// Live computes these balances before canceling currently locked orders.
-	preCancelBase, preCancelQuote := freeBase, freeQuote
-	s.cancelQuotes(book.time)
-	buyNotional := math.Min(preCancelQuote, notionals.Buy)
-	sellQty := math.Min(preCancelBase, notionals.Sell/plan.AskPrice)
-	if plan.AllowBid && buyNotional >= 100 {
+	// Replacement sizing uses total balances because canceling the old quotes
+	// releases their locks before the new orders are submitted.
+	preCancelBase, preCancelQuote := s.inventory, s.quote
+	if !retainBid {
+		s.bidOrder = productionReplayOrder{}
+	}
+	if !retainAsk {
+		s.askOrder = productionReplayOrder{}
+	}
+	hardBuyMarkNotional := math.Max(0, hardBand.MaxInventory-s.inventory) * mid
+	hardSellMarkNotional := math.Max(0, s.inventory-hardBand.MinInventory) * mid
+	orderCaps := gammacapture.TargetCenteredInventoryOrderCaps(
+		band, s.inventory, mid, actuationLevels)
+	projectionInput := gammacapture.ProbabilityCenteredQuoteInput{
+		CurrentInventoryNotionalJPY: s.inventory * mid,
+		TargetInventoryNotionalJPY:  band.Target * mid,
+		LowerInventoryNotionalJPY:   band.MinInventory * mid,
+		UpperInventoryNotionalJPY:   band.MaxInventory * mid,
+		BuyFillRatePerHour:          buyRate,
+		SellFillRatePerHour:         sellRate,
+		Horizon:                     horizon,
+		ConfidenceZScore:            cfg.InventoryRiskZScore,
+		TargetContraction:           targetContraction,
+		FastBuyRestraint:            fastBuyRestraint.Restraint,
+		MinBuyNotionalJPY:           100 * mid / plan.BidPrice,
+		MinSellNotionalJPY:          100 * mid / plan.AskPrice,
+	}
+	if plan.AllowBid && plan.BidPrice > 0 {
+		projectionInput.FastBuyNotionalJPY = plan.BidQuoteNotional * mid / plan.BidPrice
+		buyExecutionCap := replayCappedInventoryCapacity(
+			orderCaps.BuyNotional*plan.BidPrice/mid,
+			hardBuyMarkNotional*plan.BidPrice/mid, 100)
+		projectionInput.MaxBuyNotionalJPY = math.Min(
+			preCancelQuote*mid/plan.BidPrice, buyExecutionCap*mid/plan.BidPrice)
+	}
+	if plan.AllowAsk && plan.AskPrice > 0 {
+		projectionInput.FastSellNotionalJPY = plan.AskQuoteNotional * mid / plan.AskPrice
+		sellQuantityCap := replayCappedInventoryCapacity(
+			orderCaps.SellQuantity, hardSellMarkNotional/mid, 100/plan.AskPrice)
+		projectionInput.MaxSellNotionalJPY = math.Min(
+			preCancelBase*mid, sellQuantityCap*mid)
+	}
+	projection := gammacapture.ProbabilityCenteredQuoteDecision{Reason: "staged replay baseline"}
+	if s.useProbabilityProjection {
+		projection = gammacapture.ProbabilityCenteredQuoteNotionals(projectionInput)
+	}
+	projectionUsed := projection.Enabled
+	buyNotional, sellQty := 0.0, 0.0
+	if projectionUsed {
+		buyNotional = math.Min(preCancelQuote, projection.BuyNotionalJPY*plan.BidPrice/mid)
+		sellQty = math.Min(preCancelBase, projection.SellNotionalJPY/mid)
+	} else {
+		hardBuyNotional := math.Max(0, hardBand.MaxInventory-s.inventory) * plan.BidPrice
+		buyCapacity := replayCappedInventoryCapacity(orderCaps.BuyNotional, hardBuyNotional, 100)
+		buyNotional = math.Min(preCancelQuote, math.Min(notionals.Buy, buyCapacity))
+		if fastBuyRestraint.Enabled {
+			buyNotional *= fastBuyRestraint.BuyRetention
+		}
+		hardSellQuantity := math.Max(0, s.inventory-hardBand.MinInventory)
+		minimumSellQuantity := 100 / plan.AskPrice
+		sellCapacity := replayCappedInventoryCapacity(orderCaps.SellQuantity, hardSellQuantity, minimumSellQuantity)
+		sellQty = math.Min(preCancelBase, math.Min(notionals.Sell/plan.AskPrice, sellCapacity))
+	}
+	if plan.AllowBid && !retainBid && buyNotional >= 100 {
 		s.bidOrder = productionReplayOrder{active: true, side: types.SideTypeBuy, price: plan.BidPrice, remaining: buyNotional / plan.BidPrice, queueAhead: book.bidSize * s.queueFactor, placedAt: book.time}
 	}
-	if plan.AllowAsk && sellQty*plan.AskPrice >= 100 {
+	if plan.AllowAsk && !retainAsk && sellQty*plan.AskPrice >= 100 {
 		s.askOrder = productionReplayOrder{active: true, side: types.SideTypeSell, price: plan.AskPrice, remaining: sellQty, queueAhead: book.askSize * s.queueFactor, placedAt: book.time}
 	}
 	if s.bidOrder.active || s.askOrder.active {
 		s.refreshes++
 		s.lastQuoteAt = book.time
-		s.windowEndsAt = book.time.Add(horizon)
+		s.windowEndsAt = book.time.Add(orderReviewDuration)
 		s.lastBestBid, s.lastBestAsk, s.lastMid, s.lastImbalance = book.bid, book.ask, mid, imbalance
+		s.quotedTargetRatio = effectiveTargetRatio
+		s.quotedTargetSet = true
 		s.quoteActive++
 	}
+}
+
+func (s *productionReplayState) scheduleMacroIOC(at time.Time, decision gammacapture.MacroActiveExecutionDecision, closedBarAt time.Time) {
+	s.pendingMacroIOC = productionReplayMacroIOC{
+		active: true, direction: decision.Direction,
+		quantity: decision.Quantity, worstPrice: decision.WorstPrice,
+		closedBarAt: closedBarAt,
+	}
+	s.macroInventoryState.LastActiveExecutionAt = at
+	s.macroInventoryState.LastActiveExecutionBarAt = closedBarAt
+	s.macroActiveAttempts++
+}
+
+func (s *productionReplayState) recordMacroActiveDecision(
+	at, closedBarAt time.Time,
+	decision gammacapture.MacroActiveExecutionDecision,
+) {
+	if closedBarAt.IsZero() || decision.Direction == 0 ||
+		closedBarAt.Equal(s.lastMacroActiveDecisionBarAt) {
+		return
+	}
+	s.lastMacroActiveDecisionBarAt = closedBarAt
+	s.macroActiveDecisions = append(s.macroActiveDecisions, productionReplayMacroDecision{
+		At: at, ClosedBarAt: closedBarAt,
+		Direction: decision.Direction, Trigger: decision.Trigger, Reason: decision.Reason,
+		Quantity:               decision.Quantity,
+		TargetGapBase:          decision.TargetGapBase,
+		TacticalTargetGapBase:  decision.TacticalTargetGapBase,
+		ResidualMakerGapBase:   decision.ResidualMakerGapBase,
+		PassiveMissProbability: decision.PassiveMissProbability,
+		UrgentFraction:         decision.UrgentFraction,
+		WaitLossBps:            decision.WaitLossBps,
+		CrossingCostBps:        decision.PassiveToTouchCostBps + decision.FeeIncrementBps,
+	})
+}
+
+func (s *productionReplayState) executePendingMacroIOC(book bboSnapshot) bool {
+	if !s.pendingMacroIOC.active {
+		return false
+	}
+	pending := s.pendingMacroIOC
+	s.pendingMacroIOC = productionReplayMacroIOC{}
+	quantity, price := pending.quantity, 0.0
+	side := types.SideTypeBuy
+	if pending.direction > 0 {
+		if book.ask <= 0 || book.ask > pending.worstPrice {
+			return false
+		}
+		price = book.ask
+		quantity = math.Min(quantity, math.Min(book.askSize, s.quote/price))
+	} else if pending.direction < 0 {
+		side = types.SideTypeSell
+		if book.bid <= 0 || book.bid < pending.worstPrice {
+			return false
+		}
+		price = book.bid
+		quantity = math.Min(quantity, math.Min(book.bidSize, s.inventory))
+	} else {
+		return false
+	}
+	if quantity <= 0 || quantity*price < 100 {
+		return false
+	}
+	notional := quantity * price
+	fee := notional * s.cfg.TakerFeeBps / 10_000
+	if side == types.SideTypeBuy {
+		s.inventory += quantity
+		s.quote -= notional
+		if s.unmatchedSells > 0 {
+			s.unmatchedSells--
+			s.roundTrips++
+		} else {
+			s.unmatchedBuys++
+		}
+	} else {
+		s.inventory -= quantity
+		s.quote += notional
+		if s.unmatchedBuys > 0 {
+			s.unmatchedBuys--
+			s.roundTrips++
+		} else {
+			s.unmatchedSells++
+		}
+	}
+	s.fees += fee
+	s.takerFees += fee
+	s.macroActiveFills++
+	s.macroActiveQuantity += quantity
+	s.fillEvents = append(s.fillEvents, replayFill{at: book.time, side: side, price: price})
+	return true
 }
 
 func (s *productionReplayState) tryAcquisitionReset(book bboSnapshot, horizonDecision gammacapture.MarketMakerHorizonDecision, horizon time.Duration, effectiveVolBps float64, plan gammacapture.MarketMakerQuotePlan, notionals gammacapture.SideQuoteNotionals, evidence gammacapture.FastEvidenceSnapshot) bool {
@@ -598,16 +1171,31 @@ func (s *productionReplayState) tryAcquisitionReset(book bboSnapshot, horizonDec
 }
 
 func (s *productionReplayState) onTrade(trade tick) {
-	s.fastEvidence.ObserveTrade(trade.time, types.Trade{Symbol: s.symbol, Price: fixedpoint.NewFromFloat(trade.price), Quantity: fixedpoint.NewFromFloat(trade.size), Side: trade.side})
+	observed := types.Trade{Symbol: s.symbol, Price: fixedpoint.NewFromFloat(trade.price), Quantity: fixedpoint.NewFromFloat(trade.size), Side: trade.side}
+	for _, evidenceModel := range s.fastEvidenceModels {
+		evidenceModel.ObserveTrade(trade.time, observed)
+	}
+	if s.hawkesDirectionModel != nil {
+		s.hawkesDirectionModel.ObserveTrade(trade.time, observed)
+	}
 	if trade.time.Before(s.tradingFrom) {
 		return
 	}
 	s.trades++
-	if trade.side == types.SideTypeBuy && s.askOrder.active && trade.price >= s.askOrder.price {
+	if trade.side == types.SideTypeBuy && s.askOrder.active && s.askOrder.eligible && trade.price >= s.askOrder.price {
 		s.consume(&s.askOrder, trade)
 	}
-	if trade.side == types.SideTypeSell && s.bidOrder.active && trade.price <= s.bidOrder.price {
+	if trade.side == types.SideTypeSell && s.bidOrder.active && s.bidOrder.eligible && trade.price <= s.bidOrder.price {
 		s.consume(&s.bidOrder, trade)
+	}
+}
+
+func (s *productionReplayState) activatePendingQuotesOnNextBBO() {
+	if s.bidOrder.active {
+		s.bidOrder.eligible = true
+	}
+	if s.askOrder.active {
+		s.askOrder.eligible = true
 	}
 }
 
@@ -685,14 +1273,20 @@ func (s *productionReplayState) cancelQuotes(at time.Time) {
 }
 
 func (s *productionReplayState) result(books []bboSnapshot) productionReplayResult {
-	evalBooks := filterBBO(books, s.tradingFrom, books[len(books)-1].time.Add(time.Nanosecond))
+	resultTo := books[len(books)-1].time
+	if s.stopped && !s.stopAt.IsZero() {
+		resultTo = s.stopAt
+	}
+	evalBooks := filterBBO(books, s.tradingFrom, resultTo.Add(time.Nanosecond))
 	if len(evalBooks) == 0 {
 		return productionReplayResult{Mode: s.mode}
 	}
 	books = evalBooks
 	lastMid := (books[len(books)-1].bid + books[len(books)-1].ask) / 2
 	hours := s.activeDuration.Hours()
-	r := productionReplayResult{Mode: s.mode, From: books[0].time, To: books[len(books)-1].time, ActiveHours: hours, BBOEvents: s.books, AggTradeEvents: s.trades, DataGaps: s.gaps, QueueMultiplier: s.queueFactor, QuoteRefreshes: s.refreshes, FullFills: s.fills, BuyFills: s.buys, SellFills: s.sells, RoundTrips: s.roundTrips, AcquisitionResets: s.acquisitionResets, AcquisitionQuantity: s.acquisitionQuantity, AcquisitionEvaluations: s.acquisitionEvaluations, AcquisitionRejections: s.acquisitionRejections, AcquisitionDrawdownLimitSamples: s.acquisitionDrawdownLimitSamples, MinimumAcquisitionDrawdownLimitBps: s.minAcquisitionDrawdownLimitBps, MaximumAcquisitionDrawdownLimitBps: s.maxAcquisitionDrawdownLimitBps, MaxUpProbabilityLower: s.maxUpProbabilityLower, MaxAcquisitionIOCValueBps: s.maxAcquisitionIOCValueBps, MaxAcquisitionImprovementBps: s.maxAcquisitionImprovementBps, MakerFeesJPY: s.fees - s.takerFees, TakerFeesJPY: s.takerFees, NetPnLJPY: s.quote + s.inventory*lastMid - s.fees - s.initialEquity, Limitations: []string{"no level-2 depth or exchange queue priority", "IOC acquisition is capped by visible best-ask size but deeper execution and impact are unavailable", "queue multiplier is calibrated to aggregate confirmed fills, not per-order queue position", "public aggregate trades cannot identify our private execution"}}
+	r := productionReplayResult{Mode: s.mode, From: books[0].time, To: books[len(books)-1].time, ActiveHours: hours, BBOEvents: s.books, AggTradeEvents: s.trades, DataGaps: s.gaps, QueueMultiplier: s.queueFactor, QuoteRefreshes: s.refreshes, FullFills: s.fills, BuyFills: s.buys, SellFills: s.sells, RoundTrips: s.roundTrips, AcquisitionResets: s.acquisitionResets, AcquisitionQuantity: s.acquisitionQuantity, MacroActiveAttempts: s.macroActiveAttempts, MacroActiveFills: s.macroActiveFills, MacroActiveQuantity: s.macroActiveQuantity, AcquisitionEvaluations: s.acquisitionEvaluations, AcquisitionRejections: s.acquisitionRejections, AcquisitionDrawdownLimitSamples: s.acquisitionDrawdownLimitSamples, MinimumAcquisitionDrawdownLimitBps: s.minAcquisitionDrawdownLimitBps, MaximumAcquisitionDrawdownLimitBps: s.maxAcquisitionDrawdownLimitBps, MaxUpProbabilityLower: s.maxUpProbabilityLower, MaxAcquisitionIOCValueBps: s.maxAcquisitionIOCValueBps, MaxAcquisitionImprovementBps: s.maxAcquisitionImprovementBps, MakerFeesJPY: s.fees - s.takerFees, TakerFeesJPY: s.takerFees, NetPnLJPY: s.quote + s.inventory*lastMid - s.fees - s.initialEquity, StoppedEarly: s.stopped, StopAt: s.stopAt, StopReason: s.stopReason, MaximumDrawdownPct: s.maximumDrawdownPct, Limitations: []string{"no level-2 depth or exchange queue priority", "orders and Macro IOC decisions at BBO[t] execute no earlier than BBO[t+1]", "IOC quantity is capped by visible opposite-side BBO size; deeper execution and impact are unavailable", "queue multiplier is calibrated to aggregate confirmed fills, not per-order queue position", "public aggregate trades cannot identify our private execution"}}
+	r.EquityCurve = s.equityCurve
+	r.MacroActiveDecisions = s.macroActiveDecisions
 	if s.acquisitionDrawdownLimitSamples > 0 {
 		r.MeanAcquisitionDrawdownLimitBps = s.acquisitionDrawdownLimitSumBps / float64(s.acquisitionDrawdownLimitSamples)
 	}
@@ -746,7 +1340,10 @@ func compactBBO(values []bboSnapshot) []bboSnapshot {
 	for _, value := range values {
 		if len(out) > 0 {
 			last := out[len(out)-1]
-			if value.time.Equal(last.time) && value.bid == last.bid && value.ask == last.ask && value.bidSize == last.bidSize && value.askSize == last.askSize {
+			// Repeated identical BBO states carry no new price, depth, or
+			// execution information. Drop them even when capture timestamps
+			// differ; the next distinct state still preserves ordering/gaps.
+			if value.bid == last.bid && value.ask == last.ask && value.bidSize == last.bidSize && value.askSize == last.askSize {
 				continue
 			}
 		}
@@ -806,20 +1403,21 @@ func replayDirection(snapshot gammacapture.ModelSnapshot) float64 {
 	}
 	return math.Max(-1, math.Min(1, (snapshot.LambdaUp-snapshot.LambdaDown)/total))
 }
-func replayNearFill(bid, ask productionReplayOrder, book bboSnapshot, mid float64, plan gammacapture.MarketMakerQuotePlan, floor float64) bool {
-	if plan.AllowBid {
-		d := math.Log(mid/bid.price) * 10000
-		if !bid.active || bid.price >= book.ask || d < floor || d > plan.BidDistanceBps+1e-9 {
-			return false
-		}
+func replayNearFillSides(bid, ask productionReplayOrder, book bboSnapshot, plan gammacapture.MarketMakerQuotePlan, floor float64) (bool, bool) {
+	if !bid.active || !ask.active || bid.price <= 0 || ask.price <= 0 || book.bid <= 0 || book.ask <= 0 {
+		return false, false
 	}
-	if plan.AllowAsk {
-		d := math.Log(ask.price/mid) * 10000
-		if !ask.active || ask.price <= book.bid || d < floor || d > plan.AskDistanceBps+1e-9 {
-			return false
-		}
+	if math.Log(ask.price/bid.price)*10_000+1e-9 < floor {
+		return false, false
 	}
-	return plan.AllowBid || plan.AllowAsk
+	retainBid, retainAsk := false, false
+	if plan.AllowBid && bid.price < book.ask {
+		retainBid = math.Log(book.ask/bid.price)*10_000 <= plan.BidTouchDistanceBps+1e-9
+	}
+	if plan.AllowAsk && ask.price > book.bid {
+		retainAsk = math.Log(ask.price/book.bid)*10_000 <= plan.AskTouchDistanceBps+1e-9
+	}
+	return retainBid, retainAsk
 }
 func meanFillMarkout(fills []replayFill, books []bboSnapshot, horizon time.Duration) float64 {
 	total := 0.0

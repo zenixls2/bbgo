@@ -43,6 +43,30 @@ func TestUpdateMarketMakerModelConsumesBookTickerEvents(t *testing.T) {
 	}
 }
 
+func TestUpdateMarketMakerModelResetsReferenceAcrossDataGap(t *testing.T) {
+	s := &Strategy{
+		Config: Config{Symbol: "SOLJPY"},
+		State:  &State{Engine: NewCrossingEngine(0.001, 0, 8)},
+		model: NewIntensityModel(IntensityConfig{
+			Window: types.Duration(time.Hour), PriorAlphaUp: 1, PriorBetaUp: 60,
+			PriorAlphaDown: 1, PriorBetaDown: 60, MinEvents: 1,
+		}),
+	}
+	now := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	book := func(price float64) types.BookTicker {
+		return types.BookTicker{Symbol: "SOLJPY", Buy: fixedpoint.NewFromFloat(price), Sell: fixedpoint.NewFromFloat(price + 0.01)}
+	}
+	s.updateMarketMakerModel(now, book(100))
+	afterGap := s.updateMarketMakerModel(now.Add(3*time.Minute), book(102))
+	if afterGap.Up != 0 || afterGap.Down != 0 {
+		t.Fatalf("missing websocket path created phantom crossings: %+v", afterGap)
+	}
+	afterLiveMove := s.updateMarketMakerModel(now.Add(3*time.Minute+time.Second), book(102.11))
+	if afterLiveMove.Up != 1 {
+		t.Fatalf("post-gap live path did not resume from the new reference: %+v", afterLiveMove)
+	}
+}
+
 func TestMakerSubmittedSidePricesDoesNotCreatePhantomSide(t *testing.T) {
 	askOnly := []types.SubmitOrder{{Side: types.SideTypeSell, Price: fixedpoint.NewFromInt(307_788)}}
 	bid, ask := makerSubmittedSidePrices(askOnly)

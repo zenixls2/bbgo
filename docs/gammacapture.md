@@ -50,12 +50,13 @@ flowchart TD
   B -->|valid| C[Resolve one symbol and exchange market]
   C --> D{Authenticated account query succeeds?}
   D -->|no| H
-  D -->|yes| E{Live online arrival enabled?}
-  E -->|yes| F[Restore persisted sufficient statistics]
-  F --> P[Replay local Binance BBO and recent public trades]
-  P -->|missing, stale, or insufficient| H
-  P -->|completed horizon coverage| I{marketMaker.enabled?}
-  E -->|no| G{aggTradeWarmup enabled?}
+  C --> F[Restore versioned bounded model checkpoint]
+  F --> P[Replay only the indexed capture delta]
+  P -->|missing or stale| H
+  P -->|completed model coverage| R[Reconcile strategy-owned stale orders]
+  R -->|verified| I{marketMaker.enabled?}
+  R -->|failed| H
+  C --> G{aggTradeWarmup enabled?}
   G -->|yes| W[Load aggregate-trade archive + live capture files]
   G -->|no| X[Warm from session data when allowed]
   W -->|missing or stale| H
@@ -105,10 +106,11 @@ confidence hysteresis, TP/SL passage probabilities, and gate statistics.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> STARTUP_RECONCILE
-  STARTUP_RECONCILE --> PUBLIC_WARMUP: owned stale orders cleared
+  [*] --> PUBLIC_WARMUP
+  PUBLIC_WARMUP --> STARTUP_RECONCILE: checkpoint restored + capture delta replayed
+  PUBLIC_WARMUP --> HALTED: required history missing, stale, or insufficient
+  STARTUP_RECONCILE --> WAIT_FOR_BBO: owned stale orders cleared and account refreshed
   STARTUP_RECONCILE --> HALTED: query/cancel/verification failure
-  PUBLIC_WARMUP --> WAIT_FOR_BBO: model seeded or maker allowed to collect data
   WAIT_FOR_BBO --> COMPUTE_QUOTE: valid BBO + volatility statistics
   WAIT_FOR_BBO --> WAIT_FOR_BBO: data/statistics gap
   COMPUTE_QUOTE --> QUOTE_WINDOW: fee floor + filters + balances pass
@@ -223,7 +225,7 @@ flowchart LR
   BBO --> FAST[Fast 60-second model]
   BBO --> IMB[Book imbalance]
   BBO --> VOL[Ask-return BUY vol + bid-return SELL vol]
-  BBO --> H[Persisted fast/slow online arrival rates]
+  BBO --> H[Side-specific BBO horizon statistics]
   FAST --> PRESS[Direction pressure]
   IMB --> PRESS
   VOL --> SIZE[Side variance shrinkage + conservative max]
@@ -252,8 +254,8 @@ variance shrinkage → explicit 10-minute
 window → joint quote policy → hard inventory/balance projection → LIMIT_MAKER
 quotes`. The joint policy combines normalized inventory, direction, book
 imbalance, volatility, fees, and side crossing hazards once into a signed
-pressure; that pressure simultaneously determines reservation-price shift,
-bid/ask distance, and bid/ask notional factors. Legacy skew/allocation
+pressure; that pressure determines reservation-price shift and
+bid/ask distance. Final bid/ask notionals are calculated by the probability-centered Macro projection. Legacy skew/allocation
 coefficients remain decode-compatible but are not read by the active path.
 Existing quote
 windows are retained until their selected horizon expires, unless a quote
@@ -409,6 +411,506 @@ markout, fill proxy, trades per hour, fee-adjusted PnL, and drawdown. A model
 that fails to improve holdout expected value remains a risk/toxicity overlay
 and must not become breakout alpha.
 
+### Macro inventory carrying-risk study (2026-08-03)
+
+The target-centered maker band solves a microstructure problem but not the
+portfolio problem created by carrying spot inventory for hours. Pair equity is
+already marked as quote cash plus base inventory times the current mid, and the
+ask equity floor protects a single sale relative to the current mark. Neither
+charges the directional risk of inventory that remains unsold. The relevant
+self-financing decomposition is
+
+    dW(t) = dPnL_spread(t) - dFees(t) + q(t) dS(t).
+
+The existing risk budget bounds deviation around a fixed 50% target over the
+10/15/30-minute quote horizon. At the target its deviation penalty is zero even
+though `q dS` is still material. Rebalancing repeatedly to 50% can therefore buy
+a falling asset and lose total wealth while completed maker round trips retain
+a positive local spread.
+
+This matches the inventory-utility treatment in
+[Avellaneda and Stoikov](https://math.nyu.edu/inmemoriam/avellaneda/HighFrequencyTrading.pdf),
+[Gueant, Lehalle, and Fernandez-Tapia](https://arxiv.org/abs/1105.3115), and the
+non-martingale extension of [Fodra and Labadie](https://arxiv.org/abs/1206.4810).
+The no-transaction result under proportional costs is due to
+[Davis and Norman](https://pubsonline.informs.org/doi/pdf/10.1287/moor.15.4.676),
+and the wealth-cushion drawdown bound follows
+[Grossman and Zhou](https://onlinelibrary.wiley.com/doi/10.1111/j.1467-9965.1993.tb00044.x).
+
+#### Historical evidence and limitations
+
+A causal minute-end BBO-mid study covered about 2026-07-23 13:34 UTC through
+2026-08-03 01:58 UTC. SOLJPY was excluded from the cross-symbol summary because
+its capture was fragmented. Before maker-spread alpha, a 10,000 JPY portfolio
+with 50% initial spot exposure produced:
+
+| Symbol | Price return | Price max DD | Fixed-50% return | Fixed-50% max DD | 15m-rebalanced return | 15m max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| BTCJPY | -7.511% | 8.920% | -3.756% | 4.480% | -3.819% | 4.555% |
+| ETHJPY | -6.512% | 11.185% | -3.256% | 5.690% | -3.285% | 5.738% |
+| XRPJPY | -8.104% | 9.977% | -4.052% | 4.998% | -4.127% | 5.111% |
+
+The 15-minute policy generated about 1,009 rebalances per symbol. A 30-minute
+policy generated about 504 and remained slightly worse than fixed 50%; a
+45%--55% no-trade band did not trade. This allocation-only experiment includes
+a 10-bps one-way fee but no maker spread, private queue fills, or queue latency.
+The sample is only about ten and a half days and is dominated by decline, so it
+establishes a horizon mismatch rather than production-optimal coefficients.
+
+ETHJPY overlapping log-return diagnostics were:
+
+| Horizon | Standard deviation | 1% quantile | 5% quantile | Minimum |
+| --- | ---: | ---: | ---: | ---: |
+| 15m | 22.10 bps | -75.75 bps | -34.04 bps | -171.35 bps |
+| 30m | 32.16 bps | -119.02 bps | -51.54 bps | -265.34 bps |
+| 6h | 107.50 bps | -336.03 bps | -197.61 bps | -400.01 bps |
+| 24h | 215.47 bps | -463.65 bps | -408.16 bps | -564.41 bps |
+
+At the 2026-08-03 11:02 JST mark, base notional was 3,792.81 JPY and the
+short-horizon inventory budget was 17.04 JPY. The ETH 1% losses were 28.73 JPY
+at 15 minutes, 45.14 at 30 minutes, 127.45 at six hours, and 175.85 at 24 hours:
+1.69, 2.65, 7.48, and 10.32 times the budget. The worst 24-hour move was about
+214.07 JPY, or 12.56 times the budget. Deployment uses causally closed rolling returns, but corrects their effective
+sample count by the horizon-to-bar overlap factor before evaluating sufficiency,
+drift shrinkage, or cross-horizon reliability.
+
+The de-clustered six-hour executable-range breakout study on BTCJPY, ETHJPY,
+and XRPJPY found pooled 10-bps continuation rates of 44.55% upward and 48.26%
+downward at 15 minutes, and 48.48% upward and 46.25% downward at 30 minutes.
+Wilson 95% intervals were 38.00%--51.29%, 41.88%--54.69%, 40.98%--56.06%, and
+38.70%--53.97%; all contain 50%. Raw breakout therefore remains a variance and
+toxicity observation, not directional alpha. Ten bps also cannot alone clear a
+20-bps maker round-trip fee.
+
+#### Macro inventory controller specification
+
+Let marked wealth, running peak, drawdown, and risky weight be
+
+    W(t) = C(t) + q(t)S(t)
+    M(t) = max W(u), u <= t
+    d(t) = 1 - W(t)/M(t)
+    w(t) = q(t)S(t)/W(t).
+
+The configured 50% target becomes a strategic prior `w0`. For each macro
+horizon H in the live 3h/6h/24h set, maximize
+
+    U_H(w) = w mu_H - (gamma/2) w^2 sigma_H^2
+             - (kappa/2) (w-w0)^2,
+
+which gives
+
+    wUtility_H = (mu_H + kappa w0)/(gamma sigma_H^2 + kappa).
+
+The absolute `w^2` term charges baseline inventory even at `w=w0`. `mu_H` is
+the horizon log-return mean shrunk toward zero and `sigma_H^2` is horizon
+variance. Three-hour, six-hour, and 24-hour returns advance on every causally closed
+10-minute bar. Their marginal distributions use all rolling observations, while
+inference uses an overlap-corrected effective sample count. Utility preferences are not risk constraints, so
+the controller does not take their worst-horizon minimum. It assigns each
+dimensionless horizon optimum the empirical-Bayes reliability
+
+    reliability_H = n_H/(n_H + nPrior)
+
+and aggregates
+
+    wUtility = sum_H(reliability_H wUtility_H)/sum_H(reliability_H).
+
+This uses sample support to moderate the short-history horizons without
+applying inverse variance a second time: variance already enters each
+`wUtility_H`. If every horizon is insufficient, the prior implementation's
+conservative zero-drift fallback is retained.
+
+Let `L(alpha,H)=-Q_alpha(R_H)` be a positive downside loss. The implementation
+uses the greater of empirical loss and the configured Gaussian lower-tail loss.
+The configured `bCarry` is an active-risk budget around the strategic core,
+not a charge against the entire core position. Define
+
+    aCarry_H = bCarry/L(alpha,H)
+    wCarryFloor_H = max(policyMin, w0-aCarry_H)
+    wCarryCap_H   = min(policyMax, w0+aCarry_H).
+
+This prevents a 1% active-risk budget and a 5--8% tail move from incorrectly
+
+For maximum wealth drawdown `Dmax`, define
+
+    F(t) = (1-Dmax)M(t)
+    cushion(t) = max(0, W(t)-F(t))
+    wDD_H = cushion(t)/(W(t)L(alpha,H)).
+
+The live active interval and expected target are
+
+    wCap    = min_H(wCarryCap_H,wDD_H)
+    wFloor  = min(wCap, max_H min(wCarryFloor_H,wDD_H))
+    wTarget = clip(wUtility,wFloor,wCap).
+
+Thus only preferences are reliability-weighted. Carrying-loss and drawdown
+budgets retain their strict cross-horizon intersection and constrain active
+deviation; averaging those bounds could exceed the configured expected-loss
+budget. Wealth drawdown remains an absolute emergency cap; ordinary tail risk
+does not erase the strategic core allocation.
+
+#### Rolling horizon updates and reversal accumulation
+
+All configured Macro dimensions update on the same closed-bar clock. For
+`Delta=10m` and `H` in `{3h,6h,24h}`, the live observation is
+
+    R_H(t) = log(M(t)/M(t-H)).
+
+Successive values overlap, so they are not counted as independent evidence. If
+`K=H/Delta`, the implementation uses
+
+    nEffective_H = nRaw_H/K.
+
+For independent bar increments this is the Bartlett/HAC effective-sample
+correction because
+
+    1 + 2 sum_{k=1}^{K-1}(1-k/K) = K.
+
+The rolling observations estimate the marginal return mean, variance, and tail,
+but `nEffective` controls minimum-sample health, drift shrinkage, and utility
+reliability. The empirical tail index is also selected on the effective-sample
+scale. Thus all three horizons move every 10 minutes. Their overlap factors are 18,
+36, and 144 respectively; those dense observations are not misreported as
+independent support. The open 10-minute bar never enters the model, and startup
+reconstructs the same state from archived Binance BBO.
+
+The live ETHJPY profile uses a 10-minute closed-bar grid. The confirmed BIC
+change-point path still needs four posterior bars, but an additional causal
+fixed-endpoint test evaluates the newest two executable-price returns against
+at least six prior bars. A turn can therefore be recognized after two closes:
+10--20 minutes after the underlying change depending on bar alignment, rather
+than waiting roughly 40 minutes of posterior evidence. The 3h/6h/24h values
+remain risk-estimation horizons rather than short-horizon return samples.
+
+CPU cost remains bounded by the closed-bar cache. The O(history) rolling-return,
+BIC, and sequential calculations run at most once per horizon after a new bar
+closes. BBO ticks within that bar reuse the cached distribution and reversal
+shape. Current wealth, inventory, fees, risk budgets, and executable-volatility
+fallback are still recombined on each tick in O(number of horizons), so the
+approximation does not freeze account or risk state. With three horizons this
+changes the expensive work from roughly six history scans per quote event to
+six scans per 10-minute close.
+
+Macro continuity is defined on the closed-bar grid, not by the fast model's
+two-minute event-gap threshold. A replay/websocket handoff gap shorter than one
+10-minute Macro bar therefore remains inside the same segment. Only a gap of at
+least one full Macro interval, or an actually missing bar, starts a new segment.
+This prevents a routine startup handoff inside an open bar from discarding all
+otherwise contiguous 3h/6h/24h history.
+
+The structural controller is executable-side symmetric. A bottom reversal is
+fit to ask closes because adding inventory must be attainable at the ask; a top
+reversal is fit independently to bid closes because reducing inventory must be
+attainable at the bid. For each Macro horizon, every admissible change point
+with at least four bars on each side is compared with a single linear trend on
+the matching executable log price. Bullish candidates require
+`betaBefore<0, betaAfter>0`; bearish candidates require
+`betaBefore>0, betaAfter<0`. Their approximate posterior includes a BIC Bayes
+factor, a scan multiplicity penalty, and both slope-sign probabilities:
+
+    log BF_H = (BIC_single-BIC_split)/2 - log(nCandidates)
+    pBull_H = logistic(log BF_H)
+              P(betaBefore<0) P(betaAfter>0)
+    pBear_H = logistic(log BF_H)
+              P(betaBefore>0) P(betaAfter<0).
+
+The early path does not scan historical split points. It fixes the split at the
+newest two returns, uses the preceding executable returns to estimate variance,
+and evaluates a fixed-split BIC/Laplace change statistic:
+
+    muPre  = mean(r[1:n-2])
+    muPost = mean(r[n-1:n])
+    zChange = direction*(muPost-muPre)/(sPre sqrt(1/nPre+1/2))
+    log BFEarly = zChange^2/2 - log(nPre+nPost)/2
+    pEarly = logistic(log BFEarly).
+
+Both newest returns must individually agree with the new direction and the
+preceding mean must oppose it. These are hard structural gates rather than
+additional probabilities multiplied from the same observations, so the
+coherent fixed-split posterior is not counted three times. The same
+fee-adjusted confidence bound used by the confirmed path must remain positive
+for buying, or negative even at the upper bound for selling. Only the shortest
+Macro horizon contributes this evidence, avoiding false multiplication of the
+same two bars across nested 3h/6h/24h windows.
+A Bayesian counter-evidence lease update was evaluated but rejected. On the
+2026-08-03 17:42--2026-08-04 05:42 UTC design incident it improved terminal
+equity by 2.58 JPY versus confirmed-only staged sizing and avoided two low-area
+sells. On the immediately preceding 12-hour sensitivity window it reduced
+terminal equity by 3.86 JPY, increased fills from 6 to 11, increased fees from
+0.60 to 1.10 JPY, and did not improve maximum drawdown. The effect was therefore
+path-specific rather than validated regime evidence. It is not deployed; early
+evidence must still clear the normal fee-adjusted confidence test before it can
+change the persisted allocation. A future cumulative detector must control
+optional stopping (for example by an e-process or calibrated sequential GLR)
+and pass multi-window holdout replay before replacing this fail-closed rule.
+
+
+
+    rhoEarly = nPost/(nPost+nMinimum)
+    wEarly = wBaseline + rhoEarly(wRobust-wBaseline).
+
+
+The posterior slope is projected no farther than the already observed
+post-change leg (and never beyond its own horizon), then mixed with the
+horizon's shrunk null drift:
+
+    muMix_H = p_H betaAfter Hforecast + (1-p_H) muNull_H
+    seMix_H^2 = p_H (SE(betaAfter)Hforecast)^2
+                + p_H(1-p_H)(betaAfter Hforecast-muNull_H)^2.
+
+The complete maker sell/re-entry cycle is inherited from live policy rather
+than refitted:
+
+    cost = 2 makerFee + 2 adverseSelection + minimumNetEdge
+    edgeLCB_H = muMix_H - zInventory seMix_H - cost
+    edgeUCB_H = muMix_H + zInventory seMix_H + cost.
+
+A bullish horizon can increase inventory only when `pBull_H>0.5`,
+`edgeLCB_H>0`, and its rolling risk estimate is sufficient. A bearish horizon
+may reduce inventory only when `pBear_H>0.5` and even `edgeUCB_H<0`. Both sides
+apply the confidence edge as a continuous active overlay around the slow
+no-alpha allocation:
+
+    edgeSoft,H = edgeLCB_H                       (bullish)
+               = edgeUCB_H                       (bearish)
+    wH = clip(wBaseline
+              + edgeSoft,H/[gamma(sigma_H^2+seMix_H^2)],
+              wFloor,wCap).
+
+This removes the discontinuity in the former absolute long-only Merton target,
+where any slightly negative fee-clearing return clipped immediately to the
+minimum position. A stronger edge still produces a larger shift and can reach
+the policy bounds, but the first value beyond the fee threshold is infinitesimal.
+
+These are robust Merton/Kelly allocations, not additive tickets. The strategic
+core remains the no-alpha center; carrying loss bounds the active overlay on
+both sides. The current wealth-drawdown bound and outer spot limits remain
+hard. Every statistically healthy horizon enters empirical-Bayes model
+averaging. A fee-approved horizon contributes its target, posterior, and edge;
+a healthy horizon without a fee-positive turn contributes `wBaseline`, equal
+odds, and zero edge. Insufficient horizons are excluded. This avoids
+post-selection bias from assigning all aggregate weight to whichever nested
+window happened to cross its significance boundary.
+
+#### Macro passive/active execution threshold
+
+Macro still corrects inventory primarily through the existing two-sided maker
+quotes. Active execution is a bounded exception, evaluated only once for each
+new closed Macro bar. The comparison uses a hypothetical quote at the current
+BBO (`bestBid` for a BUY and `bestAsk` for a SELL), not the strategy's possibly
+old or deliberately distant Gamma quote. This keeps Macro urgency separate
+from Fast's pricing policy.
+
+Let `lambdaU` be a one-sided upper confidence bound for the BBO quote-touch
+arrival rate on the correction side, `Tf` the Macro forecast horizon, and `Te`
+the Fast model's currently selected 10/15/30-minute execution window. With
+`H=min(Tf,Te)`, treating passive touch time as exponential gives
+
+    E[min(tau,H)] = (1-exp(-lambdaU H))/lambdaU
+    pMiss = exp(-lambdaU H)
+    waitLoss = |edgeAggregate|/Tf * E[min(tau,H)].
+
+The upper rather than mean arrival rate is intentional: it assumes the passive
+order fills as quickly as the public crossing sample can statistically support,
+thereby minimizing estimated wait loss and biasing against taker execution.
+Missing crossing statistics fail closed.
+
+For a BUY, `passiveToTouch=log(bestAsk/bestBid)`; the SELL expression is the
+same BBO log spread. The decision triggers only when
+
+    waitLoss > passiveToTouch + takerFee - makerFee.
+
+Thus Binance's equal maker/taker schedule cancels in this comparison instead of
+creating an arbitrary 10-bps threshold. The remaining surplus is the maximum
+permitted book-impact budget. The order is `LIMIT IOC`, never an unbounded
+`MARKET` order:
+
+    buyWorst  = bestAsk * exp(surplus/10000)
+    sellWorst = bestBid * exp(-surplus/10000).
+
+Active size is probabilistic rather than the whole target gap. First isolate
+the tactical Macro displacement from the no-alpha baseline inventory `q0`:
+
+    tacticalGap = min(totalTargetGap, |qTarget-q0|)
+    surplus = max(0, waitLoss-crossingCost)
+    urgentFraction = pMiss * min(1, surplus/waitLoss)
+    iocQuantity = tacticalGap * urgentFraction.
+
+The submitted amount is further capped by actually available (not locked)
+balance and current opposite-side BBO quantity. It must independently pass the
+exchange's minimum quantity and notional filters; otherwise the correction
+remains maker-only. The residual target gap stays assigned to the ordinary
+maker model. This prevents a weak signal from turning the complete inventory
+error into a taker order while retaining an explicit probability-of-missing
+interpretation for the active tranche.
+
+The BBO depth cap prevents the IOC from walking an unobserved thin book; the
+worst price protects against a race between observing L1 and Binance accepting
+it. Same-bar attempts are persistently suppressed across restart. Scheduling
+an IOC does not cancel either resting maker order. If the IOC does not fill,
+the maker lifecycle is unchanged. If it does fill, the normal maker fill
+callback first synchronizes authoritative balances, recomputes the inventory
+projection from the fill, and only then cancels/replaces affected quotes. Live
+and production replay use this same next-BBO execution ordering.
+
+A causal signal must also survive one noisy closed bar. Let `Hforecast` be the
+post-change duration already selected by the structural model. Treating it as
+the mean lifetime of a memoryless regime gives
+
+    pSurvive(delta) = exp(-delta/Hforecast)
+    wLease(delta) = wBaseline
+                    + pSurvive(delta)(wRegime-wBaseline).
+
+There is no fitted timeout or half-life. A fresh fee-positive change point starts
+or replaces the persisted episode; absence of a compatible confidence edge
+decays the target continuously. A directly confirmed opposite regime replaces
+the prior lease immediately: bearish evidence is never averaged with the
+survival probability of an old bullish episode. Every update is clipped by the
+live policy bounds and wealth-drawdown cap. The persisted direction, change
+time, activation time, target, forecast horizon, probability, and net edge
+survive process restart without a pretrained artifact.
+
+Earlier numerical examples in this section used an absolute carrying cap and a
+replay harness that did not execute the live Macro controller. They are
+superseded: those target percentages and direction-change counts cannot be used
+as evidence for the strategic-core/active-overlay controller.
+
+Production replay now constructs `MacroInventoryModel` and
+`MacroInventoryState`, observes the same bid/mid/ask closed bars, and executes
+`Decide`, sequential/full `DecideReversal`, `ApplyRegimeLease`, and the
+probabilistic target-centered band in the same order as live. Its executable
+order filter is still a BBO/public-trade approximation, so realized PnL remains
+conditional on queue calibration. Any future acceptance result must identify
+the exact code revision, warmup interval, initial balances, fees, and queue
+assumption before it is promoted into this design record.
+
+#### Probabilistic inventory variation around the macro expectation
+
+The macro output `wTarget` is interpreted as the controlled long-run mean
+
+    E[w(t) | model state] = wTarget,
+
+not as a requirement that every realized fill leave `w(t) <= wTarget`. Maker
+fills are discrete. Making the same number both target and instantaneous cap
+creates an absorbing one-sided state: one corrective sell can leave less than
+Binance's minimum executable BUY headroom, so the quote process cannot return
+to its mean.
+
+Conditionally over the adaptive fast model's currently selected window `T`, let
+BUY and SELL maker
+fills be independent Poisson counts with observed executable-BBO intensities
+`lambdaBuy` and `lambdaSell`. Using conservative target-region executable order
+notional `q` (the larger of the BUY and SELL exchange-filter lattice minima),
+the inventory innovation is approximated by a scaled Skellam process:
+
+    Delta I = q (NBuy - NSell)
+    Var[Delta I | state] = q^2 (lambdaBuy + lambdaSell) T
+    sigmaInventory = q sqrt((lambdaBuy + lambdaSell) T).
+
+The symmetric admissible half-width is
+
+    B = max(1.5 q, zInventory sigmaInventory),
+
+then clipped by equal room from `wTarget` to the configured absolute portfolio
+bounds. The factor 1.5 is discrete rather than calibrated: a continuous target
+can lie at most `q/2` from its nearest reachable inventory lattice state, and a
+quote at that state needs another `q` of room for one fill. The resulting floor
+is important in sparse JPY books where a normal approximation at substantially
+less than one expected event is not reliable. It is also a causal cold-start
+fallback: absent valid arrival rates, the strategy permits exactly one
+executable jump from the nearest target state on each side rather than inventing
+turnover. The existing short-horizon volatility risk budget and maximum
+quote-level capacity may only reduce `B`; neither can shift its center.
+
+The unified quote pressure then supplies mean reversion. Inventory above the
+center makes bids farther/smaller and asks nearer/larger; inventory below the
+center does the converse. Fill-rate imbalance enters the same pressure once,
+so unequal background arrival rates are compensated without a second manual
+weight or a duplicated hard gate. At an absolute outer policy boundary the
+symmetric width collapses to zero.
+
+The inventory-variation window switches live with the same adaptive fast
+selection used by direction and executable-price volatility (10m, 15m, or
+30m); it does not wait for the next restart. The maker/order-keep horizon remains
+responsible for queue lifetime and quote-distance arrival estimation. It is
+used for inventory variation only if no fast window exists, with the configured
+minimum trading window as the final fallback. This separation preserves queue
+retention while preventing a stale 30-minute inventory scale from damping a
+healthy 10- or 15-minute fast model.
+
+When a macro horizon is below its minimum effective sample count, its drift is
+still set to zero. Its variance fallback is now continuous instead of binary.
+Let `nMin` be the configured minimum, `nEffective` the overlap-corrected support,
+and `sigmaLive,H^2` the executable-BBO quadratic variation scaled to horizon
+`H`. The live fallback weight and variance are
+
+    wFallback = clip((nMin-nEffective)/(nMin-1), 0, 1)
+    sigmaUsed,H^2 = sigmaH^2
+                     + wFallback max(0, sigmaLive,H^2-sigmaH^2).
+
+One effective sample has no variance degrees of freedom and therefore receives
+the full live fallback. The weight reaches zero continuously at `nMin`; a 24h
+estimate with `nEffective=7.92` and `nMin=8`, for example, receives 1.14% rather
+than 100% live fallback variance. The fallback never lowers observed rolling
+variance. Startup rebuilds the 10-minute bars from the local Binance BBO archive,
+then live BBO continues the same model without a pretrained artifact.
+
+The resulting regime-adjusted target remains the center of the unified quote
+model. The probabilistic inventory band and exchange headroom own feasibility;
+there is no separate unconstrained-utility price preference that can bypass or
+fight the regime target. Inventory below the target moves the unified pressure
+toward stronger bids, while the hard maximum still disables acquisition at its
+boundary.
+
+A healthy adaptive fast model also has an evidence lease tied to its selected
+10m, 15m, or 30m window. Once that window has elapsed, it may replace the
+same-side resting quote once only if the newly computed fee-safe Gamma-edge
+price improves the bid for positive direction (or lowers the ask for negative
+direction) by at least the existing `refreshMoveBps`. The normal minimum resting
+interval, `LIMIT_MAKER` constraint, fee/adverse-selection floor, and inventory
+feasibility gates still apply. Successful replacement resets quote age, so this
+is at most one reprice per selected fast window rather than BBO chasing.
+
+The same incident also exposed a variance discontinuity: the 24h estimate was
+near, but below, its effective-sample threshold, so binary fallback could
+extrapolate intrabar microvolatility to the full day and move the no-alpha
+baseline abruptly. Continuous fallback weighting fixes that estimator defect;
+the robust regime target and survival filter fix the separate allocation and
+timing defects. Acceptance requires a fee-positive lower confidence edge,
+wealth-drawdown compliance, nonzero bid headroom below the feasible maximum, a
+fee-safe fast-edge bid, and no acquisition at or above the hard maximum.
+Cash deposits naturally establish a new wealth peak. A deliberate withdrawal is
+an external capital flow rather than trading loss, so persisted macro wealth
+state must be reset or flow-adjusted before the next restart.
+
+Macro risk output enters once as the effective inventory target/min/max band.
+The regime-adjusted target remains the single center used by unified price and
+quantity pressure; fast direction, book imbalance, volume agreement, and fill
+hazard are not repeated through independent controllers.
+
+Required telemetry is wealth, peak, drawdown, current/target risky weight,
+utility target, capital/carry floors and caps, drawdown cap, downside loss,
+limiting horizon, raw and overlap-corrected samples, latest rolling return,
+per-horizon reversal posterior, early/confirmed classification, posterior-bar
+count, evidence reliability, fee-adjusted confidence edge, target shift, and
+fallback state. Acceptance compares terminal net PnL, maximum/conditional
+drawdown, inventory-carry PnL, spread PnL, fees, turnover, fills/hour, quote
+uptime, and markouts in causal walk-forward replay.
+
+The earlier ETHJPY sample had a 24-hour downside loss of 660.37 bps. Under the
+correct active-risk interpretation, a 1% budget gives 15.14 percentage points
+of headroom around the 50% strategic core, not a 15.14% absolute position cap:
+
+    active interval = [34.86%,65.14%].
+
+The previously measured reliability-weighted utility target of 48.50% lies
+inside that interval and therefore remains the no-regime center. A fee-positive
+early signal can move only 20% of the distance from that baseline toward the
+relevant bound; a confirmed signal may use the full interval. The separate
+Poisson/Skellam maker-fill band remains centered on the selected target and
+governs discrete quote headroom. Full queue-calibrated replay is still required
+before treating any observed coefficient or PnL as economically validated.
+
 ## Risk and failure modes
 
 Directional mode submits spot market buy/sell orders. Entry size is bounded by
@@ -423,46 +925,143 @@ trailing-profit reversal. Model-only soft exits do not close a small
 fee-negative move: they require either a configured adverse two-barrier loss
 cut or a move that has cleared the fee-aware profit floor.
 
-Market-maker mode submits Binance `LIMIT_MAKER` orders on both sides when the
-exchange filters, balances, and inventory band allow them. The common quote
-notional is derived from observed volatility, the selected trading horizon,
-two-sided crossing load, risk budget, and z-score; it is then reduced
-independently on the riskier side using inventory, fast direction, book
-imbalance, and side-specific fill rates. There is no strategy-level fixed
-minimum or maximum quote-notional clamp. Account balances, symbol filters, and
-`risk.maxSymbolNotionalJPY` remain hard controls. An ask is omitted when the
-available base is below Binance's minimum quantity/notional, which can produce
-a buy-only book while the account contains only dust.
+Market-maker mode submits Binance `LIMIT_MAKER` orders on both sides whenever
+balances, exchange filters, and the configured absolute portfolio bounds allow
+them. Fast remains the source of price, quote lifetime, and gross risk budget.
+Macro does not hard-disable a side merely because current inventory is outside
+its stochastic target region; it changes the fill-probability-weighted bid/ask
+quantity split instead. There is no strategy-level fixed minimum or maximum
+quote-notional clamp. Account balances, symbol filters,
+`risk.maxSymbolNotionalJPY`, and the configured outer capital ratios remain
+hard controls. A side is omitted only when one of those hard constraints cannot
+fit the exchange's minimum executable order.
 
-Inventory `min`, `target`, and `max` are absolute base-asset quantities
-at the current mid-price, recalculated from quote-equivalent pair equity on every
-quote window. Pair equity is total quote balance plus total base balance times
-mid-price. The live profile centers inventory at 50% of pair equity and currently keeps
-0%/100% as hard emergency guardrails so all pair capital remains available over
-time. Statistical risk capacity
-`D = riskBudget / (z sigma sqrt(horizon) levels)` is a half-width around that
-target, producing `max(25% E, 50% E-D)` and `min(75% E, 50% E+D)` rather
-than an absolute cap measured from zero. `inventoryRiskBudgetJPY: 10` is an
-absolute floor; `inventoryRiskBudgetRatio: 0.0025` scales it to 0.25% of pair
-equity for larger balances.
+Inventory `min`, `target`, and `max` are absolute base-asset quantities at the
+current mid, recalculated from total quote plus total base times mid. Total base,
+including externally locked holdings, is used for portfolio risk; immediately
+quoteable balances remain the exchange-submission constraint. In the ETHJPY
+live profile, 50% is now the macro controller's strategic prior. Causal 3h/6h/24h
+utility and carrying/drawdown bounds derive the expected target. The short
+quote-horizon fill distribution creates a symmetric lower/upper region around
+that expectation, clipped by the configured outer 0%/100% portfolio policy and
+the independent volatility/level risk widths. `inventoryRiskBudgetJPY: 10`
+remains an absolute quote-risk floor and `inventoryRiskBudgetRatio: 0.0025`
+scales that separate micro budget to 0.25% of pair equity.
 
-Order construction separates hard band headroom from one executable ticket.
-Let `W` be the smaller target-to-edge band half-width in quote notional and `L`
-be `inventoryMaxOrderLevels`. The target exploration tranche is `W/max(1,L)`.
-A corrective BUY/SELL may cover the current distance to target, but a single
-fill cannot traverse from one hard edge through the target to the opposite edge.
-At target, both sides use one equity-scaled tranche before joint pressure can
-shrink the riskier side. Because Binance applies side-specific quote precision,
-lot-size, and minimum-notional filters, a smaller model tranche is projected
-upward to the smallest executable BUY or SELL lattice quantity only when that
-quantity still fits the corresponding hard inventory headroom. If the hard
-headroom cannot fit an exchange-minimum ticket, that side is deliberately
-omitted instead of weakening the hard band. Final BUY and SELL quantities
+The probability-centered quantity model preserves Fast as the source of gross quote
+risk while Macro controls the fill-weighted inventory distribution. For current
+mid-marked risky notional `N`, Macro expectation `M`, horizon fill probabilities
+`pBuy = 1-exp(-lambdaBuy*T)` and `pSell = 1-exp(-lambdaSell*T)`, and fixed Fast
+gross `G = qBuy + qSell`, one executable fill removes at most one statistically
+reachable stage of the Macro target error. For correction-side arrival rate
+`lambdaCorrection`, the selected Fast/order waiting clock `TFast`, the Macro
+signal's causal forecast horizon `TRegime`, and configured maximum
+`Lmax = inventoryMaxOrderLevels`, define the staged actuation clock as:
+
+    Tact = min(TFast, TRegime), using the configured minimum only when one or both clocks are unavailable.
+
+    K = lambdaCorrection*Tact
+    Leffective = clip(K, 1, Lmax)
+    kappa = pCorrection/Leffective
+    M_step = N + kappa*(M-N)
+    qBuy  = (M_step - N + pSell*G)/(pBuy + pSell)
+    qSell = G - qBuy.
+
+Thus, whenever `1 < K < Lmax`, `K*(1/Leffective)=1`: the expected corrective
+fills over the forecast regime remove one current target error rather than
+requiring the old fixed six-stage response. `inventoryMaxOrderLevels` is now a
+maximum single-fill risk subdivision, not a fixed time constant. Missing
+correction-side arrival evidence fails closed to the previous configured-level
+behavior; the controller never borrows the opposite side's rate.
+
+The shortest-clock rule is important: a 24-hour Macro lease expresses signal
+survival, not permission for one maker order to wait 24 hours. It prevents a
+long regime horizon from shrinking every correction to an economically
+irrelevant ticket, while the `Lmax` cap and the probability-centered quantity
+constraint still prevent a single fill from becoming a full portfolio jump.
+
+Balances and absolute 0%/100% inventory headroom bound each side. In addition,
+each side is capped by the target-centered per-fill tranche, including at most
+`|M-N|/Leffective` of correction. This prevents a low estimated
+fill probability from being inverted into a near-full-inventory resting order.
+Binance's minimum executable bid and ask are constraints in this same solve, so a
+sub-lattice result cannot be repaired by deleting the opposite side. The
+controller uses the largest feasible `G` whose one-resting-order Bernoulli
+approximation does not increase expected squared Macro error:
+
+    mu = N + pBuy*qBuy - pSell*qSell
+    variance = pBuy*(1-pBuy)*qBuy^2 + pSell*(1-pSell)*qSell^2
+    |mu-M| <= |N-M|
+    (mu-M)^2 + variance <= (N-M)^2 + (softWidth/z)^2.
+
+This removes the old multiplicative quantity pressure: inventory, direction,
+OFI, and fill-rate evidence still form the unified price pressure, but they are
+not applied again as heuristic size weights. The projection works in mid-marked
+notional and converts back through the actual bid/ask prices. Each completed
+fill triggers the existing immediate balance/inventory refresh, so both sides
+are solved again. Diagnostics include `quantityProjectionDesiredInventoryJPY`,
+`quantityProjectionTargetContraction`, both absolute hard bounds, and the other
+`quantityProjection*` fields. The ETHJPY profile runs this model live with
+`probabilityCenteredQuantity.shadowOnly: false`.
+
+The same reachability calculation supplies a bounded target-side price
+urgency. Let `qCell` be one exchange-executable notional, `R=|M-N|/qCell` the
+required correction fills, and `m` the signed fast-direction posterior mean in
+`[-1,1]`. For correction side `s` (`+1` buy, `-1` sell):
+
+    load = clip(R/K, 0, 1)
+    pMomentumAligned = (1+s*m)/2
+    urgency = load*pMomentumAligned.
+
+Only the target-side quote moves inward. Its distance reduction is `urgency`
+times the economically spendable distance between the normal side floor and a
+fee/adverse-selection execution floor. The opposite quote is retained and, if
+necessary, widened so every submitted pair still satisfies:
+
+    targetSideDistance >= makerFee + adverseSelection
+    bidDistance + askDistance >= 2*makerFee + 2*adverseSelection + minimumNetEdge.
+
+This is an arrival-capacity utilization model rather than a manually weighted
+momentum bonus. Aligned momentum increases execution probability when the
+passive process cannot reach Macro's target in time; adverse momentum suppresses
+the concession. Diagnostics expose `inventoryActuation*` fields, including
+expected/required fills, effective levels, momentum probability, inward bps,
+and the active economic floor.
+
+Whenever two-sided fill probabilities are unavailable or the joint projection
+is infeasible, fallback order construction separates absolute hard-band
+headroom from one executable ticket. Let `W` be the smaller target-to-edge band
+half-width in quote notional and `L`
+be `Leffective` above (falling back to `inventoryMaxOrderLevels` when actuation
+evidence is unavailable). Let `eBuy` and `eSell` be the current
+target error on each side in quote notional:
+
+    qExplore = W/max(1,L)
+    qBuy  = max(qExplore,eBuy/max(1,L))
+    qSell = max(qExplore,eSell/max(1,L)).
+
+Thus a moving Macro target cannot bypass the tranche and place the entire
+portfolio correction into one maker order. Outside the current band, repeated
+fills converge toward target in bounded stages; inside the band, each fill uses
+one exploration tranche. At target, the fallback gives both sides one tranche;
+no directional quantity pressure is applied. Because Binance applies
+side-specific quote precision, lot-size, and minimum-notional filters, a smaller
+model tranche is projected upward to the smallest executable BUY or SELL lattice quantity
+only when that quantity still fits the corresponding hard inventory headroom.
+If the hard headroom cannot fit an exchange-minimum ticket, that side is
+deliberately omitted instead of weakening the hard band. Final quantities
 remain capped by hard band headroom, balances, and exchange filters. Diagnostics
 expose hard headroom, effective order headroom, and
 `inventoryOrderTrancheJPY`, in addition to policy capital bounds, effective
 bounds, risk half-width, and both side headrooms so deposits, withdrawals,
 volatility changes, and fills can be reconciled numerically.
+
+Macro target changes do not churn a live queue for continuous sub-tick noise.
+After the minimum resting interval, quantity and price are realigned only when
+the correction side changes sign or `|targetNew-targetQuoted|*pairEquity` is at
+least one exchange-executable notional cell. The quoted target is updated only
+after a replacement submission succeeds. Live trading and production replay
+share this cell test and the same dynamic-level equations.
 
 A quote replacement is fully constructed and checked against exchange filters
 before any safe resting maker order is cancelled. If no executable replacement
@@ -472,10 +1071,161 @@ sub-minimum target tranche from producing an empty book and a runaway
 missing-side retry loop.
 
 Every BBO evaluation also sums the remaining quantities of all active maker
-orders by side. If all remaining bids filling would exceed the latest upper
-edge, or all remaining asks filling would breach the latest lower edge, the
+orders by side. If all remaining bids filling would exceed the configured
+absolute upper edge, or all remaining asks filling would breach the configured
+absolute lower edge, the
 strategy immediately cancels and rebuilds the quote. This risk contraction
 path bypasses the normal anti-churn minimum resting interval.
+
+#### QV-time no-trade inventory controller (2026-08-06)
+
+The live ETHJPY profile now enables `macroInventory.noTradeRegion`. When this
+switch is on, this section supersedes the earlier multi-horizon utility target,
+reversal lease, arrival-level contraction, and Macro IOC descriptions. The
+older implementation remains available only as the disabled-path fallback.
+
+The controller has one signed alpha state rather than a manually weighted
+3h/6h/24h target. With `Nu` up-crossings, `Nd` down-crossings, and a symmetric
+beta prior of total mass `m`, it computes
+
+    pUp = (Nu + m/2)/(Nu + Nd + m)
+    d   = 2*pUp - 1.
+
+For a symmetric log-price first-passage barrier `+/-h`, Brownian motion in
+quadratic-variation time satisfies
+
+    pUp = logistic(2*theta*h),
+    theta = atanh(d)/h,
+
+where `theta` is drift per unit quadratic variation. BUY execution risk uses
+ask log-return volatility and SELL execution risk uses bid log-return
+volatility. With
+
+    qBuy   = sigmaAsk^2,
+    qSell  = sigmaBid^2,
+    qCross = crossing-model QV rate,
+    A      = qCross*Tobs,
+
+the causal return forecast is `theta*A`. The frictionless risky-weight aim is
+the regularized Merton solution
+
+    wAim = clip((theta*A + k*wPrior)/(gamma*A + k), wRiskMin, wRiskMax),
+
+where `gamma` is risk aversion and `k` is the strategic-prior strength. An
+unhealthy signed-crossing snapshot is not allowed to move the center: it sets
+`theta=0` and `wAim=wPrior` before calculating the boundaries.
+
+The instantaneous solution is retained as `wRaw`, not applied at every BBO.
+For a beta posterior `Beta(a,b)`, the signed-direction variance is
+
+    Var(d) = 4*a*b/((a+b)^2*(a+b+1)).
+
+The controller propagates this uncertainty through the Merton map with
+
+    J   = A/(h*(1-d^2)*(gamma*A+k)),
+    Rw  = J^2 * max(Var(dMicro), Var(dExecutable)).
+
+The maximum is deliberate: microprice and executable-side crossings are
+correlated views and must not be counted as independent evidence. On each new
+causally closed Macro bar only, the persisted scalar filter uses
+
+    f      = min(1, DeltaBar/Tobs),
+    Q      = f*max(Pprev,Rw),
+    Pminus = Pprev+Q,
+    K      = Pminus/(Pminus+Rw),
+    wAim   = wPrev+K*(wRaw-wPrev),
+    P      = (1-K)*Pminus.
+
+Thus the smoothing gain comes from posterior uncertainty and the fraction of
+the rolling observation replaced by the new bar. Repeated BBO callbacks inside
+the same bar cannot move `wAim`. An unhealthy posterior immediately resets the
+filtered center to the strategic prior and clears the correction state rather
+than preserving stale drift.
+
+For one-way proportional execution cost `c`, the executable-side free-boundary
+approximation is
+
+    deltaSide^3 = 3*c*(wAim*(1-wAim))^2*qSide/(2*g),
+    g = gamma*qCross + k/Tobs.
+
+The lower boundary is `wAim-deltaBuy` and the upper boundary is
+`wAim+deltaSell`, intersected with the retained portfolio risk bounds. Each
+half-width is also at least 1.5 exchange-executable notional cells divided by
+pair equity; this prevents a continuous boundary narrower than the Binance
+quantity lattice. If current weight is inside the region, the execution target
+is current weight and Macro contributes zero turnover. If it is outside, the
+execution target is only the nearest boundary, approximating local-time
+reflection instead of an immediate jump to the frictionless aim.
+
+Execution uses one stateless pair of cost-derived boundaries. The filtered aim,
+covariance, and last closed bar persist across restarts. BUY correction begins
+when current inventory is below the lower boundary and releases at that same
+boundary; SELL behaves symmetrically at the upper boundary. Posterior filtering
+is the sole temporal stabilizer. Hard risk-bound changes still clip the state
+immediately.
+
+The interaction contract is deliberately one-way:
+
+| Component | Behavior while `noTradeRegion.enabled=true` |
+|---|---|
+| 3h/6h/24h Macro returns | Keep only the strict carrying-loss/drawdown floor and cap intersection; do not weight a target. |
+| Macro reversal and regime lease | Skipped; they cannot shift the single QV-time aim a second time. |
+| Probabilistic inventory variation | Skipped; the free boundaries are materialized directly and are not widened again. |
+| `inventoryMaxOrderLevels` / arrival actuation | Retained as staged correction; one fill removes only a reachability-sized fraction of the boundary gap. |
+| Macro marketable IOC | Retained as a bounded correction only when confidence-adjusted waiting loss exceeds executable crossing cost. |
+| Fast direction, OFI, volume, spread, arrival model | Retained for two-sided quote price and total statistical risk budget; they do not move the Macro center. |
+| Probability-centered quantity | Retained as the sole allocator of Fast gross risk between sides, using the execution target and no-trade boundaries. |
+| Account balance, exchange filters, absolute and Macro risk caps | Retained as hard intersections and may still remove a side when an executable order would violate them. |
+
+Live and production replay pass the same slow crossing snapshot, barrier,
+executable ask/bid QV, cost, and minimum notional into this controller. Logs
+expose `macroNoTradePosteriorUp`, signed direction, drift per QV, QV rate,
+forecast return/variance, aim, both boundaries, execution target, direction,
+and side half-widths. This separation is important: `wAim` reports the model's
+economic belief, while the execution target reports whether paying turnover is
+currently justified.
+
+A causal ETHJPY replay over 2026-08-05 13:45Z--2026-08-06 00:00Z, with the
+same 6,808 JPY starting equity, 0.02 ETH, queue multiplier 1, executable-price
+confirmation, and production simulator, compared the immediately preceding
+controller with the retained Kalman-filtered controller:
+
+| Metric | Previous no-trade + IOC | Kalman filtered |
+|---|---:|---:|
+| Maker fills (BUY/SELL) | 6 (2/4) | 9 (4/5) |
+| Macro IOC attempts/fills | 16 | 10 |
+| Macro active quantity | 0.011173 ETH | 0.006486 ETH |
+| Taker fees | 3.3325 JPY | 1.9395 JPY |
+| Maximum drawdown | 0.74054% | 0.72661% |
+| Net P&L | 82.0958 JPY | 80.2906 JPY |
+
+Against the unfiltered controller, the retained filter reduced IOC count by
+37.5% and taker fees by about 42%, with a 0.0139 percentage-point drawdown
+improvement, while net P&L was 1.8053 JPY lower in this favorable upward
+interval. This does not by itself establish universal profitability of the
+filter. Both legacy-Macro replay variants remained bit-for-bit unchanged in
+their reported P&L, drawdown, maker fills, and IOC counts.
+
+The same replay was repeated with opening inventory changed from 0.02 ETH
+(86.48% risky weight at the opening mark) to 0.023122840088 ETH (100% risky
+weight, zero JPY), holding total starting equity at 6,808 JPY:
+
+| Metric | 86.48% ETH start | 100% ETH start |
+|---|---:|---:|
+| Strategy net P&L | 80.2906 JPY | 80.2388 JPY |
+| Hold net P&L | 127.6400 JPY | 147.5700 JPY |
+| Strategy minus hold | -47.3494 JPY | -67.3312 JPY |
+| Maker fills (BUY/SELL) | 9 (4/5) | 8 (3/5) |
+| Macro IOC fills / quantity | 10 / 0.006486 ETH | 12 / 0.009853 ETH |
+| Maximum drawdown | 0.72661% | 0.72667% |
+| Final risky weight / target | 59.1806% / 56.1555% | 59.1804% / 56.1554% |
+
+The zero-JPY case remained executable: the first maker SELL reduced inventory
+at 13:46Z and Macro IOC reduction began when its cost test passed at 14:30Z.
+Both starting allocations converged to almost identical final inventory and
+equity. Consequently, the strategy deliberately discarded most of the extra
+opening ETH exposure; in this upward interval that increased hold-relative
+opportunity cost by 19.9818 JPY without materially changing strategy P&L.
 
 The market-maker refresh policy is queue-preserving. A medium-term (10-minute) quote model
 update does not automatically cancel an order. A quote remains active through
@@ -728,17 +1478,46 @@ starting a strategy, account session, or order executor:
 go run ./cmd/gammacapture-capture --symbol BTCJPY --duration 2h --output data/gammacapture/live
 ```
 
-The command writes separate timestamped `trades` and `bookticker` CSV files. It
-is public-only and never submits an order. The BBO timestamps are local receive
-times because Binance's book-ticker payload has no exchange timestamp; any
-latency study must retain that distinction.
+The command writes separate `trades` and `bookticker` CSV files partitioned at
+UTC midnight, for example `ETHJPY-bookticker-2026-08-05.csv`. A same-day
+restart appends without duplicating the header. Each file has an atomic
+`.meta.json` sidecar containing its UTC range and row count, plus a `.index.csv`
+sidecar containing one safe byte offset per UTC minute. The strategy uses the
+date partition to skip non-overlapping days and the sparse index to seek near
+the checkpoint cursor; it still applies an exact event-time predicate.
+
+The collector is public-only and never submits an order. BBO timestamps are
+local receive times because Binance's book-ticker payload has no exchange
+timestamp. Before switching an existing collector, stop its writer and copy its
+legacy timestamped files into the daily layout with:
+
+```bash
+bin/gammacapture-capture --migrate-legacy \
+  --symbol ETHJPY --output data/gammacapture/ETHJPY
+```
+
+Migration normalizes older short rows to the current schema, partitions by the
+UTC `received_at` date, writes indexes and metadata in a temporary directory,
+and rereads every output row before atomically publishing it. It refuses to
+overwrite an existing daily target and leaves every source file unchanged.
+Once daily files exist for a stream, strategy warmup and research replay treat
+them as authoritative instead of reading the legacy copies again; if no daily
+file exists, the legacy layout remains the fallback. This prevents duplicate
+statistics and avoids rescanning monolithic files after migration.
+
+Fast-evidence startup merges both configured collector roots
+(`livePath` and `<path>/<SYMBOL>`) before applying that daily preference. A
+stale legacy file in one root therefore cannot hide a current daily file in the
+other. Checkpoints additionally record the size and modification time of fully
+consumed files; a later startup skips them only while both values still match,
+while any append or replacement forces the safe delta replay path.
 
 Summarize a completed (or still-growing) capture with:
 
 ```bash
 go run ./cmd/gammacapture-bbo-research \
-  --book data/gammacapture/live/BTCJPY-bookticker-<timestamp>.csv \
-  --trades data/gammacapture/live/BTCJPY-trades-<timestamp>.csv \
+  --book data/gammacapture/live/BTCJPY-bookticker-<YYYY-MM-DD>.csv \
+  --trades data/gammacapture/live/BTCJPY-trades-<YYYY-MM-DD>.csv \
   --max-spread-bps 10 --max-book-age 5s
 ```
 
@@ -749,80 +1528,44 @@ seconds, 96.49% of trades passed the five-second book-age condition, and one
 trade was 19.55 seconds after the preceding quote. The stale-book gate is
 therefore an execution-safety control rather than a redundant spread check.
 
-### Online arrival training with Binance startup replay
+### Retired online-arrival learner
 
-The supplied maker configuration sets `aggTradeWarmup.enabled: false`: it does
-not load a frozen model or train from private fills. Instead, startup causally
-replays the local raw Binance book-ticker capture through the same online
-learner used by the live stream. It also reconstructs the volatile crossing,
-fast-direction, volatility-prior, and recent public trade/BBO evidence state
-before any order lifecycle begins. The strategy then resolves non-overlapping BBO paths for every admitted horizon and every five-bps executable-distance bucket. BUY labels use future best ask reaching the bid quote; SELL labels use future best bid reaching the ask quote.
-Training every bucket prevents the active quote policy from censoring
-alternatives that were not submitted. Binance book-ticker is change-driven, so
-a silence shorter than two minutes is forward-filled at the last BBO; a
-two-minute gap marks the path discontinuous and discards the affected label.
-The aggregate-trade warmup's explicit five-second outage rule remains separate.
+The former dual-timescale online-arrival/Poisson learner and its Binance
+startup replay have been removed from the runtime. Horizon decisions now use
+the side-specific executable-BBO history already maintained by the maker
+model. The `onlineArrival` YAML/state fields remain passive compatibility
+fields for older files and are ignored by quote selection and warmup.
 
-For each side and cell, the estimator keeps event count `N` and exposure hours
-`T`. Its Poisson maximum-likelihood intensity is `lambda = N/T`. Both values
-are exponentially decayed on two clocks:
+The BBGO strategy state persists a bounded, versioned model checkpoint. It
+contains the crossing engine, slow/fast crossing windows, decayed direction
+events, recent fast evidence, the executable-BBO horizon ring, and closed/open
+Macro bars. It contains no orders, balances, credentials, or fills. A compatible
+live restart replays only capture rows newer than the causal cursor; backtest
+and replay environments never load this live checkpoint. Checkpoint restoration
+and delta replay are independent of the retired online-arrival learner and run
+even when `aggTradeWarmup.enabled` is false. The checkpoint cursor, rather than
+a possibly newer top-level state timestamp, is authoritative for the delta
+boundary. When the checkpoint is missing, incompatible, or older than the
+bounded sufficient window, live startup reconstructs the rolling crossing and
+executable-BBO models from indexed local capture before stale orders are
+reconciled; it does not begin quoting from an empty model.
 
-* the six-hour fast component follows the current intraday regime;
-* the 72-hour slow component prevents rare ETHJPY crossings from disappearing
-  at a hard six-hour cutoff.
-
-The live blend is
-`lambda = w*lambda_fast + (1-w)*lambda_slow`, where
-`w = W_fast/(W_fast + horizonMinSamples)` and `W_fast` is the effective number
-of completed fast windows. Using exposure rather than touch count lets a
-well-observed quiet regime reduce the estimated arrival rate. A cell is usable only after at least
-`horizonMinSamples` effective completed windows and at least one observed touch
-on each side. Before then, the strategy reports `insufficient online arrival
-exposure` and retains conservative one-ticket sizing rather than inventing a
-fill probability.
-
-```yaml
-aggTradeWarmup:
-  enabled: false
-marketMaker:
-  horizonMinSamples: 20
-  onlineArrival:
-    enabled: true
-    distanceStepBps: 5
-    fastHalfLife: 6h
-    slowHalfLife: 72h
-    persistenceInterval: 10m
-    startupLookback: 72h
-    startupMaxAge: 15m
-    requireStartupHistory: true
-```
-
-Only compact version-2 executable-BBO sufficient statistics are persisted in the BBGO strategy state; midpoint-labeled version-1 cells are cleared and rebuilt from raw capture on upgrade;
-the collector remains the source of raw Binance history. On restart, the
-strategy replays up to `startupLookback`, while each persisted per-horizon
-resolution cursor prevents overlapping windows from being counted twice. The
-raw replay always reconstructs the non-persisted rolling models. Startup fails
-before order handling when the newest BBO is older than `startupMaxAge`, the
-capture is missing, or any configured horizon has fewer than
-`horizonMinSamples` effective completed windows. With a 10-minute horizon and
-`horizonMinSamples: 20`, an actually empty archive needs about 3 hours 20
-minutes of history for the sample-count gate; two-sided touch evidence can take
-longer in a sparse market. Existing quotes keep the parameters selected at the
-beginning of their window.
-
-A read-only cadence validation of the captured ETHJPY BBO from July 23--31
-(187.48 hours) produced 1,122 valid non-overlapping 10-minute windows and 747
-valid 15-minute windows with the two-minute outage rule. At 20--50 bps, the
-10-minute cells cleared the 20-window/two-sided gate after about 3.33 hours. The
-15-minute 20/30-bps cells cleared after 5 hours; the sparser 50-bps cell needed
-17.77 hours. An 80-bps tail cell needed 17.69 hours at 10 minutes and 96.98 hours
-at 15 minutes. These figures validate data sufficiency and restart-replay
-timing. Production replays the raw observations, not these research summaries,
-and the figures are not fill or profitability claims.
+Research replay has a separate deterministic parsed-event checkpoint for
+repeated experiments over the same interval. It is enabled by default at
+`data/gammacapture/state/replay-cache` and can be disabled with
+`--replay-cache-dir ""`. The cache stores only parsed BBO/trade observations,
+never model state, orders, balances, credentials, or private fills. Its key
+contains the symbol, replay mode (`exact` or `macro-1s`), warm-up/evaluation
+interval, configuration-content fingerprint, and every selected CSV file's absolute
+path, size, and modification time. Therefore an identical train/holdout or
+Macro replay reports `replayCacheHit: true`; appending, replacing, repartitioning
+or changing the configuration automatically selects a new cache entry. A
+missing, corrupt, or oversized cache is ignored and rebuilt atomically. This
+keeps repeated parameter trials fast while retaining the strict separation
+between live restart checkpoints and deterministic backtests.
 
 The legacy aggregate-trade warmup remains available for directional research
-profiles. It replays public executions, not private fills, and must not be
-mistaken for the live maker's BBO arrival estimator.
+profiles. It replays public executions, not private fills.
 
 ### Raw trade/BBO fast evidence
 
@@ -1451,8 +2194,8 @@ For live calibration, capture public aggregate trades and BBO together:
 go run ./cmd/gammacapture-capture \
   --symbol SOLJPY --duration 24h --output data/gammacapture/live
 go run ./cmd/gammacapture-bbo-research \
-  --book data/gammacapture/live/SOLJPY-bookticker-<timestamp>.csv \
-  --trades data/gammacapture/live/SOLJPY-trades-<timestamp>.csv \
+  --book data/gammacapture/live/SOLJPY-bookticker-<YYYY-MM-DD>.csv \
+  --trades data/gammacapture/live/SOLJPY-trades-<YYYY-MM-DD>.csv \
   --max-spread-bps 10 --max-book-age 5s
 ```
 
@@ -1563,3 +2306,288 @@ userspace service now coalesces the cancellation callbacks and re-evaluates
 within 500ms using a fresh BBO. Cancellations initiated by the strategy's own
 repricing path are tagged and ignored by this replenisher, preventing a
 cancel/requote loop.
+
+### Conditional acquisition quote (ETHJPY)
+
+The passive bid can miss an upward bump because a rising BBO lowers the
+probability of touching a bid that remains at its old distance. The acquisition
+quote path uses causal fast evidence to estimate a horizon-scaled executable-ask
+drift and applies a one-sided, maker-only accommodation only when its lower
+confidence bound is positive:
+
+`delta = min(maxDelta, bidDistance - feeFloor, max(0, drift - z * sigma * sqrt(T)))`.
+
+For diagnostics it also reports the drifted-Brownian lower-barrier first-passage probability. The bid is capped below the current ask and never crosses the fee/adverse-selection floor. The ETHJPY profile is currently `shadowOnly: true`; it reports the hypothetical delta and probability without changing live orders until an out-of-sample review confirms the effect. The macro reversal policy now also retains `CapitalCapRatio` when applying tactical accumulation.
+
+
+## 2026-08-07 causal long-window pivot/excursion experiment
+
+### Motivation and recovered evidence
+
+The locally reproducible result previously described as “better than hold” was the
+legacy midpoint order-retention holdout on a falling market: it lost less than
+hold. It was not evidence that the old Macro controller predicted long-window
+pivots. The long-window-pivot explanation was therefore treated as a hypothesis,
+not copied back as an assumed-good coefficient set.
+
+The production defect visible in the 2026-08-05 ETHJPY rise was a phase lag:
+QV crossing drift recognized the rise, but it did not estimate trend survival or
+remaining excursion. On the 100%-ETH opening replay the QV-only target reached its
+largest bullish allocation after the 18:20 price high.
+
+### Causal model
+
+The optional `noTradeRegion.trendExcursionEnabled` path has no pretrained
+artifact and is evaluated only on causally closed Macro bars.
+
+1. The state vector contains executable ask and bid log returns over every
+   configured Macro horizon (currently 3h, 6h, and 24h).
+2. Historical labels are spaced one forecast horizon apart. A label is admitted
+   only after its complete future window has elapsed, preventing overlap from
+   being counted as independent evidence and preventing look-ahead.
+3. `k = ceil(sqrt(N))` nearest historical states estimate terminal return,
+   maximum/minimum executable excursion, profitable-pivot probability, and
+   time to the next pivot. Feature scales come from the available history; there
+   are no manually weighted trend features.
+4. Ask and bid forecasts must agree in sign. The weaker executable-side mean and
+   probability are retained.
+5. The existing sequential/BIC executable-price change-point posterior selects
+   the current regime. A selected horizon pays a Bayesian `log(m)` penalty,
+   implemented by dividing posterior odds by the number `m` of healthy
+   candidate horizons. This prevents an uncorrected max over 3h/6h/24h while
+   avoiding permanent dilution by neutral windows.
+6. In a structural regime, amplitude is the confidence-bounded post-change
+   slope:
+   `A = max(0, direction*mu_slope - z*SE_slope) * tau`.
+   The analog model supplies `tau`, but projection is capped at the already
+   observed post-change leg; the model never extrapolates the slope farther than
+   it has causally observed.
+7. The resulting regime posterior and the QV crossing posterior are Bayesian
+   model-averaged into one expected return and variance. They pass through one
+   Merton target, one Kalman state, and one proportional-cost no-trade boundary.
+   There is no second inventory target or duplicated feature weight.
+8. A regime-direction change adds posterior-weighted innovation variance to the
+   Kalman process covariance. Strong bottom/top evidence can therefore update
+   quickly without globally shortening the filter window.
+
+CPU work is cached per closed Macro bar. BBO ticks inside the bar do not rescan
+the long history.
+
+### Same-window factorial replay
+
+All rows below use the identical local ETHJPY replay:
+2026-08-05 13:45Z through 2026-08-06 00:00Z, 6,808 JPY starting
+pair equity, 0.023122840088 ETH (100% risky opening), queue multiplier 1,
+next-BBO execution, and the same maker/IOC simulator. Hold earned 147.56997 JPY
+with 1.10574% maximum drawdown. QV-only+ioc reproduced
+80.2387808826 JPY and 0.7266667% drawdown on every run.
+
+| revision | change | net P&L JPY | max DD | result |
+|---|---|---:|---:|---|
+| v1 | fixed-3h terminal kNN mean | 75.9334 | 0.7005% | rejected: late bullish turn |
+| v2 | signed remaining excursion | 77.6038 | 0.6936% | rejected: terminal direction still late |
+| v3 | change point selects direction | 79.9607 | 0.6778% | rejected: neutral horizons dilute posterior |
+| v4 | multiplicity-corrected strongest horizon | 79.0200 | 0.6342% | rejected: early posterior strong, amplitude weak |
+| v5 | confidence-bounded structural slope amplitude | 80.8402 | 0.6521% | research-only |
+
+v5 improved QV-only by only 0.60143 JPY and reduced maximum drawdown by
+0.07453 percentage point. Its extra maker+taker fees were about 0.5785 JPY, so
+almost all incremental P&L was consumed by turnover. More importantly, it did
+not meet the requested behavioral objective: although the bullish posterior was
+77% at 16:20 and 86% at 16:30, the confidence-bounded amplitude was only
+2.84–3.10 bps and the filtered target remained below 50%. The useful change was
+the exit: the model turned bearish after the high and held a materially lower
+target than QV-only.
+
+Artifacts:
+
+- `/tmp/gamma-eth-trend-qv-full-base.json`
+- `/tmp/gamma-eth-trend-excursion-v2-full-base.json`
+- `/tmp/gamma-eth-trend-structural-v3-full-base.json`
+- `/tmp/gamma-eth-trend-multiplicity-v4-full-base.json`
+- `/tmp/gamma-eth-trend-structural-amplitude-v5-full-base.json`
+
+### Deployment decision
+
+The implementation, diagnostics, unit tests, and two-variant replay mode are
+retained, but `trendExcursionEnabled` remains false in the live ETHJPY profile.
+Repeated tuning on this same 10.25-hour event would overfit. Enabling it requires
+an untouched multi-day walk-forward/shadow result that improves fee-adjusted P&L
+and preserves the earlier post-peak drawdown improvement. Until then the live
+service remains on the previously verified QV-only controller.
+
+### Untouched bearish stress replay: 2026-08-03
+
+The first untouched counter-regime check used the complete 2026-08-03 UTC day.
+The BBO fell from an intraday peak of 297,021 JPY at 00:01:31Z to 286,750.5 JPY
+at 08:30:03Z, a 3.45784% peak-to-trough drawdown, before partially recovering.
+The replay started with the same 6,808 JPY pair equity and 100% ETH exposure
+(0.022940981226 ETH). Parameters were frozen from the 2026-08-05 experiment.
+
+| model | net P&L JPY | max DD | low-period risky weight (08:30) | maker+taker fees JPY |
+|---|---:|---:|---:|---:|
+| hold | -85.3175 | 3.4578% | 100.0% | 0 |
+| QV-only+ioc | -87.0770 | 2.1802% | 34.18% | 10.2597 |
+| trend-excursion v5+ioc | -86.5913 | 2.2845% | 42.96% | 11.4068 |
+
+Both controllers materially reduced the falling-period drawdown versus hold,
+so the existing partial-adjustment/IOC path did de-risk. The trend model also
+reacted faster initially: risky weight fell from 100% to 63.88% by 00:30 and
+40.03% by 01:00, versus 65.70% and 53.22% for QV-only. This advantage did not
+persist. QV-only continued its staged bearish IOC decisions through 03:50 and
+reached 32.97% risky weight at 06:00; trend v5 stopped sustained de-risking and
+was back at 42.89% by 04:00 and 42.96% near the low. At 08:30 QV-only equity was
+6.76 JPY above trend v5 and 80.73 JPY above hold.
+
+Trend v5 then recognized the rebound earlier, beginning bullish IOC tranches at
+09:10; QV-only did not begin them until 14:20. That recovery timing allowed v5
+to finish 0.486 JPY above QV-only, but both finished below hold after costs, and
+v5 had the worse strategy drawdown. The failure mode is therefore not a lack of
+initial bearish detection. It is premature exhaustion of the bearish excursion
+and re-expansion of inventory before a causally confirmed bottom. This untouched
+counterexample reinforces the deployment decision: v5 remains research-only
+and `trendExcursionEnabled` remains false.
+
+Artifact: `/tmp/gamma-eth-2026-08-03-drop-v5-vs-qv.json`.
+
+
+### No-trade hold-protection gate (2026-08-07)
+
+The no-trade controller now exposes a conservative hold-protection gate. Let m be the executable log-return forecast over the model horizon and s its posterior standard error. A discretionary increase in risky inventory is allowed only when m - z*s >= 2c + e; a reduction is allowed only when -m - z*s >= 2c + e. Here c is the configured one-way maker/adverse-selection cost and e is the minimum residual edge. This is a one-sided 95% gate when z=1.645. Missing uncertainty is treated as failure, not as zero risk.
+
+The gate is applied after the unified QV/continuation/trend aim and before materializing the boundaries. It does not create another target controller: when the condition fails, the aim is projected to current inventory, so Macro adds no discretionary turnover. The separate capital/drawdown policy interval remains available for hard safety actions. Diagnostics are logged as macroNoTradeForecastReturnSE, macroNoTradeForecastEdgeLowerBps, and macroNoTradeHoldProtectionApplied.
+
+A pathwise promise that a fee-paying strategy will never finish below hold on every future up, down, or ranging path is mathematically impossible while allowing nonzero trades: an adverse next price move or a round-trip fee can make a trade lose. The enforceable guarantee is therefore a deployment rule: do not promote a variant unless paired excess equity versus hold has a nonnegative one-sided lower confidence bound in each predeclared regime and the tail-drawdown limit passes; otherwise use the hold-equivalent fallback. A short ETHJPY stress replay showed why this distinction matters: the gate reduced a bearish 30-minute loss from -3746.75 JPY to -3459.52 JPY, but remained 2.52 JPY below hold after fees. It is not promoted live on that evidence.
+
+The ETHJPY YAML records holdProtectionEnabled: true, holdProtectionZScore: 1.645, and holdProtectionMinEdgeBps: 0, but noTradeRegion.enabled remains false until a longer same-ticker, regime-stratified replay meets the predeclared lower-bound gates.
+
+
+#### Upward-window validation and stale-filter fix
+
+An ETHJPY-only BBO scan selected the strongest 60-minute rise on 2026-07-26 without using strategy P&L: 22:10Z to 23:10Z, 316,834.5 to 321,006 JPY (+130.803 bps). Before the state fix, hold-protected QV lost 7.11 JPY versus hold because a rejected SELL target still leaked through the persisted Kalman mean. ApplyNoTradeState now projects both the filtered aim and covariance to current inventory immediately when hold protection rejects a direction; independent HAR and hard capital-risk reductions remain downstream.
+
+On the identical replay after the fix, hold earned 4,164.00 JPY; protected QV earned 4,163.53 JPY (excess -0.47 JPY, max drawdown 0.1512%), while unprotected QV earned 4,134.96 JPY (excess -29.04 JPY, max drawdown 0.1407%). The protected path made no Macro IOC fill; its residual 0.47 JPY shortfall was one small maker SELL and 0.46 JPY fee after the outer capital cap compressed the target near the end. Therefore the stale-state bug is fixed, but the upward-regime lower bound remains negative and live promotion remains rejected. Artifacts: /tmp/no-trade-up-60m.json and /tmp/no-trade-up-60m-fixed.json.
+
+
+#### Oscillation-window validation
+
+The predeclared ETHJPY range regime (2026-07-28 18:00Z to 2026-07-29 06:00Z) was scanned using BBO path statistics only. The selected two-hour window, 03:04Z to 05:04Z, had -13.979 bps net displacement, 629.465 bps path variation, and a 144.343 bps range. Hold lost 426.00 JPY. Corrected hold-protected QV lost 423.00 JPY, an excess of +2.998 JPY, with one maker round trip, 1.354 JPY fees, and no Macro IOC decisions or fills. Unprotected QV lost 480.75 JPY, an excess of -54.75 JPY, with nine Macro IOC fills and 155.02 JPY total fees.
+
+The hourly paired-CI implementation was also corrected: samples are now non-overlapping hourly excess increments, not cumulative excess endpoints, and first-block costs are included from the common zero-excess starting equity. For protected QV the two increments were -2.853 and +5.841 JPY; mean hourly excess was +1.494 JPY but the one-sided 95% lower bound was -5.656 JPY. Thus the point estimate beats hold and drawdown is marginally lower (0.9310% versus 0.9313%), but the lower-confidence deployment gate still fails because n=2 is too small and heterogeneous. Artifact: /tmp/no-trade-range-120m-fixed-ci.json.
+
+
+#### Exact live-config no-trade toggle A/B
+
+A targeted replay mode now compares the current maker-only legacy path with the identical configuration after changing only noTradeRegion.enabled to true; activeExecution remains false. In the two-hour oscillation window, true improved P&L from -464.54 to -423.00 JPY, reduced maker fees from 51.07 to 1.35 JPY, and changed excess versus hold from -38.54 to +3.00 JPY. It retained more risky inventory (62.45% versus 52.41%), so maximum drawdown rose from 0.8371% to 0.9310%, still marginally below hold at 0.9313%. The protected lower 95% bound remained -5.656 JPY.
+
+Cross-regime counterchecks reject an immediate live toggle. In the +130.803 bps upward hour, true was 0.470 JPY below hold and 0.475 JPY below the current false configuration. In the 30-minute bearish stress window, true submitted one small maker BUY and finished 2.673 JPY below both hold and false; false made no fill. Therefore true removes legacy over-adjustment and fee drag in the ranging path but currently weakens the one-sided inventory restraint on bearish paths. The YAML remains false. Artifacts: /tmp/no-trade-range-120m-live-toggle.json, /tmp/no-trade-up-60m-live-toggle.json, and /tmp/no-trade-down-30m-live-toggle.json.
+
+
+#### Credible bearish-posterior Fast BUY restraint
+
+Fast BUY quantity now consumes the same unified no-trade return posterior on the active Fast horizon. Let `p- = P(R_H < 0)` under the posterior normal approximation and let `p0 = Phi(z)`, where `z` is the existing inventory-risk confidence score. The continuous restraint is
+
+`r_buy = max(0, (p- - p0) / (1 - p0))`, and `BUY_final = (1-r_buy) BUY_probability-centered`.
+
+Fast quote prices already include maker fees, adverse selection, and minimum net edge, so the posterior restraint does not subtract transaction costs a second time. It changes only proposed BUY quantity after the probability-centered split. It does not move the Macro target, increase SELL quantity, or set the legacy directional `allowBid=false` gate. Exchange minimum quantity remains the only discrete final filter. Missing posterior uncertainty and statistically weak bearish means leave BUY retention at one.
+
+Exact ETHJPY causal replay counterchecks retained the prior outcomes: the 2026-07-29 03:04Z--05:04:01Z ranging path remained +2.998 JPY versus hold with three fills and 1.354 JPY fees; the 2026-07-26 22:10Z--23:10:01Z upward path remained -0.470 JPY versus hold; and the 2026-08-03 00:00Z--00:30:01Z bearish path retained its pre-posterior BUY because the credible bearish threshold was not reached before that fill. This last result is causal and intentional: the restraint cannot use the later price decline as advance evidence. Artifacts: `/tmp/no-trade-range-120m-buy-restraint.json`, `/tmp/no-trade-up-60m-buy-restraint.json`, and `/tmp/no-trade-down-30m-buy-restraint.json`. Deployment on 2026-08-08 enabled `noTradeRegion.enabled: true` after the credible-bearish restraint was added. Live startup also exposed a sparse-arrival fallback bypass; the same BUY retention is now applied when probability-centered quantity is temporarily unavailable, without changing SELL quantity or the Macro target.
+
+## 2026-08-08 effective-crossing posterior and quote lifecycle
+
+### Root cause and estimator correction
+
+The Fast horizon selector previously treated overlapping horizon observations as
+independent crossing samples, required nonzero events on both sides, converted
+empirical touch probabilities through a Poisson-arrival assumption, and reused
+the statistical horizon as the exchange-order replacement clock. In a sparse
+ETHJPY market this combination could leave every horizon degraded, inflate the
+apparent information content of highly overlapping windows, and cancel an order
+that was approaching execution merely because its model window expired.
+
+For a horizon `H`, observation starts separated by `delta_i` now contribute
+bounded effective exposure
+
+`a_i = min(1, delta_i / H)`, with `n_eff = sum_i a_i`.
+
+Side-specific touch counts use the same weights. With weighted touches `x_s`,
+the online probability estimate is the Jeffreys posterior
+
+`p_s = (x_s + 1/2) / (n_eff + 1)`,
+
+and its posterior standard error is reported with the horizon decision. Zero
+observed touches remain finite evidence instead of making the opposite side
+unusable. Since the observations are first-passage windows and not assumed to
+be independent Poisson arrivals, the quote-sizing rate is simply
+
+`lambda_s = p_s / H`.
+
+No exponential `1-exp(-lambda H)` transform is applied. The minimum effective
+sample threshold is six in the live ETHJPY and generic profiles. This threshold
+applies to overlap-adjusted exposure, not raw BBO count.
+
+### Executable-side price and order clock
+
+Every final BUY review uses its actual distance from the executable ask and the
+ask-side volatility model; every final SELL review uses its actual distance
+from the executable bid and the bid-side volatility model. The statistical
+window remains 10, 15, or 30 minutes, while the order review duration is derived
+after the final quote price is known:
+
+`T_review,s = min(H, delta_s^2 / sigma_s^2)`,
+
+subject to the configured refresh bounds. `orderKeepDistanceBps` therefore
+reports the selected executable distance rather than a hard-coded 80 bps
+fallback.
+
+At a clean window expiry, the strategy revalidates each side against the latest
+executable BBO and the full round-trip floor. A side that remains close enough
+to execution is retained with its original exchange order and queue age; only
+the stale side is cancelled and replaced. Hard transitions such as a crossed
+quote, missing side, side-policy mismatch, statistically significant
+realignment, Macro target realignment, or IOC completion still force immediate
+re-evaluation. Self-cross guards are applied when retained and replacement
+orders coexist. The production replay implements the same next-BBO activation,
+selective cancellation, side-specific review clock, quantity projection, and
+partial-fill semantics as live trading.
+
+### Eight-hour ETHJPY validation
+
+The exact replay covered 2026-08-08 02:37:56Z--10:37:56Z (11:37:56--19:37:56
+JST), starting with 6,872.06269679 JPY pair equity and 0.0099663 ETH. Orders
+decided at `BBO[t]` became eligible no earlier than `BBO[t+1]`; a 5% drawdown
+stop was armed but did not trigger.
+
+| visible-L1 queue multiplier | fills | BUY / SELL | net P&L JPY | max drawdown | quote uptime | average quote life |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2 | 0 / 2 | +10.6793 | 0.1130% | 100% | 387.84 s |
+| 0 | 3 | 0 / 3 | +10.6403 | 0.1130% | 100% | 387.84 s |
+
+The conservative queue-one path returned approximately 0.1555%, versus
+0.1617% for leaving the opening ETH/JPY allocation unchanged, an excess of
+-0.4282 JPY. The zero-BUY result persisted with queue multiplier zero and Fast
+BUY retention remained one throughout, so it was not caused by visible queue
+depth or the bearish-posterior restraint. ETH mid rose about 0.3691%; the
+additional queue-zero SELL reduced subsequent upside exposure. With only two
+or three one-sided fills, Sharpe, t-statistics, and confidence intervals are not
+statistically meaningful. The result validates lifecycle continuity, not an
+outperformance claim.
+
+### Causal pivot audit and deployment
+
+Fifteen-minute fractal pivots use executable ask for a LOW entry and executable
+bid for a HIGH exit. Hindsight LOW-to-HIGH envelopes in the same replay reached
+30.48, 31.80, and 34.78 bps, while the instantaneous BBO spread at any confirmed
+pivot never exceeded 6.61 bps. A pivot is known only after the following
+15-minute bar closes. After this causal delay, the first usable move retained
+23.70--25.02 bps; the 34.78 bps move peaked before its LOW was confirmed and was
+not tradable from that signal.
+
+The ordinary maker floor is 26 bps: 20 bps for two 10-bps maker legs, 4 bps for
+two 2-bps adverse-selection budgets, and 2 bps minimum residual edge. Therefore
+no causally confirmed pivot move in this interval cleared the complete floor,
+and the absence of a BUY fill did not justify lowering the cost guard. The
+tested binary was deployed through the userspace
+`gammacapture-strategy.service`; startup restored its checkpoint and capture
+delta before cancelling two stale orders, then submitted fresh two-sided
+`LIMIT_MAKER` quotes without API, filter, panic, or restart errors.

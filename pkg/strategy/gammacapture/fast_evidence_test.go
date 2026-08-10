@@ -53,6 +53,17 @@ func TestFastEvidenceRequiresCoverageBeforeHealthy(t *testing.T) {
 	require.InDelta(t, -0.5, s.QueueImbalance, 1e-9)
 }
 
+func TestFastEvidenceHealthAtMatchesFullSnapshot(t *testing.T) {
+	now := time.Unix(1500, 0)
+	m := NewFastEvidenceModel(FastEvidenceConfig{Window: time.Minute, MinTrades: 1, MinBBOUpdates: 1})
+	m.ObserveTrade(now, evidenceTrade(now, 1, types.SideTypeBuy, 100, 1))
+	m.ObserveBBO(now, evidenceBBO("SOLJPY", 99, 1, 101, 1))
+	require.Equal(t, m.Snapshot(now).Health, m.HealthAt(now))
+
+	afterExpiry := now.Add(2 * time.Minute)
+	require.Equal(t, m.Snapshot(afterExpiry).Health, m.HealthAt(afterExpiry))
+}
+
 func TestFastEvidenceTrimsWindowAndDeduplicatesTrades(t *testing.T) {
 	now := time.Unix(2000, 0)
 	m := NewFastEvidenceModel(FastEvidenceConfig{Window: time.Minute, MinTrades: 1, MinBBOUpdates: 1})

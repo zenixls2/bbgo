@@ -174,6 +174,35 @@ func TestProbabilityCenteredQuoteChanceConstraintReducesGross(t *testing.T) {
 	}
 }
 
+func TestProbabilityCenteredQuoteFindsNarrowMinimumOrderFeasibleRegion(t *testing.T) {
+	horizon := 30 * time.Minute
+	d := ProbabilityCenteredQuoteNotionals(ProbabilityCenteredQuoteInput{
+		CurrentInventoryNotionalJPY: 500,
+		TargetInventoryNotionalJPY:  500,
+		LowerInventoryNotionalJPY:   390,
+		UpperInventoryNotionalJPY:   610,
+		FastBuyNotionalJPY:          5_000,
+		FastSellNotionalJPY:         5_000,
+		MinBuyNotionalJPY:           100,
+		MinSellNotionalJPY:          100,
+		MaxBuyNotionalJPY:           5_000,
+		MaxSellNotionalJPY:          5_000,
+		BuyFillRatePerHour:          rateForHorizonProbability(0.25, horizon),
+		SellFillRatePerHour:         rateForHorizonProbability(0.25, horizon),
+		Horizon:                     horizon,
+		ConfidenceZScore:            1.645,
+	})
+	if !d.Enabled {
+		t.Fatalf("narrow executable region near exchange minimum was skipped: %+v", d)
+	}
+	if d.BuyNotionalJPY < 100 || d.SellNotionalJPY < 100 {
+		t.Fatalf("projection must keep both exchange-executable sides: %+v", d)
+	}
+	if d.ProjectedGrossNotionalJPY < 200 || d.ProjectedGrossNotionalJPY > 230 {
+		t.Fatalf("unexpected narrow-region upper boundary: %+v", d)
+	}
+}
+
 func TestProbabilityCenteredQuoteUsesOppositeSideToRetainGross(t *testing.T) {
 	horizon := 30 * time.Minute
 	d := ProbabilityCenteredQuoteNotionals(ProbabilityCenteredQuoteInput{
@@ -317,5 +346,104 @@ func TestProbabilityCenteredQuoteBearishRestraintDoesNotForceSell(t *testing.T) 
 	if restrained.DesiredInventoryNotionalJPY != unrestrained.DesiredInventoryNotionalJPY ||
 		restrained.TargetContraction != unrestrained.TargetContraction {
 		t.Fatalf("bearish BUY restraint must not rewrite Macro target: unrestrained=%+v restrained=%+v", unrestrained, restrained)
+	}
+}
+
+func TestProbabilityCenteredQuoteAllowsAsymmetricMinimumOrdersAtTarget(t *testing.T) {
+	horizon := 30 * time.Minute
+	d := ProbabilityCenteredQuoteNotionals(ProbabilityCenteredQuoteInput{
+		CurrentInventoryNotionalJPY: 500,
+		TargetInventoryNotionalJPY:  500,
+		LowerInventoryNotionalJPY:   390,
+		UpperInventoryNotionalJPY:   610,
+		FastBuyNotionalJPY:          5_000,
+		FastSellNotionalJPY:         5_000,
+		MinBuyNotionalJPY:           100,
+		MinSellNotionalJPY:          100,
+		MaxBuyNotionalJPY:           100,
+		MaxSellNotionalJPY:          100,
+		BuyFillRatePerHour:          rateForHorizonProbability(0.162, horizon),
+		SellFillRatePerHour:         rateForHorizonProbability(0.067, horizon),
+		Horizon:                     horizon,
+		ConfidenceZScore:            1.645,
+	})
+	if !d.Enabled || math.Abs(d.ProjectedGrossNotionalJPY-200) > 1e-7 {
+		t.Fatalf("asymmetric minimum orders should fit the joint second-moment budget: %+v", d)
+	}
+	if d.ExpectedInventoryNotionalJPY <= 500 {
+		t.Fatalf("test must exercise unavoidable nonzero expected drift: %+v", d)
+	}
+	if d.ConfidenceLowerNotionalJPY < 390 || d.ConfidenceUpperNotionalJPY > 610 {
+		t.Fatalf("asymmetric minimum orders escaped the configured confidence band: %+v", d)
+	}
+}
+
+func TestProbabilityCenteredQuoteUsesDirectNonPoissonProbabilities(t *testing.T) {
+	d := ProbabilityCenteredQuoteNotionals(ProbabilityCenteredQuoteInput{
+		CurrentInventoryNotionalJPY: 500,
+		TargetInventoryNotionalJPY:  500,
+		LowerInventoryNotionalJPY:   0,
+		UpperInventoryNotionalJPY:   1000,
+		FastBuyNotionalJPY:          100,
+		FastSellNotionalJPY:         100,
+		MaxBuyNotionalJPY:           100,
+		MaxSellNotionalJPY:          100,
+		BuyFillRatePerHour:          99,
+		SellFillRatePerHour:         99,
+		DirectFillProbabilities:     true,
+		BuyFillProbability:          0.6,
+		SellFillProbability:         0.4,
+		BothFillProbability:         0.25,
+		Horizon:                     15 * time.Minute,
+		ConfidenceZScore:            1,
+	})
+	if !d.Enabled {
+		t.Fatalf("expected direct-probability projection, got %q", d.Reason)
+	}
+	if math.Abs(d.BuyFillProbability-0.6) > 1e-12 ||
+		math.Abs(d.SellFillProbability-0.4) > 1e-12 {
+		t.Fatalf("direct probabilities were transformed: buy=%v sell=%v", d.BuyFillProbability, d.SellFillProbability)
+	}
+	if math.Abs(d.BothFillProbability-0.25) > 1e-12 ||
+		math.Abs(d.FillCovariance-0.01) > 1e-12 {
+		t.Fatalf("unexpected joint probability/covariance: both=%v cov=%v", d.BothFillProbability, d.FillCovariance)
+	}
+}
+
+func TestProbabilityCenteredQuoteJointCovarianceChangesRiskCapacity(t *testing.T) {
+	base := ProbabilityCenteredQuoteInput{
+		CurrentInventoryNotionalJPY: 500,
+		TargetInventoryNotionalJPY:  500,
+		LowerInventoryNotionalJPY:   250,
+		UpperInventoryNotionalJPY:   750,
+		FastBuyNotionalJPY:          1000,
+		FastSellNotionalJPY:         1000,
+		MaxBuyNotionalJPY:           1000,
+		MaxSellNotionalJPY:          1000,
+		DirectFillProbabilities:     true,
+		BuyFillProbability:          0.5,
+		SellFillProbability:         0.5,
+		Horizon:                     15 * time.Minute,
+		ConfidenceZScore:            1,
+	}
+	independent := base
+	independent.BothFillProbability = 0.25
+	positive := base
+	positive.BothFillProbability = 0.5
+	negative := base
+	negative.BothFillProbability = 0
+	independentDecision := ProbabilityCenteredQuoteNotionals(independent)
+	positiveDecision := ProbabilityCenteredQuoteNotionals(positive)
+	negativeDecision := ProbabilityCenteredQuoteNotionals(negative)
+	if !independentDecision.Enabled || !positiveDecision.Enabled || !negativeDecision.Enabled {
+		t.Fatalf("expected all covariance cases feasible: independent=%q positive=%q negative=%q",
+			independentDecision.Reason, positiveDecision.Reason, negativeDecision.Reason)
+	}
+	if !(positiveDecision.ProjectedGrossNotionalJPY > independentDecision.ProjectedGrossNotionalJPY &&
+		independentDecision.ProjectedGrossNotionalJPY > negativeDecision.ProjectedGrossNotionalJPY) {
+		t.Fatalf("gross capacity must decrease with inventory-difference variance: positive=%v independent=%v negative=%v",
+			positiveDecision.ProjectedGrossNotionalJPY,
+			independentDecision.ProjectedGrossNotionalJPY,
+			negativeDecision.ProjectedGrossNotionalJPY)
 	}
 }

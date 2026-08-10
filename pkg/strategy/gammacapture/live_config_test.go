@@ -16,6 +16,14 @@ func TestLiveETHJPYConfigDecodesInventoryControllers(t *testing.T) {
 		ExchangeStrategies []struct {
 			GammaCapture Config `yaml:"gammacapture"`
 		} `yaml:"exchangeStrategies"`
+		Sync *struct {
+			DisableStartupSync bool `yaml:"disableStartupSync"`
+			UserDataStream     *struct {
+				Trades bool `yaml:"trades"`
+				Orders bool `yaml:"orders"`
+			} `yaml:"userDataStream"`
+			Sessions []string `yaml:"sessions"`
+		} `yaml:"sync"`
 	}
 	if err := yaml.Unmarshal(data, &document); err != nil {
 		t.Fatalf("decode live ETHJPY config: %v", err)
@@ -38,5 +46,15 @@ func TestLiveETHJPYConfigDecodesInventoryControllers(t *testing.T) {
 	}
 	if !strategy.MarketMaker.HawkesDirection.Enabled {
 		t.Fatal("live ETHJPY config must enable Hawkes direction")
+	}
+	if document.Sync == nil || document.Sync.UserDataStream == nil ||
+		!document.Sync.UserDataStream.Trades || !document.Sync.UserDataStream.Orders {
+		t.Fatal("live ETHJPY config must persist private trades and the complete order lifecycle")
+	}
+	if !document.Sync.DisableStartupSync {
+		t.Fatal("live ETHJPY config must not run REST history sync during strategy startup")
+	}
+	if len(document.Sync.Sessions) != 1 || document.Sync.Sessions[0] != "binance" {
+		t.Fatalf("live ETHJPY persistence must be restricted to binance: %+v", document.Sync.Sessions)
 	}
 }

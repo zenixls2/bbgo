@@ -66,6 +66,13 @@ func (s *MacroInventoryState) ApplyNoTradeState(
 		s.NoTradeAimClosedBarAt = closedBarAt
 		d.AimKalmanGain = 1
 		changed = true
+	} else if s.NoTradeAimVariance <= 0 && measurementVariance > 0 {
+		// Versions before the covariance-preserving hold projection persisted an
+		// exact zero here. A healthy noisy posterior cannot have zero covariance;
+		// restore uncertainty without moving the persisted mean or pretending a
+		// second measurement arrived inside the same closed bar.
+		s.NoTradeAimVariance = measurementVariance
+		changed = true
 	} else if closedBarAt.After(s.NoTradeAimClosedBarAt) {
 		elapsed := closedBarAt.Sub(s.NoTradeAimClosedBarAt)
 		observation := d.ForecastObservation
@@ -108,14 +115,16 @@ func (s *MacroInventoryState) ApplyNoTradeState(
 	filteredAim := clampRatio(s.NoTradeFilteredAimRatio, minimum, maximum)
 	if d.HoldProtectionApplied {
 		// A rejected directional target must not leak through the persisted
-		// Kalman mean. Project the state to current inventory immediately;
-		// hard volatility and capital-risk reductions are applied below.
+		// Kalman mean. Project the mean to current inventory immediately, but
+		// preserve the posterior covariance: declining to trade is a control
+		// decision, not a zero-noise observation. Clearing the covariance here
+		// made the filterVariance diagnostic falsely report zero and made the
+		// next closed-bar update overconfident. Hard volatility and capital-risk
+		// reductions are applied below.
 		protectedAim := clampRatio(in.CurrentRiskyWeight, minimum, maximum)
-		if filteredAim != protectedAim || s.NoTradeAimVariance != 0 {
+		if filteredAim != protectedAim {
 			filteredAim = protectedAim
 			s.NoTradeFilteredAimRatio = protectedAim
-			s.NoTradeAimVariance = 0
-			d.AimKalmanGain = 0
 			changed = true
 		}
 	}

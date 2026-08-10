@@ -289,21 +289,14 @@ func SelectAdaptiveFastSnapshot(now time.Time, fastModels map[time.Duration]*Int
 	sort.Slice(windows, func(i, j int) bool { return windows[i] < windows[j] })
 
 	type candidate struct {
-		window   time.Duration
-		model    ModelSnapshot
-		evidence FastEvidenceSnapshot
+		window time.Duration
+		model  ModelSnapshot
 	}
 	candidates := make([]candidate, 0, len(windows))
-	summary := make([]string, 0, len(windows))
 	selected := -1
 	for _, window := range windows {
 		model := fastModels[window].Snapshot(now)
-		evidence := FastEvidenceSnapshot{Health: HealthInsufficient}
-		if evidenceModel := fastEvidenceModels[window]; evidenceModel != nil {
-			evidence = evidenceModel.Snapshot(now)
-		}
-		candidates = append(candidates, candidate{window: window, model: model, evidence: evidence})
-		summary = append(summary, fmt.Sprintf("%s=%s/%s", window, model.Health, evidence.Health))
+		candidates = append(candidates, candidate{window: window, model: model})
 		if selected < 0 && model.Health == HealthHealthy {
 			// The shortest healthy crossing window is the most responsive
 			// statistically admissible estimate. Raw evidence health remains a
@@ -326,8 +319,22 @@ func SelectAdaptiveFastSnapshot(now time.Time, fastModels map[time.Duration]*Int
 		}
 	}
 	chosen := candidates[selected]
+	chosenEvidence := FastEvidenceSnapshot{Health: HealthInsufficient}
+	summary := make([]string, 0, len(candidates))
+	for index, current := range candidates {
+		evidenceHealth := HealthInsufficient
+		if evidenceModel := fastEvidenceModels[current.window]; evidenceModel != nil {
+			if index == selected {
+				chosenEvidence = evidenceModel.Snapshot(now)
+				evidenceHealth = chosenEvidence.Health
+			} else {
+				evidenceHealth = evidenceModel.HealthAt(now)
+			}
+		}
+		summary = append(summary, fmt.Sprintf("%s=%s/%s", current.window, current.model.Health, evidenceHealth))
+	}
 	return AdaptiveFastSnapshot{
-		Window: chosen.window, Model: chosen.model, Evidence: chosen.evidence,
+		Window: chosen.window, Model: chosen.model, Evidence: chosenEvidence,
 		HealthSummary: strings.Join(summary, ","),
 	}
 }

@@ -253,10 +253,33 @@ func (s *OrderService) Insert(order types.Order) (err error) {
 		return err
 	}
 
-	_, err = s.DB.NamedExec(`
+	query := `
 			INSERT INTO orders (exchange, order_id, client_order_id, order_type, status, symbol, price, stop_price, quantity, executed_quantity, side, is_working, time_in_force, created_at, updated_at, is_margin, is_futures, is_isolated, uuid, actual_order_id)
 			VALUES (:exchange, :order_id, :client_order_id, :order_type, :status, :symbol, :price, :stop_price, :quantity, :executed_quantity, :side, :is_working, :time_in_force, :created_at, :updated_at, :is_margin, :is_futures, :is_isolated, :uuid, :actual_order_id)
-	`, order)
+	`
+	if s.DB.DriverName() == "sqlite3" {
+		query += `
+			ON CONFLICT(order_id, exchange) DO UPDATE SET
+			client_order_id=excluded.client_order_id,
+			order_type=excluded.order_type,
+			status=excluded.status,
+			symbol=excluded.symbol,
+			price=excluded.price,
+			stop_price=excluded.stop_price,
+			quantity=excluded.quantity,
+			executed_quantity=excluded.executed_quantity,
+			side=excluded.side,
+			is_working=excluded.is_working,
+			time_in_force=excluded.time_in_force,
+			updated_at=excluded.updated_at,
+			is_margin=excluded.is_margin,
+			is_futures=excluded.is_futures,
+			is_isolated=excluded.is_isolated,
+			uuid=excluded.uuid,
+			actual_order_id=excluded.actual_order_id
+		`
+	}
+	_, err = s.DB.NamedExec(query, order)
 
 	return err
 }

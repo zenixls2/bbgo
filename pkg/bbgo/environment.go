@@ -9,6 +9,7 @@ import (
 	stdlog "log"
 	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -407,7 +408,7 @@ func (environ *Environment) BindSync(config *SyncConfig) {
 		}
 	}
 
-	orderWriterCreator := func(session *ExchangeSession) func(order types.Order) {
+	orderWriterCreator := func(session *ExchangeSession, completeLifecycle bool) func(order types.Order) {
 		return func(order types.Order) {
 			order.IsMargin = session.Margin
 			order.IsFutures = session.Futures
@@ -417,13 +418,18 @@ func (environ *Environment) BindSync(config *SyncConfig) {
 				order.IsIsolated = session.IsolatedFutures
 			}
 
-			switch order.Status {
-			case types.OrderStatusFilled, types.OrderStatusCanceled:
-				if order.ExecutedQuantity.Sign() > 0 {
-					if err := environ.OrderService.Insert(order); err != nil {
-						log.WithError(err).Errorf("order insert error: %+v", order)
+			if !completeLifecycle {
+				switch order.Status {
+				case types.OrderStatusFilled, types.OrderStatusCanceled:
+					if order.ExecutedQuantity.Sign() <= 0 {
+						return
 					}
+				default:
+					return
 				}
+			}
+			if err := environ.OrderService.Insert(order); err != nil {
+				log.WithError(err).Errorf("order insert error: %+v", order)
 			}
 		}
 	}
@@ -463,8 +469,8 @@ func (environ *Environment) BindSync(config *SyncConfig) {
 			session.UserDataStream.OnTradeUpdate(tradeWriter)
 		}
 
-		if config.UserDataStream.FilledOrders {
-			orderWriter := orderWriterCreator(s2)
+		if config.UserDataStream.Orders || config.UserDataStream.FilledOrders {
+			orderWriter := orderWriterCreator(s2, config.UserDataStream.Orders)
 			session.UserDataStream.OnOrderUpdate(orderWriter)
 		}
 
@@ -516,9 +522,118 @@ func (environ *Environment) Connect(ctx context.Context) error {
 			if err := session.UserDataStream.Connect(ctx); err != nil {
 				return err
 			}
+			if err := environ.reconcileOpenOrderPersistence(ctx, session); err != nil {
+				logger.WithError(err).Warn("open-order persistence reconciliation failed")
+			}
 		}
 	}
 
+	return nil
+}
+
+// reconcileOpenOrderPersistence closes the startup race between the public
+// stream (which can trigger immediate strategy quotes) and the private stream.
+// Once private updates are live, query the explicitly configured symbols and
+// upsert their current open orders. Subsequent status changes arrive through
+// the user-data writer registered by BindSync.
+func (environ *Environment) reconcileOpenOrderPersistence(ctx context.Context, session *ExchangeSession) error {
+	if environ.syncConfig == nil || environ.syncConfig.UserDataStream == nil ||
+		!environ.syncConfig.UserDataStream.Orders || environ.OrderService == nil {
+		return nil
+	}
+	if len(environ.syncConfig.Sessions) > 0 {
+		selected := false
+		for _, name := range environ.syncConfig.Sessions {
+			if name == session.Name {
+				selected = true
+				break
+			}
+		}
+		if !selected {
+			return nil
+		}
+	}
+	queryService, ok := session.Exchange.(types.ExchangeTradeService)
+	if !ok {
+		return nil
+	}
+	statusQueryService, canQueryStatus := session.Exchange.(types.ExchangeOrderQueryService)
+	sessionSymbols, restSymbols := categorizeSyncSymbol(environ.syncConfig.Symbols)
+	symbols := restSymbols
+	if configured, exists := sessionSymbols[session.Name]; exists {
+		symbols = configured
+	}
+	seen := make(map[string]struct{}, len(symbols))
+	inserted := 0
+	terminalUpdates := 0
+	for _, symbol := range symbols {
+		if symbol == "" {
+			continue
+		}
+		if _, exists := seen[symbol]; exists {
+			continue
+		}
+		seen[symbol] = struct{}{}
+		orders, err := queryService.QueryOpenOrders(ctx, symbol)
+		if err != nil {
+			return err
+		}
+		openOrderIDs := make(map[uint64]struct{}, len(orders))
+		for _, order := range orders {
+			openOrderIDs[order.OrderID] = struct{}{}
+			order.IsMargin = session.Margin
+			order.IsFutures = session.Futures
+			order.IsIsolated = session.IsolatedMargin || session.IsolatedFutures
+			if err := environ.OrderService.Insert(order); err != nil {
+				return err
+			}
+			inserted++
+		}
+		if !canQueryStatus {
+			continue
+		}
+		persisted, err := environ.OrderService.Query(service.QueryOrdersOptions{
+			Exchange: session.ExchangeName,
+			Symbol:   symbol,
+			Ordering: "DESC",
+			Limit:    500,
+		})
+		if err != nil {
+			return err
+		}
+		for _, entry := range persisted {
+			order := entry.Order
+			if order.Status.Closed() {
+				continue
+			}
+			if _, isOpen := openOrderIDs[order.OrderID]; isOpen {
+				continue
+			}
+			latest, err := statusQueryService.QueryOrder(ctx, types.OrderQuery{
+				Symbol:  symbol,
+				OrderID: strconv.FormatUint(order.OrderID, 10),
+			})
+			if err != nil {
+				log.WithError(err).WithFields(log.Fields{
+					"session": session.Name, "symbol": symbol, "orderID": order.OrderID,
+				}).Warn("persisted open-order status reconciliation failed")
+				continue
+			}
+			latest.IsMargin = session.Margin
+			latest.IsFutures = session.Futures
+			latest.IsIsolated = session.IsolatedMargin || session.IsolatedFutures
+			if err := environ.OrderService.Insert(*latest); err != nil {
+				return err
+			}
+			terminalUpdates++
+		}
+	}
+	log.WithFields(log.Fields{
+		"session":         session.Name,
+		"symbols":         len(seen),
+		"openOrders":      inserted,
+		"terminalUpdates": terminalUpdates,
+	}).Info("open-order persistence reconciled")
 	return nil
 }
 
@@ -623,6 +738,11 @@ func (environ *Environment) syncWithUserConfig(ctx context.Context, userConfig *
 // Sync syncs all registered exchange sessions
 func (environ *Environment) Sync(ctx context.Context, userConfig ...*Config) error {
 	if environ.SyncService == nil {
+		return nil
+	}
+	if len(userConfig) > 0 && userConfig[0] != nil && userConfig[0].Sync != nil &&
+		userConfig[0].Sync.DisableStartupSync {
+		log.Info("startup history sync disabled; live user-data persistence remains available")
 		return nil
 	}
 

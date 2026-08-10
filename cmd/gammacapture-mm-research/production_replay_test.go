@@ -28,6 +28,27 @@ func TestReplayDatasetCacheKeyIgnoresStrategyConfigFingerprint(t *testing.T) {
 	}
 }
 
+func TestProductionConfigOverridesAreOptIn(t *testing.T) {
+	base := gammacapture.MarketMakerConfig{
+		InventoryRiskZScore:  1.645,
+		MinimumNetEdgeBps:    2,
+		MinimumHalfSpreadBps: 15,
+	}
+	if got := (productionConfigOverrides{}).apply(base); got.InventoryRiskZScore != base.InventoryRiskZScore ||
+		got.MinimumNetEdgeBps != base.MinimumNetEdgeBps ||
+		got.MinimumHalfSpreadBps != base.MinimumHalfSpreadBps {
+		t.Fatalf("zero-value research overrides must be a no-op: got=%+v want=%+v", got, base)
+	}
+	got := (productionConfigOverrides{
+		InventoryRiskZScore: 1.282,
+		MinimumNetEdgeBps:   0,
+		MinimumNetEdgeSet:   true,
+	}).apply(base)
+	if got.InventoryRiskZScore != 1.282 || got.MinimumNetEdgeBps != 0 || got.MinimumHalfSpreadBps != 15 {
+		t.Fatalf("explicit research overrides were not isolated correctly: %+v", got)
+	}
+}
+
 func TestProductionQueueRequiresCompleteOrderFill(t *testing.T) {
 	at := time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)
 	s := &productionReplayState{cfg: gammacapture.MarketMakerConfig{MakerFeeBps: 10}, bidOrder: productionReplayOrder{active: true, side: types.SideTypeBuy, price: 100, remaining: 2, queueAhead: 1}, fillsByDay: make(map[string]*productionReplayDay)}
@@ -35,7 +56,14 @@ func TestProductionQueueRequiresCompleteOrderFill(t *testing.T) {
 	if s.fills != 0 || !s.bidOrder.active || s.bidOrder.remaining != 1 {
 		t.Fatalf("partial execution counted as full: %+v fills=%d", s.bidOrder, s.fills)
 	}
+	if !s.fillRefreshPending || s.lastMakerFill.Side != types.SideTypeBuy || s.lastMakerFill.Quantity != 1 {
+		t.Fatalf("partial fill did not schedule balance-aware next-BBO refresh: pending=%t fill=%+v", s.fillRefreshPending, s.lastMakerFill)
+	}
+
 	s.consume(&s.bidOrder, tick{time: at.Add(time.Second), price: 100, size: 1, side: types.SideTypeSell})
+	if !s.fillRefreshPending || !s.lastMakerFill.At.Equal(at.Add(time.Second)) {
+		t.Fatalf("terminal fill did not update post-fill state: %+v", s.lastMakerFill)
+	}
 	if s.fills != 1 || s.bidOrder.active {
 		t.Fatalf("order did not complete: %+v fills=%d", s.bidOrder, s.fills)
 	}

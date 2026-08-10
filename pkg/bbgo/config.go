@@ -301,6 +301,10 @@ const (
 )
 
 type SyncConfig struct {
+	// DisableStartupSync skips REST history backfill during strategy startup
+	// while still allowing UserDataStream writers to persist live events.
+	DisableStartupSync bool `json:"disableStartupSync,omitempty" yaml:"disableStartupSync,omitempty"`
+
 	// Sessions to sync, if ignored, all defined sessions will sync
 	Sessions []string `json:"sessions,omitempty" yaml:"sessions,omitempty"`
 
@@ -327,7 +331,10 @@ type SyncConfig struct {
 
 	// UserDataStream is for real-time sync with websocket user data stream
 	UserDataStream *struct {
-		Trades                      bool           `json:"trades,omitempty" yaml:"trades,omitempty"`
+		Trades bool `json:"trades,omitempty" yaml:"trades,omitempty"`
+		// Orders records the complete order lifecycle and upserts later status
+		// changes. FilledOrders is the legacy terminal-only mode.
+		Orders                      bool           `json:"orders,omitempty" yaml:"orders,omitempty"`
 		FilledOrders                bool           `json:"filledOrders,omitempty" yaml:"filledOrders,omitempty"`
 		FuturesPosition             bool           `json:"futuresPosition,omitempty" yaml:"futuresPosition,omitempty"`
 		FuturesPositionSyncInterval types.Duration `json:"futuresPositionSyncInterval,omitempty" yaml:"futuresPositionSyncInterval,omitempty"`

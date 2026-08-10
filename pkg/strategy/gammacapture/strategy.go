@@ -81,6 +81,7 @@ type State struct {
 	OnlineArrival                 *OnlineArrivalState  `json:"onlineArrival,omitempty"`
 	MacroInventory                *MacroInventoryState `json:"macroInventory,omitempty"`
 	ModelCheckpoint               *ModelCheckpoint     `json:"modelCheckpoint,omitempty"`
+	MakerPostFill                 *MakerPostFillState  `json:"makerPostFill,omitempty"`
 }
 
 // FeedbackState is a persisted, causal scorecard. It records outcomes only
@@ -763,6 +764,12 @@ func (s *Strategy) onMakerOrderCanceled(ctx context.Context, order types.Order) 
 func (s *Strategy) onMakerTradeFilled(ctx context.Context, trade types.Trade) {
 	now := time.Now()
 	s.marketMakerMu.Lock()
+	if s.State != nil {
+		s.State.MakerPostFill = &MakerPostFillState{
+			Side: trade.Side, Price: trade.Price.Float64(),
+			Quantity: trade.Quantity.Float64(), At: now,
+		}
+	}
 	s.makerFillRefreshGeneration++
 	generation := s.makerFillRefreshGeneration
 	s.makerFillRefreshPending = true
@@ -1695,6 +1702,22 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 		AcquisitionDriftBps: acquisitionDriftBps, AcquisitionVolatilityPerSqrtSecBps: acquisitionVolatilityPerSqrtSecBps, AcquisitionHorizonSeconds: horizon.Seconds(), AcquisitionDirection: direction,
 		CanBuy: canBuy, CanSell: canSell,
 	})
+	postFillUtilityDecision := PostFillUtilityDecision{Reason: "no pending fill", Plan: plan}
+	if fillRefreshPending && s.State != nil && s.State.MakerPostFill != nil {
+		postFillUtilityDecision = quoteConfig.ApplyPostFillUtility(&s.makerHorizonModel, PostFillUtilityInput{
+			Now: now, Fill: *s.State.MakerPostFill, Plan: plan,
+			BestBid: ticker.Buy.Float64(), BestAsk: ticker.Sell.Float64(), Mid: mid,
+			Horizon: horizon, InventoryBase: inventoryBase,
+			InventoryTargetBase: inventoryBand.Target, PairEquityJPY: pairEquityJPY,
+			ExpectedFillNotionalJPY: dynamicQuoteNotional,
+			VolatilityBpsPerSqrtSec: effectiveVolatilityBps,
+			RiskAversion:            quoteConfig.MacroInventory.RiskAversion,
+		})
+		if postFillUtilityDecision.Applied {
+			plan = postFillUtilityDecision.Plan
+		}
+	}
+
 	// Use the final asymmetric executable prices and the matching executable
 	// side volatility. Buy touch risk follows the ask path; sell touch risk
 	// follows the bid path. Review the pair when the earlier side clock resolves,
@@ -1786,29 +1809,98 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 		s.Market, fixedpoint.NewFromFloat(plan.AskPrice)); ok {
 		projectionInput.MinSellNotionalJPY = minimum.Float64() * mid
 	}
+	jointMaxBuyNotionalJPY, jointMaxSellNotionalJPY := 0.0, 0.0
 	if plan.AllowBid && plan.BidPrice > 0 {
 		projectionInput.FastBuyNotionalJPY = plan.BidQuoteNotional * mid / plan.BidPrice
 		bidPrice := fixedpoint.NewFromFloat(plan.BidPrice)
 		modelCap := fixedpoint.NewFromFloat(orderCaps.BuyNotional * plan.BidPrice / mid)
 		hardCap := fixedpoint.NewFromFloat(
 			inventoryBuyHeadroomNotional(hardInventoryBand, inventoryBase, plan.BidPrice))
+		if quoteConfig.JointDistanceQuantity.Enabled &&
+			!quoteConfig.JointDistanceQuantity.ShadowOnly {
+			// The chance constraint below is the coherent stochastic risk cap.
+			// Dividing the soft band by InventoryMaxOrderLevels here created
+			// sub-minimum tranches and then rounded capital use down to one
+			// exchange-minimum order per side.
+			modelCap = hardCap
+		}
 		executableCap := makerBuyInventoryCapacity(s.Market, bidPrice, modelCap, hardCap)
 		projectionInput.MaxBuyNotionalJPY = math.Min(
 			quoteableQuote.Float64()*mid/plan.BidPrice,
 			executableCap.Float64()*mid/plan.BidPrice)
+		jointExecutableCap := makerBuyInventoryCapacity(s.Market, bidPrice, hardCap, hardCap)
+		jointMaxBuyNotionalJPY = math.Min(
+			quoteableQuote.Float64()*mid/plan.BidPrice,
+			jointExecutableCap.Float64()*mid/plan.BidPrice)
 	}
 	if plan.AllowAsk && plan.AskPrice > 0 {
 		projectionInput.FastSellNotionalJPY = plan.AskQuoteNotional * mid / plan.AskPrice
+		modelSellCap := orderCaps.SellQuantity
+		if quoteConfig.JointDistanceQuantity.Enabled &&
+			!quoteConfig.JointDistanceQuantity.ShadowOnly {
+			modelSellCap = hardSellInventoryHeadroom
+		}
 		executableCap := makerSellInventoryCapacity(
 			s.Market, fixedpoint.NewFromFloat(plan.AskPrice),
-			fixedpoint.NewFromFloat(orderCaps.SellQuantity),
+			fixedpoint.NewFromFloat(modelSellCap),
 			fixedpoint.NewFromFloat(hardSellInventoryHeadroom))
 		projectionInput.MaxSellNotionalJPY = math.Min(
 			base.Float64()*mid, executableCap.Float64()*mid)
+		jointExecutableCap := makerSellInventoryCapacity(
+			s.Market, fixedpoint.NewFromFloat(plan.AskPrice),
+			fixedpoint.NewFromFloat(hardSellInventoryHeadroom),
+			fixedpoint.NewFromFloat(hardSellInventoryHeadroom))
+		jointMaxSellNotionalJPY = math.Min(
+			base.Float64()*mid, jointExecutableCap.Float64()*mid)
 	}
 	probabilityProjection := ProbabilityCenteredQuoteDecision{Reason: "disabled"}
+	jointQuoteDecision := JointDistanceQuantityDecision{Reason: "disabled", Plan: plan}
 	if quoteConfig.ProbabilityCenteredQuantity.Enabled {
 		probabilityProjection = ProbabilityCenteredQuoteNotionals(projectionInput)
+		if quoteConfig.JointDistanceQuantity.Enabled {
+			jointProjectionInput := projectionInput
+			jointProjectionInput.MaxBuyNotionalJPY = jointMaxBuyNotionalJPY
+			jointProjectionInput.MaxSellNotionalJPY = jointMaxSellNotionalJPY
+			jointQuoteDecision = OptimizeJointDistanceQuantity(
+				&s.makerHorizonModel, quoteConfig, JointDistanceQuantityInput{
+					Now: now, Horizon: inventoryVariationHorizon,
+					BestBid: ticker.Buy.Float64(), BestAsk: ticker.Sell.Float64(),
+					MidPrice: mid, BasePlan: plan, Projection: jointProjectionInput,
+					ConfidenceZScore: quoteConfig.InventoryRiskZScore,
+				})
+			if jointQuoteDecision.Applied {
+				plan = jointQuoteDecision.Plan
+				probabilityProjection = jointQuoteDecision.Projection
+				finalHorizonDecision = jointQuoteDecision.Crossing
+				horizonDecision = jointQuoteDecision.Crossing
+				s.makerHorizonDecision = jointQuoteDecision.Crossing
+				buyFillRate = jointQuoteDecision.Crossing.BuyTouchRatePerHour()
+				sellFillRate = jointQuoteDecision.Crossing.SellTouchRatePerHour()
+				// A farther selected level needs its own first-passage lifetime;
+				// retaining the base quote's shorter clock would invalidate the
+				// selected completed-window probability.
+				orderReviewDuration = 0
+				if plan.AllowBid {
+					buyOrderKeepDecision = quoteConfig.DynamicOrderKeepDecision(
+						inventoryVariationHorizon,
+						quoteConfig.OrderKeepDistanceBps(plan.BidTouchDistanceBps),
+						buyQuoteVolatilityBps)
+					orderKeepDecision = buyOrderKeepDecision
+					orderReviewDuration = buyOrderKeepDecision.Duration
+				}
+				if plan.AllowAsk {
+					sellOrderKeepDecision = quoteConfig.DynamicOrderKeepDecision(
+						inventoryVariationHorizon,
+						quoteConfig.OrderKeepDistanceBps(plan.AskTouchDistanceBps),
+						sellQuoteVolatilityBps)
+					if orderReviewDuration <= 0 ||
+						sellOrderKeepDecision.Duration < orderReviewDuration {
+						orderKeepDecision = sellOrderKeepDecision
+						orderReviewDuration = sellOrderKeepDecision.Duration
+					}
+				}
+			}
+		}
 	}
 	probabilityProjectionUsed := probabilityProjection.Enabled &&
 		!quoteConfig.ProbabilityCenteredQuantity.ShadowOnly
@@ -2586,6 +2678,8 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"quantityProjectionReason":               probabilityProjection.Reason,
 			"quantityProjectionBuyProbability":       probabilityProjection.BuyFillProbability,
 			"quantityProjectionSellProbability":      probabilityProjection.SellFillProbability,
+			"quantityProjectionBothProbability":      probabilityProjection.BothFillProbability,
+			"quantityProjectionFillCovariance":       probabilityProjection.FillCovariance,
 			"quantityProjectionFastGrossJPY":         probabilityProjection.FastGrossNotionalJPY,
 			"quantityProjectionGrossJPY":             probabilityProjection.ProjectedGrossNotionalJPY,
 			"quantityProjectionExpectedInventoryJPY": probabilityProjection.ExpectedInventoryNotionalJPY,
@@ -2594,31 +2688,55 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"quantityProjectionConfidenceUpperJPY":   probabilityProjection.ConfidenceUpperNotionalJPY,
 			"quantityProjectionTargetErrorJPY":       probabilityProjection.TargetErrorJPY,
 			"quantityProjectionDesiredInventoryJPY":  probabilityProjection.DesiredInventoryNotionalJPY,
-			"quantityProjectionTargetContraction":    probabilityProjection.TargetContraction,
-			"fastBuyRestraintEnabled":                fastBuyRestraint.Enabled,
-			"fastBuyRestraintReason":                 fastBuyRestraint.Reason,
-			"fastBuyRestraintForecastReturnBps":      fastBuyRestraint.ForecastReturnBps,
-			"fastBuyRestraintForecastSEBps":          fastBuyRestraint.ForecastReturnSEBps,
-			"fastBuyRestraintAdverseProbability":     fastBuyRestraint.AdverseProbability,
-			"fastBuyRestraintStrength":               fastBuyRestraint.Restraint,
-			"fastBuyRetention":                       appliedFastBuyRetention,
-			"quantityProjectionUnrestrainedBuyJPY":   unrestrainedFastBuyNotionalJPY,
-			"quoteOrderSize":                         inventoryBand.OrderSize,
-			"effectiveOrderLevels":                   quoteConfig.EffectiveOrderLevels(windowDuration, riskSizingSellFillRate, riskSizingBuyFillRate),
-			"inventoryRiskMoveBps":                   inventoryBand.RiskMoveBps,
-			"missingSide":                            missingSide,
-			"sideMismatch":                           sideMismatch,
-			"fillRefreshPending":                     fillRefreshPending,
-			"fillRefreshSide":                        fillRefreshSide,
-			"fillRefreshAge":                         fillRefreshAge,
-			"materialMove":                           materialMove,
-			"materialImbalance":                      materialImbalance,
-			"materialImbalanceObserved":              materialImbalanceObserved,
-			"inventoryResetAskDistanceBps":           inventoryResetAskDistanceBps,
-			"inventoryResetUpCrosses":                inventoryResetUpCrosses,
-			"inventoryResetUpRatePerHour":            inventoryResetUpRatePerHour,
-			"inventoryResetFillIntensityValid":       inventoryResetFillIntensityValid,
-			"adverseAskMoveBps":                      adverseAskMoveBps, "adverseBidMoveBps": adverseBidMoveBps,
+			"jointQuoteEnabled":                      quoteConfig.JointDistanceQuantity.Enabled,
+			"jointQuoteShadowOnly":                   quoteConfig.JointDistanceQuantity.ShadowOnly,
+			"jointQuoteActive":                       jointQuoteDecision.Applied,
+			"jointQuoteReason":                       jointQuoteDecision.Reason,
+			"jointQuoteCandidateCount":               jointQuoteDecision.CandidateCount,
+			"jointQuoteSelectedCandidate":            jointQuoteDecision.SelectedCandidate,
+			"jointQuoteExpectedCycleJPY":             jointQuoteDecision.ExpectedCycleJPY,
+			"jointQuoteExpectedPnLJPYHour":           jointQuoteDecision.ExpectedPnLJPYHour,
+			"jointQuoteLowerPnLJPYHour":              jointQuoteDecision.LowerPnLJPYHour,
+			"jointQuoteCapitalUtilization":           jointQuoteDecision.CapitalUtilization,
+			"postFillUtilityEnabled":                 postFillUtilityDecision.Enabled,
+			"postFillUtilityApplied":                 postFillUtilityDecision.Applied,
+			"postFillUtilityReason":                  postFillUtilityDecision.Reason,
+			"postFillUtilitySide":                    postFillUtilityDecision.Side,
+			"postFillUtilityBaseDistanceBps":         postFillUtilityDecision.BaseDistanceBps,
+			"postFillUtilitySelectedDistanceBps":     postFillUtilityDecision.SelectedDistanceBps,
+			"postFillUtilityIncrementalMeanBps":      postFillUtilityDecision.IncrementalMeanBps,
+			"postFillUtilityIncrementalSEBps":        postFillUtilityDecision.IncrementalStdErrorBps,
+			"postFillUtilityIncrementalLowerBps":     postFillUtilityDecision.IncrementalLowerBps,
+			"postFillUtilityFillProbability":         postFillUtilityDecision.FillProbability,
+			"postFillUtilityEffectiveSamples":        postFillUtilityDecision.EffectiveSamples,
+			"postFillUtilityCycleEdgeBps":            postFillUtilityDecision.CycleEdgeBps,
+			"postFillUtilityInventoryRiskBenefitBps": postFillUtilityDecision.InventoryRiskBenefitBps,
+
+			"quantityProjectionTargetContraction":  probabilityProjection.TargetContraction,
+			"fastBuyRestraintEnabled":              fastBuyRestraint.Enabled,
+			"fastBuyRestraintReason":               fastBuyRestraint.Reason,
+			"fastBuyRestraintForecastReturnBps":    fastBuyRestraint.ForecastReturnBps,
+			"fastBuyRestraintForecastSEBps":        fastBuyRestraint.ForecastReturnSEBps,
+			"fastBuyRestraintAdverseProbability":   fastBuyRestraint.AdverseProbability,
+			"fastBuyRestraintStrength":             fastBuyRestraint.Restraint,
+			"fastBuyRetention":                     appliedFastBuyRetention,
+			"quantityProjectionUnrestrainedBuyJPY": unrestrainedFastBuyNotionalJPY,
+			"quoteOrderSize":                       inventoryBand.OrderSize,
+			"effectiveOrderLevels":                 quoteConfig.EffectiveOrderLevels(windowDuration, riskSizingSellFillRate, riskSizingBuyFillRate),
+			"inventoryRiskMoveBps":                 inventoryBand.RiskMoveBps,
+			"missingSide":                          missingSide,
+			"sideMismatch":                         sideMismatch,
+			"fillRefreshPending":                   fillRefreshPending,
+			"fillRefreshSide":                      fillRefreshSide,
+			"fillRefreshAge":                       fillRefreshAge,
+			"materialMove":                         materialMove,
+			"materialImbalance":                    materialImbalance,
+			"materialImbalanceObserved":            materialImbalanceObserved,
+			"inventoryResetAskDistanceBps":         inventoryResetAskDistanceBps,
+			"inventoryResetUpCrosses":              inventoryResetUpCrosses,
+			"inventoryResetUpRatePerHour":          inventoryResetUpRatePerHour,
+			"inventoryResetFillIntensityValid":     inventoryResetFillIntensityValid,
+			"adverseAskMoveBps":                    adverseAskMoveBps, "adverseBidMoveBps": adverseBidMoveBps,
 			"adverseRepriceBps":    quoteConfig.AdverseRepriceBps,
 			"inventoryExposureAge": exposureAge,
 			"refreshMin":           minRefreshInterval, "refreshMax": refreshInterval,

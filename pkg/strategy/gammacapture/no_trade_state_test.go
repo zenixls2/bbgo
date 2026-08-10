@@ -124,7 +124,30 @@ func TestNoTradeHoldProtectionProjectsStaleFilteredAimImmediately(t *testing.T) 
 	got, changed := state.ApplyNoTradeState(at.Add(time.Second), at, in, d)
 	if !changed || got.AimRatio != in.CurrentRiskyWeight ||
 		state.NoTradeFilteredAimRatio != in.CurrentRiskyWeight ||
-		state.NoTradeAimVariance != 0 || got.Direction != 0 {
+		state.NoTradeAimVariance != 0.01 || got.AimFilterVariance != 0.01 || got.Direction != 0 {
 		t.Fatalf("hold protection leaked through the persisted Kalman aim: %+v state=%+v", got, state)
+	}
+}
+
+func TestNoTradeStateRecoversLegacyZeroFilterVarianceWithoutMovingMean(t *testing.T) {
+	at := time.Date(2026, 8, 7, 1, 0, 0, 0, time.UTC)
+	in := noTradeTestInput()
+	in.CurrentRiskyWeight = 0.63
+	state := &MacroInventoryState{
+		NoTradeFilteredAimRatio: in.CurrentRiskyWeight,
+		NoTradeAimUpdatedAt:     at,
+		NoTradeAimClosedBarAt:   at,
+	}
+	d := EvaluateNoTradeInventory(NoTradeInventoryConfig{
+		Enabled: true, HoldProtectionEnabled: true, HoldProtectionZScore: 1.645,
+	}, in)
+	if !d.HoldProtectionApplied || d.AimMeasurementVariance <= 0 {
+		t.Fatalf("test setup did not produce a noisy protected posterior: %+v", d)
+	}
+	got, changed := state.ApplyNoTradeState(at.Add(time.Second), at, in, d)
+	if !changed || got.AimRatio != in.CurrentRiskyWeight || got.Direction != 0 ||
+		got.AimFilterVariance != d.AimMeasurementVariance ||
+		state.NoTradeAimVariance != d.AimMeasurementVariance {
+		t.Fatalf("legacy zero covariance was not restored without movement: %+v state=%+v", got, state)
 	}
 }

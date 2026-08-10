@@ -91,6 +91,7 @@ type FastEvidenceModel struct {
 	trades        []fastEvidenceTrade
 	bbo           []fastEvidenceBBO
 	lastTradeID   uint64
+	lastCompactAt time.Time
 }
 
 func NewFastEvidenceModel(cfg FastEvidenceConfig) *FastEvidenceModel {
@@ -159,14 +160,48 @@ func (m *FastEvidenceModel) ObserveBBO(at time.Time, ticker types.BookTicker) {
 
 func (m *FastEvidenceModel) trimLocked(now time.Time) {
 	cutoff := now.Add(-m.window)
+	trimmed := false
 	tradeFirst := sort.Search(len(m.trades), func(i int) bool { return !m.trades[i].at.Before(cutoff) })
 	if tradeFirst > 0 {
-		m.trades = append([]fastEvidenceTrade(nil), m.trades[tradeFirst:]...)
+		// Advance the bounded view instead of copying the active window on every
+		// event. Append growth compacts it periodically, giving amortized O(1)
+		// trimming with identical ordering and contents.
+		trimmed = true
+		m.trades = m.trades[tradeFirst:]
 	}
 	bboFirst := sort.Search(len(m.bbo), func(i int) bool { return !m.bbo[i].at.Before(cutoff) })
 	if bboFirst > 0 {
-		m.bbo = append([]fastEvidenceBBO(nil), m.bbo[bboFirst:]...)
+		m.bbo = m.bbo[bboFirst:]
+		trimmed = true
 	}
+	if trimmed && (m.lastCompactAt.IsZero() || now.Sub(m.lastCompactAt) >= time.Minute) {
+		m.trades = append([]fastEvidenceTrade(nil), m.trades...)
+		m.bbo = append([]fastEvidenceBBO(nil), m.bbo...)
+		m.lastCompactAt = now
+	}
+}
+
+// HealthAt returns only the observational health gate. Adaptive-window
+// selection needs this for unselected windows but does not need to rebuild
+// their O(window) feature vectors on every BBO decision.
+func (m *FastEvidenceModel) HealthAt(now time.Time) ModelHealth {
+	if m == nil || now.IsZero() {
+		return HealthInsufficient
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.trimLocked(now)
+	return m.healthLocked()
+}
+
+func (m *FastEvidenceModel) healthLocked() ModelHealth {
+	if len(m.trades) == 0 || len(m.bbo) == 0 {
+		return HealthInsufficient
+	}
+	if len(m.trades) >= m.minTrades && len(m.bbo) >= m.minBBOUpdates {
+		return HealthHealthy
+	}
+	return HealthDegraded
 }
 
 func (m *FastEvidenceModel) Snapshot(now time.Time) FastEvidenceSnapshot {
@@ -349,11 +384,6 @@ func (m *FastEvidenceModel) Snapshot(now time.Time) FastEvidenceSnapshot {
 		s.Age = now.Sub(last)
 	}
 	s.VolumeBalance = ComputeVolumeBalance(m.trades, m.bbo, now, m.window)
-	if s.TradeCount > 0 && s.BBOCount > 0 {
-		s.Health = HealthDegraded
-		if s.TradeCount >= m.minTrades && s.BBOCount >= m.minBBOUpdates {
-			s.Health = HealthHealthy
-		}
-	}
+	s.Health = m.healthLocked()
 	return s
 }

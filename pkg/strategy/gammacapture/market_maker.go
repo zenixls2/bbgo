@@ -13,6 +13,27 @@ type ProbabilityCenteredQuantityConfig struct {
 	ShadowOnly bool `json:"shadowOnly" yaml:"shadowOnly"`
 }
 
+// JointDistanceQuantityConfig enables the final one-order-per-side optimizer.
+// CandidateCount is a numerical resolution, not a risk weight: the optimizer
+// evaluates an outward price ladder between the unified Fast quote and the
+// configured maximum half-spread, then selects by a confidence-adjusted
+// expected fee-net cycle P&L rate subject to the inventory chance constraint.
+type JointDistanceQuantityConfig struct {
+	Enabled        bool `json:"enabled" yaml:"enabled"`
+	ShadowOnly     bool `json:"shadowOnly" yaml:"shadowOnly"`
+	CandidateCount int  `json:"candidateCount" yaml:"candidateCount"`
+}
+
+// PostFillUtilityConfig controls causal opposite-side repricing immediately
+// after an execution. The previous fill price is model state and diagnostics,
+// not a hard boundary: continuation or inventory risk may justify paying back
+// part of a completed edge.
+type PostFillUtilityConfig struct {
+	Enabled          bool    `json:"enabled" yaml:"enabled"`
+	MinimumSamples   int     `json:"minimumSamples" yaml:"minimumSamples"`
+	ConfidenceZScore float64 `json:"confidenceZScore" yaml:"confidenceZScore"`
+}
+
 // MarketMakerConfig contains only quote-policy parameters.  It is deliberately
 // independent of the exchange adapter so the policy can be trained and tested
 // against historical events without pretending that historical fills are known.
@@ -55,6 +76,8 @@ type MarketMakerConfig struct {
 	MacroInventory              MacroInventoryConfig              `json:"macroInventory" yaml:"macroInventory"`
 	HawkesDirection             HawkesDirectionConfig             `json:"hawkesDirection" yaml:"hawkesDirection"`
 	ProbabilityCenteredQuantity ProbabilityCenteredQuantityConfig `json:"probabilityCenteredQuantity" yaml:"probabilityCenteredQuantity"`
+	JointDistanceQuantity       JointDistanceQuantityConfig       `json:"jointDistanceQuantity" yaml:"jointDistanceQuantity"`
+	PostFillUtility             PostFillUtilityConfig             `json:"postFillUtility" yaml:"postFillUtility"`
 	InventorySkewBps            float64                           `json:"inventorySkewBps" yaml:"inventorySkewBps"`
 	QuoteNotional               float64                           `json:"quoteNotionalJPY" yaml:"quoteNotionalJPY"`
 	// MinimumQuoteNotional and MaximumQuoteNotional are retained for backwards
@@ -242,6 +265,9 @@ func (c *MarketMakerConfig) setDefaults() {
 	if c.InventoryMaxOrderLevels <= 0 {
 		c.InventoryMaxOrderLevels = 32
 	}
+	if c.JointDistanceQuantity.CandidateCount <= 0 {
+		c.JointDistanceQuantity.CandidateCount = 5
+	}
 	if c.InventoryTargetRatio <= 0 || c.InventoryTargetRatio >= 1 {
 		c.InventoryTargetRatio = 0.5
 	}
@@ -295,6 +321,12 @@ func (c *MarketMakerConfig) setDefaults() {
 	}
 	if c.HorizonMinSamples <= 0 {
 		c.HorizonMinSamples = 6
+	}
+	if c.PostFillUtility.MinimumSamples <= 0 {
+		c.PostFillUtility.MinimumSamples = c.HorizonMinSamples
+	}
+	if c.PostFillUtility.ConfidenceZScore <= 0 {
+		c.PostFillUtility.ConfidenceZScore = c.InventoryRiskZScore
 	}
 	c.HorizonTouchModel.setDefaults()
 	if c.FastWindow <= 0 {
@@ -579,8 +611,11 @@ type MarketMakerHorizonDecision struct {
 	EffectiveSamples     float64
 	BuyTouchProbability  float64 // Jeffreys-posterior probability of an ask-path touch within Horizon
 	SellTouchProbability float64 // Jeffreys-posterior probability of a bid-path touch within Horizon
+	BothTouchProbability float64 // coherent probability that both executable sides touch within Horizon
+	TouchCovariance      float64 // Cov(1_buy_touch, 1_sell_touch) on paired completed BBO paths
 	BuyTouchStdError     float64
 	SellTouchStdError    float64
+	BothTouchStdError    float64
 	OnlineFastWeight     float64
 	EstimatorSource      string
 	NetRoundTripEdgeBps  float64
@@ -634,12 +669,13 @@ func (d MarketMakerHorizonDecision) SellTouchRatePerHour() float64 {
 // reference for the next trading window; callers must not cancel an existing
 // quote merely because this decision changed.
 type MarketMakerHorizonModel struct {
-	points              []MarketMakerHorizonPoint
-	lastSecond          time.Time
-	lastTrimSecond      time.Time
-	lastUpdate          time.Time
-	decision            MarketMakerHorizonDecision
-	sideHARVarianceRisk map[time.Duration]*OnlineSideHARVarianceRisk
+	points                 []MarketMakerHorizonPoint
+	lastSecond             time.Time
+	lastTrimSecond         time.Time
+	lastUpdate             time.Time
+	decision               MarketMakerHorizonDecision
+	sideHARVarianceRisk    map[time.Duration]*OnlineSideHARVarianceRisk
+	crossingExposureCaches map[time.Duration]*marketMakerHorizonExposureCache
 }
 
 // EmpiricalSideVolatilityEstimate returns executable-price realized
@@ -1215,13 +1251,13 @@ func neutralMakerTouchDistances(bestBid, bestAsk, halfSpreadBps float64) (buyDis
 	return MakerTouchDistances(bestBid, bestAsk, bidQuote, askQuote)
 }
 
-func (m MarketMakerHorizonModel) CrossingDecisionAtDistance(now time.Time, c MarketMakerConfig, horizon time.Duration, distanceBps float64) MarketMakerHorizonDecision {
+func (m *MarketMakerHorizonModel) CrossingDecisionAtDistance(now time.Time, c MarketMakerConfig, horizon time.Duration, distanceBps float64) MarketMakerHorizonDecision {
 	return m.CrossingDecisionAtSideDistances(now, c, horizon, distanceBps, distanceBps, 2*distanceBps)
 }
 
 // CrossingDecisionAtSideDistances estimates each side from its executable BBO
 // path. Up/sell events use best bid; down/buy events use best ask.
-func (m MarketMakerHorizonModel) CrossingDecisionAtSideDistances(
+func (m *MarketMakerHorizonModel) CrossingDecisionAtSideDistances(
 	now time.Time,
 	c MarketMakerConfig,
 	horizon time.Duration,
@@ -1240,80 +1276,25 @@ func (m MarketMakerHorizonModel) CrossingDecisionAtSideDistances(
 	cutoff := now.Add(-time.Duration(c.HorizonLookback))
 	var up, down int
 	var first, last, lastUp, lastDown, lastExposure time.Time
-	var effectiveSamples, weightedUpTouches, weightedDownTouches float64
+	var effectiveSamples, weightedUpTouches, weightedDownTouches, weightedBothTouches float64
 	var upSpacing, downSpacing []time.Duration
-	// The old implementation rescanned every future point for every start
-	// point, making this O(N*H) for a horizon of H samples. Build a monotone
-	// future window once and maintain max-bid/min-ask deques. The prefix count
-	// preserves the exact outage/invalid-point rejection without rescanning.
-	badPrefix := make([]int, len(m.points)+1)
-	for i := range m.points {
-		badPrefix[i+1] = badPrefix[i]
-		bid, ask := m.points[i].bidPrice(), m.points[i].askPrice()
-		if m.points[i].GapBefore || bid <= 0 || ask < bid {
-			badPrefix[i+1]++
+	exposures := m.crossingExposures(horizon)
+	for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
+		exposure := exposures[index]
+		if exposure.EndAt.After(now) {
+			break
 		}
-	}
-	maxDeque, minDeque := make([]int, 0), make([]int, 0)
-	right := 1
-	pushWindow := func(index int) {
-		bid, ask := m.points[index].bidPrice(), m.points[index].askPrice()
-		for len(maxDeque) > 0 {
-			lastIndex := maxDeque[len(maxDeque)-1]
-			lastBid, _ := m.points[lastIndex].bidPrice(), m.points[lastIndex].askPrice()
-			if lastBid > bid {
-				break
-			}
-			maxDeque = maxDeque[:len(maxDeque)-1]
-		}
-		maxDeque = append(maxDeque, index)
-		for len(minDeque) > 0 {
-			lastIndex := minDeque[len(minDeque)-1]
-			_, lastAsk := m.points[lastIndex].bidPrice(), m.points[lastIndex].askPrice()
-			if lastAsk < ask {
-				break
-			}
-			minDeque = minDeque[:len(minDeque)-1]
-		}
-		minDeque = append(minDeque, index)
-	}
-	for i := range m.points {
-		start := m.points[i]
-		startBid, startAsk := start.bidPrice(), start.askPrice()
-		endAt := start.At.Add(horizon)
-		if right < i+1 {
-			right = i + 1
-		}
-		for right < len(m.points) && m.points[right].At.Before(endAt) {
-			pushWindow(right)
-			right++
-		}
-		for len(maxDeque) > 0 && maxDeque[0] <= i {
-			maxDeque = maxDeque[1:]
-		}
-		for len(minDeque) > 0 && minDeque[0] <= i {
-			minDeque = minDeque[1:]
-		}
-		j := right
-		if start.At.Before(cutoff) || start.GapBefore || startBid <= 0 || startAsk < startBid ||
-			endAt.After(now) || (!last.IsZero() && start.At.Sub(last) < time.Minute) {
-			continue
-		}
-		if j <= i+1 {
-			continue
-		}
-		if badPrefix[j]-badPrefix[i+1] > 0 || len(maxDeque) == 0 || len(minDeque) == 0 {
-			continue
-		}
-		maxBid, _ := m.points[maxDeque[0]].bidPrice(), m.points[maxDeque[0]].askPrice()
-		_, minAsk := m.points[minDeque[0]].bidPrice(), m.points[minDeque[0]].askPrice()
-		sellTouched := math.Log(maxBid/startBid)*10_000 >= sellDistanceBps
-		buyTouched := math.Log(startAsk/minAsk)*10_000 >= buyDistanceBps
+		sellTouched := exposure.SellExcursionBps >= sellDistanceBps
+		buyTouched := exposure.BuyExcursionBps >= buyDistanceBps
 		weight := 1.0
 		if !lastExposure.IsZero() {
-			weight = math.Min(1, start.At.Sub(lastExposure).Seconds()/horizon.Seconds())
+			weight = math.Min(1, exposure.At.Sub(lastExposure).Seconds()/horizon.Seconds())
 		}
 		if weight <= 0 {
+			if exposure.NextMinute <= index {
+				break
+			}
+			index = exposure.NextMinute
 			continue
 		}
 		effectiveSamples += weight
@@ -1323,29 +1304,36 @@ func (m MarketMakerHorizonModel) CrossingDecisionAtSideDistances(
 		if buyTouched {
 			weightedDownTouches += weight
 		}
-		lastExposure = start.At
+		if buyTouched && sellTouched {
+			weightedBothTouches += weight
+		}
+		lastExposure = exposure.At
 		sellEvent := sellTouched &&
-			(lastUp.IsZero() || start.At.Sub(lastUp) >= horizon)
+			(lastUp.IsZero() || exposure.At.Sub(lastUp) >= horizon)
 		buyEvent := buyTouched &&
-			(lastDown.IsZero() || start.At.Sub(lastDown) >= horizon)
+			(lastDown.IsZero() || exposure.At.Sub(lastDown) >= horizon)
 		if sellEvent {
 			up++
 			if !lastUp.IsZero() {
-				upSpacing = append(upSpacing, start.At.Sub(lastUp))
+				upSpacing = append(upSpacing, exposure.At.Sub(lastUp))
 			}
-			lastUp = start.At
+			lastUp = exposure.At
 		}
 		if buyEvent {
 			down++
 			if !lastDown.IsZero() {
-				downSpacing = append(downSpacing, start.At.Sub(lastDown))
+				downSpacing = append(downSpacing, exposure.At.Sub(lastDown))
 			}
-			lastDown = start.At
+			lastDown = exposure.At
 		}
 		if first.IsZero() {
-			first = start.At
+			first = exposure.At
 		}
-		last = start.At
+		last = exposure.At
+		if exposure.NextMinute <= index {
+			break
+		}
+		index = exposure.NextMinute
 	}
 	if first.IsZero() || !last.After(first) {
 		return d
@@ -1360,6 +1348,15 @@ func (m MarketMakerHorizonModel) CrossingDecisionAtSideDistances(
 	// counts are the overlap weights of the rolling completed windows.
 	d.BuyTouchProbability, d.BuyTouchStdError = jeffreysBernoulliPosterior(weightedDownTouches, effectiveSamples)
 	d.SellTouchProbability, d.SellTouchStdError = jeffreysBernoulliPosterior(weightedUpTouches, effectiveSamples)
+	d.BothTouchProbability, d.BothTouchStdError = jeffreysBernoulliPosterior(weightedBothTouches, effectiveSamples)
+	// Separate Jeffreys marginals and the joint posterior can differ by one
+	// pseudo-count. Project the joint mean onto the Frechet bounds so the
+	// Bernoulli covariance remains realizable without changing the established
+	// per-side estimators.
+	lowerJoint := math.Max(0, d.BuyTouchProbability+d.SellTouchProbability-1)
+	upperJoint := math.Min(d.BuyTouchProbability, d.SellTouchProbability)
+	d.BothTouchProbability = math.Max(lowerJoint, math.Min(upperJoint, d.BothTouchProbability))
+	d.TouchCovariance = d.BothTouchProbability - d.BuyTouchProbability*d.SellTouchProbability
 	d.NetRoundTripEdgeBps = grossQuoteEdgeBps - 2*c.MakerFeeBps - 2*c.AdverseSelectionBps - c.MinimumNetEdgeBps
 	edge := math.Max(0, d.NetRoundTripEdgeBps)
 	if horizonHours := horizon.Hours(); horizonHours > 0 {

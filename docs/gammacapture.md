@@ -1004,6 +1004,39 @@ are solved again. Diagnostics include `quantityProjectionDesiredInventoryJPY`,
 `quantityProjection*` fields. The ETHJPY profile runs this model live with
 `probabilityCenteredQuantity.shadowOnly: false`.
 
+### Post-fill terminal-wealth utility
+
+A private maker fill causes the next BBO to rebuild both quotes from refreshed
+inventory and balances. The opposite quote is then allowed to move inward only
+when completed executable-BBO paths support the concession. For candidate
+touch distance `d`, define terminal wealth in bps by
+
+    Y_i(d) = I_i(d) * [executableMarkout_i(d) - 2*makerFee - minimumNetEdge + DeltaInventoryRisk].
+
+BUY candidates touch on the ask path and mark at the horizon bid; SELL
+candidates touch on the bid path and mark at the horizon ask. This incorporates
+observed spread and adverse selection directly, so the configured adverse-
+selection allowance is not charged a second time. `DeltaInventoryRisk` is the
+change in quadratic tracking utility relative to the current Macro expectation:
+
+    DeltaInventoryRisk = (gamma*sigma_H^2/2) * [(w-w*)^2 - (w_after-w*)^2].
+
+Against the ordinary Fast quote `d0`, the controller evaluates paired path
+differences `D_i(d)=Y_i(d)-Y_i(d0)` on one-minute starts over the configured
+rolling lookback. Overlap is down-weighted by `min(1, delta_i/H)`. It spends
+edge only when
+
+    mean(D(d)) - z*SE(D(d)) > 0.
+
+The previous fill price is retained as path state and diagnostics, never as a
+hard price gate. Therefore a statistically supported upward chase may rebid
+above the previous sale, and a supported risk exit may reoffer below the
+previous buy. If no candidate passes the lower bound, the ordinary Fast/Macro
+quote remains unchanged. Any inward move widens the non-urgent side when needed
+to preserve the full resting-pair fee and edge floor. Replay follows the live
+sequence: a partial or complete maker fill updates inventory immediately and
+forces replacement calculation at the next BBO.
+
 The same reachability calculation supplies a bounded target-side price
 urgency. Let `qCell` be one exchange-executable notional, `R=|M-N|/qCell` the
 required correction fills, and `m` the signed fast-direction posterior mean in
@@ -2591,3 +2624,203 @@ tested binary was deployed through the userspace
 `gammacapture-strategy.service`; startup restored its checkpoint and capture
 delta before cancelling two stale orders, then submitted fresh two-sided
 `LIMIT_MAKER` quotes without API, filter, panic, or restart errors.
+
+## 2026-08-10 exact incremental crossing cache
+
+`CrossingDecisionAtSideDistances` previously rebuilt the future max-bid and
+min-ask window for every BBO evaluation. Although the monotone-deque scan was
+linear rather than quadratic, replay complexity remained `O(B*N)`, where `B`
+is the number of BBO decisions and `N` is the retained one-second history.
+
+The horizon model now separates distance-independent path work from the quote
+barrier query. Initial warmup builds each horizon's completed exposure path in
+`O(N)`. Each record stores the exact ask-side downward excursion, bid-side
+upward excursion, gap validity, and holding-window timestamps. As new seconds
+arrive, only newly completed windows are appended; each completed window is
+calculated once. A precomputed link follows the identical greedy one-minute
+exposure spacing used by the estimator, so changing bid/ask distances does not
+rescan intervening one-second observations. Old records are trimmed with the
+bounded horizon history. No sampling, interpolation, or probabilistic
+approximation is introduced.
+
+Randomized path tests compare the cache against an independent brute-force
+implementation across side-specific distances, multiple horizons, capture
+gaps, and same-second BBO replacement. The 2026-08-09 14:41:13Z to 2026-08-10
+02:41:13Z ETHJPY production replay was byte-identical before and after the
+change. CPU-profiled wall time fell from 63.86 seconds to 20.39 seconds; the
+crossing decision's cumulative CPU share fell from 59.14% to 8.84%.
+
+## 2026-08-10 quantity projection and staged HPO
+
+The probability-centered quantity projection previously searched a fixed
+32-point gross-notional grid. A narrow feasible confidence-constrained interval
+near the exchange minimum could fall between grid points and incorrectly force
+the legacy direction fallback.
+
+The solver now treats feasibility as a continuous normalized constraint-
+violation objective. It seeds exchange-capacity kinks, minimizes the objective
+with a bounded golden-section search, and then bisects the upper feasible
+boundary. Quote-time work remains bounded `O(1)`.
+
+A second contradiction was exposed by live startup diagnostics. At the Macro
+target, requiring the expected inventory error never to increase forces
+`E[N_T]=M` exactly. Unequal BUY/SELL arrivals and exchange minimum quantities
+make that equality generally impossible, so the supposedly safer path fell
+back to unmodelled equal orders. The duplicate hard gate is removed. The single
+coherent constraint now controls mean displacement and fill variance together:
+
+`E[(N_T-M)^2] <= (N-M)^2 + (softWidth/z)^2`.
+
+Regression tests cover both a narrow feasible interval and asymmetric
+minimum-size orders with unavoidable nonzero expected drift.
+
+### Staged HPO protocol and result
+
+Research-only CLI overrides permit bounded sequential optimization: first
+inventory risk budget/confidence, then spread/volatility/order lifetime, and
+then Macro risk budget/bar interval. An independent 2026-08-08 eight-hour
+interval and fixed up/range/down regimes were not used for candidate selection.
+
+| stage | candidates | result |
+|---|---|---|
+| inventory confidence | risk budget 0.10%-0.35%; `z` 1.282/1.645/1.960 | risk budget was non-binding; `z=1.282` passed validation |
+| quote geometry | half spread 13/15/18 bps; volatility multiplier 0.50/0.75/1.00 | production 15/0.75 remained best |
+| retention | 30/45/60 minutes | no effect because selective side retention was the binding clock |
+| Macro | risk aversion 0.5/1/2; carry budget 0.5%/1%/2%; bar 5/10/15 minutes | default 1/1%/10m remained Pareto-best |
+
+With the coherent risk constraint, the 12-hour tuning interval improved from
+3.4939 JPY and 7 fills at `z=1.645` to 3.6804 JPY and 10 fills at `z=1.282`.
+The untouched eight-hour holdout was identical at 10.8614 JPY and one SELL fill
+for all three tested z-scores. Fixed up and down regimes were also identical.
+In the range regime, `z=1.282` improved excess versus hold from 0.9208 to
+1.0086 JPY while reducing fills from six to five.
+
+Therefore production uses `inventoryRiskZScore=1.282`,
+`minimumHalfSpreadBps=15`, `volatilityMultiplier=0.75`, and the existing Macro
+parameters. The HPO flags are isolated to the research command and cover
+inventory risk, quote geometry, horizon, and Macro parameters. Explicit zero
+residual edge uses a separate set flag, so a zero-value override object cannot
+silently erase the configured profitability floor.
+
+This is a bounded sensitivity study, not evidence of a globally optimal vector.
+No candidate produced a positive lower confidence bound across the small
+regime set; `z=1.282` is promoted only because it Pareto-dominated the production
+baseline on the tested intervals, not because of a joint-grid optimum.
+
+## 2026-08-10 live covariance and order persistence audit
+
+Hold protection projects an unprofitable Macro target back to current risky
+weight. That projection is a control decision, not a new zero-noise
+observation. The previous implementation also cleared the scalar Kalman
+covariance, so `macroNoTradeAimFilterVariance` incorrectly logged zero and the
+next closed-bar update started from an overconfident state. Hold protection now
+projects only the posterior mean. Covariance and the actual Kalman update
+diagnostics remain intact. A compatibility branch recognizes exact-zero
+covariance left by older checkpoints and restores it from the current Beta
+posterior measurement variance without moving inventory. The first deployed
+decision reported filter variance `4.935889852285411e-05` and measurement
+variance `7.513493584888184e-05`.
+
+The ETHJPY service now enables private trade and complete order-lifecycle
+persistence. SQLite order insertion upserts `(order_id, exchange)`, allowing
+`NEW`, partial, cancelled, and filled updates to occupy one row. Startup REST
+history synchronization is disabled independently of live user-data writers;
+backfill is intentionally a separate maintenance operation because the legacy
+SQLite `inserted_at` format still needs compatibility handling. After the private stream is
+connected, configured symbols receive one open-order reconciliation plus exact
+status queries for any locally nonterminal row absent from the exchange open
+set. This closes the startup interval in which stale orders are cancelled
+before private websocket updates are available. Deployment validation left
+exactly two nonterminal rows, matching the current BUY and SELL quotes.
+
+### Capital-utilization diagnosis and next model
+
+The observed small tickets are not caused by the configured reference
+notional. In the audited live decision, Fast supplied `16,603.77 JPY` of gross
+risk capacity, but the no-trade region was only `+/-152.26 JPY`. Splitting that
+width across six future correction levels yielded `25.38 JPY` per tranche,
+below Binance's approximately `100 JPY` executable minimum. The projection
+therefore collapsed to one minimum order per side: `202.02 JPY`, or about
+`2.93%` of `6,895.10 JPY` pair equity. Increasing `quoteNotionalJPY` or the
+Fast risk budget cannot remove this downstream discrete constraint.
+
+The recommended replacement is a joint price-distance/quantity ladder, not a
+larger fixed order. For side `s` and level `k`, estimate executable first-passage
+probabilities `p_{s,k}=P(tau_{s,k}<=H | F_t)` from the completed BBO paths and
+choose distances and quantities together. Same-side fills are nested, so their
+exact Bernoulli covariance is
+
+`Cov(I_i,I_j)=min(p_i,p_j)-p_i p_j`.
+
+Cross-side covariance is estimated from the same completed path pairs. The
+deployed one-order-per-side solver maximizes confidence-adjusted fee-net edge
+subject to:
+
+`|E[N_H]-M| + z sqrt(Var[N_H]) <= noTradeWidth`,
+
+hard post-fill inventory/capital bounds, account balances, exchange filters,
+and a stressed gap-path CVaR budget. The high-arrival side can move farther out
+instead of being shrunk below the exchange minimum, while the low-arrival side
+moves inward only when its fee-adjusted lower-bound edge remains positive.
+This uses more resting capital without assuming independent fills or allowing
+all near-touch orders to fill in the same adverse jump.
+
+### Implemented non-Poisson joint distance/quantity path
+
+The final Fast quote now evaluates a small outward ladder from the unified
+reservation quote to the configured maximum half-spread, but submits only the
+selected level on each side. Candidate levels are alternatives, not
+simultaneous orders; after a fill, the normal inventory refresh solves the
+allocation again.
+
+For every distance candidate, the same paired completed BBO paths estimate
+
+`pB=P(tauB<=H)`, `pS=P(tauS<=H)`, and
+`pBoth=P(tauB<=H, tauS<=H)`.
+
+These are measured window probabilities and are passed to quantity allocation
+directly. They are not converted again through `1-exp(-lambda*H)`, which would
+silently impose a homogeneous Poisson clock. With risky-notional change
+`DeltaN=qB*IB-qS*IS`, the implemented inventory variance is
+
+`Var(DeltaN)=pB(1-pB)qB^2+pS(1-pS)qS^2-2(pBoth-pB*pS)qB*qS`.
+
+The joint mean is projected onto the Frechet bounds
+`max(0,pB+pS-1)<=pBoth<=min(pB,pS)` so separate Jeffreys pseudo-counts cannot
+create an impossible covariance matrix.
+
+The old `noTradeWidth/inventoryMaxOrderLevels` cap is removed only from this
+final stochastic projection. Available balances, hard portfolio min/max,
+exchange filters, the Fast gross budget, posterior bearish BUY restraint, and
+the existing second-moment inventory constraint remain binding. The objective
+for candidate selection is the lower-confidence fee-net cycle P&L rate:
+
+`min((pB-z*seB)+*qB,(pS-z*seS)+*qS)/H * (edge-fees-adverse-minEdge)/10000`.
+
+Consequently the optimizer does not maximize deployed capital by itself. A
+farther level or larger order is selected only when its confidence-adjusted
+expected fee-net cycle value is at least as good; gross notional is merely the
+tie-breaker. `jointDistanceQuantity.shadowOnly` can retain the complete
+decision diagnostics without changing live orders.
+
+The initial 2026-08-10 eight-hour ETHJPY replay exposed a promotion bug.
+Against the immediately preceding probability-centered allocator, the
+unguarded joint path kept 13 fills (5 BUY, 8 SELL) and reduced maximum drawdown
+from 0.480% to 0.407%, but net P&L fell from 37.42 JPY to 33.01 JPY and fee
+turnover increased. Live shadow diagnostics explained it: all candidate
+fee-net P&L lower bounds were exactly zero, so the gross-notional tie-break had
+selected a larger order despite no positive-confidence evidence. The corrected
+rule requires `LowerPnLJPYHour > 0`; gross notional is only a tie-break among
+strictly positive candidates. When that guard is not met the accepted
+probability-centered prices and quantities remain active, while the rejected
+candidate stays visible in diagnostics.
+
+The guarded rerun improved the unguarded joint result from 33.01 JPY to
+34.74 JPY and bounded drawdown at 0.437%, but it still remained below the
+immediately preceding allocator's 37.42 JPY. This proves that a positive
+single-window cycle lower bound is necessary but not sufficient: repeated
+larger fills interact with the moving Macro target and create path-dependent
+inventory drift that the one-step constraint does not price. The production
+configuration therefore remains `shadowOnly: true`. Activation requires a
+multi-step target-transition/bootstrap test whose return lower bound is
+non-inferior to the accepted allocator, not merely a positive one-step edge.

@@ -16,6 +16,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"time"
 
@@ -119,6 +120,7 @@ func main() {
 	macroReversalCompare := flag.Bool("macro-reversal-compare", false, "compare confirmed-only and early-sequential Macro reversal paths")
 	quantityProjectionCompare := flag.Bool("quantity-projection-compare", false, "compare staged and probability-centered quantity policies")
 	quantityProjectionCurrentOnly := flag.Bool("quantity-projection-current-only", false, "run only the current probability-centered policy")
+	postFillUtilityCompare := flag.Bool("post-fill-utility-compare", false, "compare current policy with confidence-adjusted post-fill utility")
 	noTradeIOCCompare := flag.Bool("no-trade-ioc-compare", false, "comparison of trend/QV no-trade, legacy Macro, and bounded IOC")
 	trendQVOnly := flag.Bool("trend-qv-only", false, "with --no-trade-ioc-compare, run only trend-excursion+ioc and qv-only+ioc")
 	continuationQVOnly := flag.Bool("continuation-qv-only", false, "with --no-trade-ioc-compare, run only qv-continuation+ioc and qv-only+ioc")
@@ -141,6 +143,20 @@ func main() {
 	regimeAnchorStep := flag.Duration("regime-anchor-step", 3*time.Hour, "non-overlapping prediction anchor spacing for the standalone regime study")
 	maxDrawdownStopPct := flag.Float64("max-drawdown-stop-pct", 0, "stop production replay when equity drawdown reaches this percentage; zero disables")
 	replayCacheDir := flag.String("replay-cache-dir", "data/gammacapture/state/replay-cache", "deterministic parsed replay cache; empty disables")
+	cpuProfilePath := flag.String("cpu-profile", "", "write a Go CPU profile for replay performance analysis")
+	overrideRiskBudgetRatio := flag.Float64("override-inventory-risk-budget-ratio", -1, "research-only inventory risk budget ratio")
+	overrideRiskZScore := flag.Float64("override-inventory-risk-z-score", -1, "research-only inventory confidence z-score")
+	overrideMinimumHalfSpread := flag.Float64("override-minimum-half-spread-bps", -1, "research-only minimum half spread")
+	overrideVolatilityMultiplier := flag.Float64("override-volatility-multiplier", -1, "research-only quote volatility multiplier")
+	overrideMinimumNetEdge := flag.Float64("override-minimum-net-edge-bps", -1, "research-only minimum residual edge")
+	overrideMaxTradingWindow := flag.Duration("override-max-trading-window", -1, "research-only maximum trading window")
+	overrideHorizonLookback := flag.Duration("override-horizon-lookback", -1, "research-only horizon lookback")
+	overrideHorizonMinSamples := flag.Int("override-horizon-min-samples", -1, "research-only horizon minimum effective samples")
+	overrideMacroRiskAversion := flag.Float64("override-macro-risk-aversion", -1, "research-only Macro risk aversion")
+	overrideMacroCarryBudget := flag.Float64("override-macro-carry-risk-budget-ratio", -1, "research-only Macro carry risk budget ratio")
+	overrideMacroBarInterval := flag.Duration("override-macro-bar-interval", -1, "research-only Macro bar interval")
+	disableJointDistanceQuantity := flag.Bool("disable-joint-distance-quantity", false, "research-only disable joint distance/quantity optimizer")
+	overrideJointDistanceCandidates := flag.Int("override-joint-distance-candidates", -1, "research-only joint distance ladder candidate count")
 	replayFrom := flag.String("replay-from", "", "exact Macro replay start (RFC3339)")
 	replayTo := flag.String("replay-to", "", "exact Macro replay end (RFC3339)")
 	configPath := flag.String("config", "config/gammacapture.yaml", "GammaCapture YAML configuration used by production replay")
@@ -155,6 +171,36 @@ func main() {
 	journalData := flag.String("journal-data", "", "exported userspace journal JSONL; reconstructs actual gcmm LIMIT_MAKER lifecycles")
 	lifecycleOnly := flag.Bool("lifecycle-only", false, "report journal maker lifecycles without replaying either quote policy")
 	flag.Parse()
+	activeProductionConfigOverrides = productionConfigOverrides{
+		InventoryRiskBudgetRatio:     *overrideRiskBudgetRatio,
+		InventoryRiskZScore:          *overrideRiskZScore,
+		MinimumHalfSpreadBps:         *overrideMinimumHalfSpread,
+		VolatilityMultiplier:         *overrideVolatilityMultiplier,
+		MinimumNetEdgeBps:            *overrideMinimumNetEdge,
+		MinimumNetEdgeSet:            *overrideMinimumNetEdge >= 0,
+		MaxTradingWindow:             *overrideMaxTradingWindow,
+		HorizonLookback:              *overrideHorizonLookback,
+		HorizonMinSamples:            *overrideHorizonMinSamples,
+		MacroRiskAversion:            *overrideMacroRiskAversion,
+		MacroCarryRiskBudget:         *overrideMacroCarryBudget,
+		MacroBarInterval:             *overrideMacroBarInterval,
+		DisableJointDistanceQuantity: *disableJointDistanceQuantity,
+		JointDistanceCandidateCount:  *overrideJointDistanceCandidates,
+	}
+	if *cpuProfilePath != "" {
+		profileFile, err := os.Create(*cpuProfilePath)
+		if err != nil {
+			fatalf("create CPU profile: %v", err)
+		}
+		if err := pprof.StartCPUProfile(profileFile); err != nil {
+			_ = profileFile.Close()
+			fatalf("start CPU profile: %v", err)
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			_ = profileFile.Close()
+		}()
+	}
 	trainStart, trainEnd := parseDate(*trainFrom), parseDate(*trainTo)
 	holdStart, holdEnd := parseDate(*holdoutFrom), parseDate(*holdoutTo)
 	if !trainStart.Before(trainEnd) || !holdStart.Before(holdEnd) || *fee < 0 || *takerFee < 0 || *acquisitionSlippage < 0 || *adverse < 0 || *inventoryLimit <= 0 || *inventoryTargetRatio < 0 || *inventoryTargetRatio > 1 || *quoteNotional <= 0 || *minOrderNotional <= 0 || *statsQuoteDistance <= 0 || *minTradingWindow <= 0 || *maxTradingWindow < *minTradingWindow {
@@ -280,6 +326,20 @@ func main() {
 		})
 		return
 	}
+	if *postFillUtilityCompare {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--post-fill-utility-compare requires --replay-from and --replay-to")
+		}
+		runPostFillUtilityComparison(postFillUtilityComparisonInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			QueueMultiplier: *queueMultiplier, ReplayCacheDir: *replayCacheDir,
+			MaxDrawdownStopPct: *maxDrawdownStopPct,
+		})
+		return
+	}
+
 	if *quantityProjectionCompare {
 		if *replayFrom == "" || *replayTo == "" {
 			fatalf("--quantity-projection-compare requires --replay-from and --replay-to")

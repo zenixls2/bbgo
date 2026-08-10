@@ -4,8 +4,50 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/c9s/bbgo/pkg/fixedpoint"
+	"github.com/c9s/bbgo/pkg/types"
 )
+
+func TestOrderServiceInsertUpsertsSQLiteLifecycle(t *testing.T) {
+	db, err := prepareDB(t)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	xdb := sqlx.NewDb(db.DB, "sqlite3")
+	service := &OrderService{DB: xdb}
+	now := time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)
+	order := types.Order{
+		SubmitOrder: types.SubmitOrder{
+			ClientOrderID: "gcmm-buy-test", Symbol: "ETHJPY",
+			Side: types.SideTypeBuy, Type: types.OrderTypeLimitMaker,
+			Price: fixedpoint.NewFromInt(305000), Quantity: fixedpoint.NewFromFloat(0.00033),
+			TimeInForce: types.TimeInForceGTC,
+		},
+		Exchange: types.ExchangeBinance, OrderID: 12345,
+		Status: types.OrderStatusNew, IsWorking: true,
+		CreationTime: types.Time(now), UpdateTime: types.Time(now),
+	}
+	require.NoError(t, service.Insert(order))
+
+	order.Status = types.OrderStatusFilled
+	order.IsWorking = false
+	order.ExecutedQuantity = order.Quantity
+	order.UpdateTime = types.Time(now.Add(time.Minute))
+	require.NoError(t, service.Insert(order))
+
+	var count int
+	require.NoError(t, xdb.Get(&count, "SELECT COUNT(*) FROM orders WHERE exchange = ? AND order_id = ?", order.Exchange, order.OrderID))
+	assert.Equal(t, 1, count)
+	var stored types.Order
+	require.NoError(t, xdb.Get(&stored, "SELECT * FROM orders WHERE exchange = ? AND order_id = ?", order.Exchange, order.OrderID))
+	assert.Equal(t, types.OrderStatusFilled, stored.Status)
+	assert.Equal(t, order.Quantity, stored.ExecutedQuantity)
+	assert.False(t, stored.IsWorking)
+}
 
 func Test_genOrderSQL(t *testing.T) {
 	t.Run("accept empty options", func(t *testing.T) {

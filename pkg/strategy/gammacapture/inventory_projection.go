@@ -24,8 +24,14 @@ type ProbabilityCenteredQuoteInput struct {
 
 	BuyFillRatePerHour  float64
 	SellFillRatePerHour float64
-	Horizon             time.Duration
-	ConfidenceZScore    float64
+	// DirectFillProbabilities identifies non-Poisson completed-window inputs.
+	// Zero is a valid measured probability, so an explicit switch is required.
+	DirectFillProbabilities bool
+	BuyFillProbability      float64
+	SellFillProbability     float64
+	BothFillProbability     float64
+	Horizon                 time.Duration
+	ConfidenceZScore        float64
 	// TargetContraction is the fraction of the current Macro target error that
 	// one fill should remove. Live trading uses one over the configured inventory
 	// order levels. The solver multiplies this by the corrective side's horizon
@@ -186,6 +192,8 @@ type ProbabilityCenteredQuoteDecision struct {
 
 	BuyFillProbability        float64
 	SellFillProbability       float64
+	BothFillProbability       float64
+	FillCovariance            float64
 	FastGrossNotionalJPY      float64
 	ProjectedGrossNotionalJPY float64
 	BuyNotionalJPY            float64
@@ -231,6 +239,9 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 		!inventoryProjectionFinite(in.MaxSellNotionalJPY) ||
 		!inventoryProjectionFinite(in.BuyFillRatePerHour) ||
 		!inventoryProjectionFinite(in.SellFillRatePerHour) ||
+		!inventoryProjectionFinite(in.BuyFillProbability) ||
+		!inventoryProjectionFinite(in.SellFillProbability) ||
+		!inventoryProjectionFinite(in.BothFillProbability) ||
 		!inventoryProjectionFinite(in.ConfidenceZScore) ||
 		!inventoryProjectionFinite(in.TargetContraction) ||
 		!inventoryProjectionFinite(in.FastBuyRestraint) {
@@ -239,6 +250,14 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 
 	d.BuyFillProbability = horizonFillProbability(in.BuyFillRatePerHour, in.Horizon)
 	d.SellFillProbability = horizonFillProbability(in.SellFillRatePerHour, in.Horizon)
+	if in.DirectFillProbabilities {
+		d.BuyFillProbability = math.Max(0, math.Min(1, in.BuyFillProbability))
+		d.SellFillProbability = math.Max(0, math.Min(1, in.SellFillProbability))
+		lowerJoint := math.Max(0, d.BuyFillProbability+d.SellFillProbability-1)
+		upperJoint := math.Min(d.BuyFillProbability, d.SellFillProbability)
+		d.BothFillProbability = math.Max(lowerJoint, math.Min(upperJoint, in.BothFillProbability))
+		d.FillCovariance = d.BothFillProbability - d.BuyFillProbability*d.SellFillProbability
+	}
 	if d.BuyFillProbability <= 0 || d.SellFillProbability <= 0 {
 		d.Reason = "two-sided fill probabilities unavailable"
 		return d
@@ -308,7 +327,8 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 		buy := math.Max(minimumBuy, math.Min(maximumBuy, desiredBuy))
 		sell := gross - buy
 		expected := in.CurrentInventoryNotionalJPY + pBuy*buy - pSell*sell
-		variance := pBuy*(1-pBuy)*buy*buy + pSell*(1-pSell)*sell*sell
+		variance := pBuy*(1-pBuy)*buy*buy + pSell*(1-pSell)*sell*sell -
+			2*d.FillCovariance*buy*sell
 		stddev := math.Sqrt(math.Max(0, variance))
 
 		c.ProjectedGrossNotionalJPY = gross
@@ -322,28 +342,35 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 		c.TargetErrorJPY = expected - target
 		return c
 	}
-	feasible := func(c ProbabilityCenteredQuoteDecision) bool {
+	constraintViolation := func(c ProbabilityCenteredQuoteDecision) float64 {
 		const tolerance = 1e-7
 		if !c.Enabled ||
 			(c.BuyNotionalJPY > tolerance && c.BuyNotionalJPY+tolerance < minBuy) ||
 			(c.SellNotionalJPY > tolerance && c.SellNotionalJPY+tolerance < minSell) {
-			return false
+			return math.Inf(1)
 		}
 		currentError := math.Abs(in.CurrentInventoryNotionalJPY - target)
 		expectedError := math.Abs(c.ExpectedInventoryNotionalJPY - target)
 		softHalfWidth := math.Max(target-in.LowerInventoryNotionalJPY,
 			in.UpperInventoryNotionalJPY-target)
 		softHalfWidth = math.Max(0, softHalfWidth)
-		// Expected Macro error must not increase. Progress toward the target
-		// earns an equal amount of Bernoulli variance budget, while the soft
-		// stochastic band remains available even when inventory is on target:
+		// One coherent second-moment budget jointly controls mean displacement
+		// and Bernoulli fill variance:
 		// E[(N_T-M)^2] <= (N-M)^2 + (softWidth/z)^2.
+		// A separate |E[N_T]-M| <= |N-M| gate is intentionally absent: at the
+		// target, asymmetric arrivals plus exchange minimums would otherwise make
+		// every nonzero two-sided quote infeasible and activate an unmodelled
+		// fallback.
 		mseBudget := currentError*currentError + math.Pow(softHalfWidth/z, 2)
 		mse := expectedError*expectedError + c.InventoryVarianceJPY2
-		return expectedError <= currentError+tolerance &&
-			math.Abs(c.ExpectedInventoryNotionalJPY-d.DesiredInventoryNotionalJPY) <= softHalfWidth+tolerance &&
-			mse <= mseBudget+tolerance
+		notionalScale := math.Max(1, math.Max(currentError, softHalfWidth))
+		mseScale := math.Max(1, mseBudget)
+		return math.Max(
+			(math.Abs(c.ExpectedInventoryNotionalJPY-d.DesiredInventoryNotionalJPY)-softHalfWidth-tolerance)/notionalScale,
+			(mse-mseBudget-tolerance)/mseScale,
+		)
 	}
+	feasible := func(c ProbabilityCenteredQuoteDecision) bool { return constraintViolation(c) <= 0 }
 
 	// Apply the posterior restraint only after the coherent quantity split. The
 	// ask is deliberately unchanged: this is a restraint on adding exposure, not
@@ -370,7 +397,8 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 		expected := in.CurrentInventoryNotionalJPY +
 			pBuy*c.BuyNotionalJPY - pSell*c.SellNotionalJPY
 		variance := pBuy*(1-pBuy)*c.BuyNotionalJPY*c.BuyNotionalJPY +
-			pSell*(1-pSell)*c.SellNotionalJPY*c.SellNotionalJPY
+			pSell*(1-pSell)*c.SellNotionalJPY*c.SellNotionalJPY -
+			2*d.FillCovariance*c.BuyNotionalJPY*c.SellNotionalJPY
 		stddev := math.Sqrt(math.Max(0, variance))
 		c.ExpectedInventoryNotionalJPY = expected
 		c.InventoryVarianceJPY2 = variance
@@ -389,24 +417,60 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 	}
 
 	// Capacity clipping means feasibility need not begin at zero gross when the
-	// current inventory lies outside the soft band. Find the highest feasible
-	// interval with a bounded scan, then refine its upper edge. This is constant
-	// work per quote and does not touch historical data.
-	const scanSteps = 32
-	bestGross := 0.0
-	for i := 1; i <= scanSteps; i++ {
-		gross := maxGross * float64(i) / scanSteps
+	// current inventory lies outside the soft band. The former 32-point grid
+	// could skip a narrow interval near the exchange minimum. Minimize the
+	// continuous normalized violation, seed every capacity kink, then bisect the
+	// upper feasible boundary. Work remains constant per quote.
+	left := 0.0
+	if minBuy > 0 && minSell > 0 && maxBuy >= minBuy && maxSell >= minSell {
+		left = math.Min(maxGross, minBuy+minSell)
+	}
+	critical := []float64{
+		left, maxGross, minBuy, minSell, minBuy + minSell,
+		maxBuy, maxSell, maxBuy + minSell, maxSell + minBuy,
+	}
+	bestViolation := math.Inf(1)
+	bestGross := left
+	consider := func(gross float64) {
+		gross = math.Max(left, math.Min(maxGross, gross))
 		c := candidate(gross)
-		if feasible(c) && gross > bestGross {
-			best, bestGross = c, gross
+		violation := constraintViolation(c)
+		if violation < bestViolation || (violation == bestViolation && gross > bestGross) {
+			bestViolation, bestGross = violation, gross
+			if feasible(c) {
+				best = c
+			}
 		}
 	}
-	if !best.Enabled {
+	for _, gross := range critical {
+		consider(gross)
+	}
+	a, b := left, maxGross
+	const goldenRatio = 0.6180339887498948482
+	x1 := b - goldenRatio*(b-a)
+	x2 := a + goldenRatio*(b-a)
+	v1 := constraintViolation(candidate(x1))
+	v2 := constraintViolation(candidate(x2))
+	for i := 0; i < 48; i++ {
+		consider(x1)
+		consider(x2)
+		if v1 <= v2 {
+			b, x2, v2 = x2, x1, v1
+			x1 = b - goldenRatio*(b-a)
+			v1 = constraintViolation(candidate(x1))
+		} else {
+			a, x1, v1 = x1, x2, v2
+			x2 = a + goldenRatio*(b-a)
+			v2 = constraintViolation(candidate(x2))
+		}
+	}
+	consider((a + b) / 2)
+	if bestViolation > 0 || !best.Enabled {
 		d.Reason = "no feasible two-sided macro contraction"
 		return d
 	}
-	low, high := bestGross, math.Min(maxGross, bestGross+maxGross/scanSteps)
-	for i := 0; i < 16; i++ {
+	low, high := bestGross, maxGross
+	for i := 0; i < 48; i++ {
 		mid := (low + high) / 2
 		c := candidate(mid)
 		if feasible(c) {

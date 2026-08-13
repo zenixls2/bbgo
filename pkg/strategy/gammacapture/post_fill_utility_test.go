@@ -38,8 +38,8 @@ func TestPostFillUtilityAllowsStatisticallySupportedNegativeCycleEdge(t *testing
 	cfg := MarketMakerConfig{
 		MakerFeeBps: 10, AdverseSelectionBps: 2, MinimumNetEdgeBps: 2,
 		MinimumHalfSpreadBps: 15, MaximumHalfSpreadBps: 80,
-		InventoryMaxOrderLevels: 6, HorizonMinSamples: 6,
-		PostFillUtility: PostFillUtilityConfig{Enabled: true, MinimumSamples: 6, ConfidenceZScore: 1.0},
+		HorizonMinSamples: 6,
+		PostFillUtility:   PostFillUtilityConfig{Enabled: true, MinimumSamples: 6, ConfidenceZScore: 1.0, CandidateCount: 6},
 	}
 	decision := cfg.ApplyPostFillUtility(&model, PostFillUtilityInput{
 		Now: now, Fill: MakerPostFillState{Side: types.SideTypeSell, Price: plan.BidPrice * 0.99, Quantity: 1, At: now.Add(-time.Second)},
@@ -72,8 +72,8 @@ func TestPostFillUtilityRejectsAdverseBuyAfterTouch(t *testing.T) {
 	cfg := MarketMakerConfig{
 		MakerFeeBps: 10, AdverseSelectionBps: 2, MinimumNetEdgeBps: 2,
 		MinimumHalfSpreadBps: 15, MaximumHalfSpreadBps: 80,
-		InventoryMaxOrderLevels: 6, HorizonMinSamples: 6,
-		PostFillUtility: PostFillUtilityConfig{Enabled: true, MinimumSamples: 6, ConfidenceZScore: 1.0},
+		HorizonMinSamples: 6,
+		PostFillUtility:   PostFillUtilityConfig{Enabled: true, MinimumSamples: 6, ConfidenceZScore: 1.0, CandidateCount: 6},
 	}
 	decision := cfg.ApplyPostFillUtility(&model, PostFillUtilityInput{
 		Now: now, Fill: MakerPostFillState{Side: types.SideTypeSell, Price: ask, Quantity: 1, At: now.Add(-time.Second)},
@@ -102,5 +102,23 @@ func TestPostFillInventoryRiskBenefitChangesSignAtTarget(t *testing.T) {
 	base.InventoryBase = 60
 	if got := postFillInventoryRiskBenefitBps(types.SideTypeBuy, base); got >= 0 {
 		t.Fatalf("buy away from target should increase inventory risk, got %f", got)
+	}
+}
+
+func TestPostFillInventoryRiskBenefitUsesMarginalExecutableFill(t *testing.T) {
+	in := PostFillUtilityInput{
+		Mid: 298_000, PairEquityJPY: 6_835, ExpectedFillNotionalJPY: 102.6,
+		Horizon: 30 * time.Minute, VolatilityBpsPerSqrtSec: 0.4, RiskAversion: 1,
+		InventoryBase: 0.01092201, InventoryTargetBase: 0.5 * 6_835 / 298_000,
+	}
+	if got := postFillInventoryRiskBenefitBps(types.SideTypeBuy, in); got <= 0 {
+		t.Fatalf("one executable BUY toward the target must have positive risk benefit, got %f", got)
+	}
+	// The old call site passed the entire dynamic risk budget. Here that is
+	// larger than pair equity, clips the hypothetical fill to 100% weight, and
+	// gives the opposite answer despite the actual order being one small cell.
+	in.ExpectedFillNotionalJPY = 8_939
+	if got := postFillInventoryRiskBenefitBps(types.SideTypeBuy, in); got >= 0 {
+		t.Fatalf("oversized whole-budget hypothetical should expose the old sign reversal, got %f", got)
 	}
 }

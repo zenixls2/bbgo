@@ -6,11 +6,15 @@ import (
 )
 
 type jointPathPayoffMoments struct {
-	BuyMeanBps  float64
-	SellMeanBps float64
-	BuyVarBps2  float64
-	SellVarBps2 float64
-	CovBps2     float64
+	BuyMeanBps           float64
+	SellMeanBps          float64
+	InventoryMeanBps     float64
+	BuyVarBps2           float64
+	SellVarBps2          float64
+	InventoryVarBps2     float64
+	CovBps2              float64
+	InventoryBuyCovBps2  float64
+	InventorySellCovBps2 float64
 }
 
 type JointPathPayoffStats struct {
@@ -20,22 +24,31 @@ type JointPathPayoffStats struct {
 }
 
 type JointPathPayoffDecision struct {
-	ExpectedPnLJPY      float64
-	StdErrorJPY         float64
-	LowerPnLJPY         float64
-	KellyPenaltyJPY     float64
-	CertaintyEquivalent float64
+	ExpectedPnLJPY                  float64
+	StdErrorJPY                     float64
+	LowerPnLJPY                     float64
+	ExistingInventoryExpectedPnLJPY float64
+	BaselineVarianceJPY2            float64
+	WholePositionVarianceJPY2       float64
+	MarginalVarianceJPY2            float64
+	InventoryOrderCovarianceJPY2    float64
+	KellyPenaltyJPY                 float64
+	CertaintyEquivalent             float64
+	RiskReducing                    bool
 }
 
 type weightedJointMoments struct {
 	weight, weightSquared float64
-	buy, sell             float64
+	buy, sell, inventory  float64
 	buySquared            float64
 	sellSquared           float64
+	inventorySquared      float64
 	buySell               float64
+	inventoryBuy          float64
+	inventorySell         float64
 }
 
-func (m *weightedJointMoments) add(weight, buy, sell float64) {
+func (m *weightedJointMoments) add(weight, buy, sell, inventory float64) {
 	if weight <= 0 {
 		return
 	}
@@ -43,16 +56,20 @@ func (m *weightedJointMoments) add(weight, buy, sell float64) {
 	m.weightSquared += weight * weight
 	m.buy += weight * buy
 	m.sell += weight * sell
+	m.inventory += weight * inventory
 	m.buySquared += weight * buy * buy
 	m.sellSquared += weight * sell * sell
+	m.inventorySquared += weight * inventory * inventory
 	m.buySell += weight * buy * sell
+	m.inventoryBuy += weight * inventory * buy
+	m.inventorySell += weight * inventory * sell
 }
 
 func (m weightedJointMoments) result() (jointPathPayoffMoments, float64) {
 	if m.weight <= 0 {
 		return jointPathPayoffMoments{}, 0
 	}
-	buyMean, sellMean := m.buy/m.weight, m.sell/m.weight
+	buyMean, sellMean, inventoryMean := m.buy/m.weight, m.sell/m.weight, m.inventory/m.weight
 	effective := m.weight
 	if m.weightSquared > 0 {
 		effective = math.Min(effective, m.weight*m.weight/m.weightSquared)
@@ -65,13 +82,18 @@ func (m weightedJointMoments) result() (jointPathPayoffMoments, float64) {
 		varianceCorrection = effective / (effective - 1)
 	}
 	out := jointPathPayoffMoments{
-		BuyMeanBps:  buyMean,
-		SellMeanBps: sellMean,
+		BuyMeanBps:       buyMean,
+		SellMeanBps:      sellMean,
+		InventoryMeanBps: inventoryMean,
 		BuyVarBps2: math.Max(0,
 			(m.buySquared/m.weight-buyMean*buyMean)*varianceCorrection),
 		SellVarBps2: math.Max(0,
 			(m.sellSquared/m.weight-sellMean*sellMean)*varianceCorrection),
-		CovBps2: (m.buySell/m.weight - buyMean*sellMean) * varianceCorrection,
+		InventoryVarBps2: math.Max(0,
+			(m.inventorySquared/m.weight-inventoryMean*inventoryMean)*varianceCorrection),
+		CovBps2:              (m.buySell/m.weight - buyMean*sellMean) * varianceCorrection,
+		InventoryBuyCovBps2:  (m.inventoryBuy/m.weight - inventoryMean*buyMean) * varianceCorrection,
+		InventorySellCovBps2: (m.inventorySell/m.weight - inventoryMean*sellMean) * varianceCorrection,
 	}
 	return out, effective
 }
@@ -137,6 +159,8 @@ func (m *MarketMakerHorizonModel) JointPathPayoffStatistics(
 		}
 		buyTouched := exposure.BuyExcursionBps >= buyDistanceBps
 		sellTouched := exposure.SellExcursionBps >= sellDistanceBps
+		startMid := math.Sqrt(exposure.StartBid * exposure.StartAsk)
+		inventoryReturnBps := math.Log(exposure.TerminalBid/startMid) * 10_000
 		bidQuote := exposure.StartAsk * math.Exp(-buyDistanceBps/10_000)
 		askQuote := exposure.StartBid * math.Exp(sellDistanceBps/10_000)
 		buySingleBps, sellSingleBps := 0.0, 0.0
@@ -165,8 +189,8 @@ func (m *MarketMakerHorizonModel) JointPathPayoffStatistics(
 		case sellTouched:
 			buyDomSell, sellDomSell = sellSingleBps, sellSingleBps
 		}
-		buyDominant.add(weight, buyDomBuy, buyDomSell)
-		sellDominant.add(weight, sellDomBuy, sellDomSell)
+		buyDominant.add(weight, buyDomBuy, buyDomSell, inventoryReturnBps)
+		sellDominant.add(weight, sellDomBuy, sellDomSell, inventoryReturnBps)
 		lastExposure = exposure.At
 		if exposure.NextMinute <= index {
 			break
@@ -182,18 +206,30 @@ func (m *MarketMakerHorizonModel) JointPathPayoffStatistics(
 	}
 }
 
-// Evaluate returns a confidence-adjusted fractional-Kelly certainty
-// equivalent in JPY for one holding window:
-//
-// CE = E[PnL] - z*SE[PnL] - gamma*Var(PnL)/(2*equity).
-//
-// The last term is the second-order log-wealth penalty. It is quadratic in
-// deployed quantity, so unlike a linear expected-edge objective it can choose
-// an interior capital allocation rather than always zero or the hard maximum.
+// Evaluate preserves the incremental-order API for callers that do not own inventory.
 func (s JointPathPayoffStats) Evaluate(
 	buyNotionalJPY, sellNotionalJPY, pairEquityJPY, riskAversion, zScore float64,
 ) JointPathPayoffDecision {
-	if buyNotionalJPY < 0 || sellNotionalJPY < 0 ||
+	return s.EvaluateWholePosition(
+		0, buyNotionalJPY, sellNotionalJPY,
+		pairEquityJPY, riskAversion, zScore)
+}
+
+// EvaluateWholePosition compares a candidate quote with leaving the current
+// inventory unchanged over the same completed terminal paths. Existing PnL is
+// common to both choices and is not counted as new alpha, but its covariance
+// with the candidate is decision-relevant:
+//
+//	Delta Var(W) = Var(Delta W) + 2 Cov(W_inventory, Delta W).
+//
+// A risk-reducing SELL may therefore receive a negative Kelly penalty, while
+// a BUY that compounds downside exposure is restrained. Average cost is
+// intentionally absent: it is an accounting state, not a return forecast.
+func (s JointPathPayoffStats) EvaluateWholePosition(
+	currentInventoryNotionalJPY, buyNotionalJPY, sellNotionalJPY,
+	pairEquityJPY, riskAversion, zScore float64,
+) JointPathPayoffDecision {
+	if currentInventoryNotionalJPY < 0 || buyNotionalJPY < 0 || sellNotionalJPY < 0 ||
 		pairEquityJPY <= 0 || s.EffectiveSamples <= 0 {
 		return JointPathPayoffDecision{}
 	}
@@ -203,18 +239,32 @@ func (s JointPathPayoffStats) Evaluate(
 	}
 	meanJPY := (buyNotionalJPY*moments.BuyMeanBps +
 		sellNotionalJPY*moments.SellMeanBps) / 10_000
-	varianceJPY2 := (buyNotionalJPY*buyNotionalJPY*moments.BuyVarBps2 +
+	incrementalVarianceJPY2 := (buyNotionalJPY*buyNotionalJPY*moments.BuyVarBps2 +
 		sellNotionalJPY*sellNotionalJPY*moments.SellVarBps2 +
 		2*buyNotionalJPY*sellNotionalJPY*moments.CovBps2) / 100_000_000
-	varianceJPY2 = math.Max(0, varianceJPY2)
-	standardErrorJPY := math.Sqrt(varianceJPY2 / math.Max(1, s.EffectiveSamples))
+	incrementalVarianceJPY2 = math.Max(0, incrementalVarianceJPY2)
+	baselineVarianceJPY2 := currentInventoryNotionalJPY * currentInventoryNotionalJPY *
+		moments.InventoryVarBps2 / 100_000_000
+	inventoryOrderCovarianceJPY2 := currentInventoryNotionalJPY *
+		(buyNotionalJPY*moments.InventoryBuyCovBps2 +
+			sellNotionalJPY*moments.InventorySellCovBps2) / 100_000_000
+	wholeVarianceJPY2 := math.Max(0, baselineVarianceJPY2+incrementalVarianceJPY2+
+		2*inventoryOrderCovarianceJPY2)
+	marginalVarianceJPY2 := wholeVarianceJPY2 - baselineVarianceJPY2
+	standardErrorJPY := math.Sqrt(incrementalVarianceJPY2 / math.Max(1, s.EffectiveSamples))
 	lower := meanJPY - math.Max(0, zScore)*standardErrorJPY
-	kellyPenalty := math.Max(0, riskAversion) * varianceJPY2 / (2 * pairEquityJPY)
+	kellyPenalty := math.Max(0, riskAversion) * marginalVarianceJPY2 / (2 * pairEquityJPY)
 	return JointPathPayoffDecision{
-		ExpectedPnLJPY:      meanJPY,
-		StdErrorJPY:         standardErrorJPY,
-		LowerPnLJPY:         lower,
-		KellyPenaltyJPY:     kellyPenalty,
-		CertaintyEquivalent: lower - kellyPenalty,
+		ExpectedPnLJPY:                  meanJPY,
+		StdErrorJPY:                     standardErrorJPY,
+		LowerPnLJPY:                     lower,
+		ExistingInventoryExpectedPnLJPY: currentInventoryNotionalJPY * moments.InventoryMeanBps / 10_000,
+		BaselineVarianceJPY2:            baselineVarianceJPY2,
+		WholePositionVarianceJPY2:       wholeVarianceJPY2,
+		MarginalVarianceJPY2:            marginalVarianceJPY2,
+		InventoryOrderCovarianceJPY2:    inventoryOrderCovarianceJPY2,
+		KellyPenaltyJPY:                 kellyPenalty,
+		CertaintyEquivalent:             lower - kellyPenalty,
+		RiskReducing:                    marginalVarianceJPY2 < -1e-12,
 	}
 }

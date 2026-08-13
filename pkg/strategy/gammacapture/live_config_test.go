@@ -1,6 +1,7 @@
 package gammacapture
 
 import (
+	"math"
 	"os"
 	"testing"
 
@@ -35,17 +36,24 @@ func TestLiveETHJPYConfigDecodesInventoryControllers(t *testing.T) {
 	if err := strategy.Validate(); err != nil {
 		t.Fatalf("validate live ETHJPY strategy: %v", err)
 	}
-	if !strategy.MarketMaker.MacroInventory.Enabled {
-		t.Fatal("live ETHJPY config must enable Macro inventory decisions")
+	if strategy.MarketMaker.MacroInventory.Enabled {
+		t.Fatal("live ETHJPY config must not install a second Macro inventory target")
 	}
-	if !strategy.MarketMaker.MacroInventory.NoTradeRegion.Enabled {
-		t.Fatal("live ETHJPY config must enable the QV no-trade controller")
+	if !strategy.MarketMaker.ProbabilityCenteredQuantity.Enabled ||
+		!strategy.MarketMaker.JointDistanceQuantity.Enabled {
+		t.Fatal("live ETHJPY config must give Fast joint price/quantity ownership")
+	}
+	if !strategy.MarketMaker.PosteriorInventoryTarget {
+		t.Fatal("live ETHJPY config must enable posterior inventory targeting")
+	}
+	if !strategy.MarketMaker.BOCPD45.Enabled || strategy.MarketMaker.BOCPD45.Calibration != "platt" {
+		t.Fatalf("live ETHJPY config must enable strictly-prequential Platt BOCPD45: %+v", strategy.MarketMaker.BOCPD45)
+	}
+	if got := strategy.MarketMaker.EffectiveInventoryTargetRatio(); math.Abs(got-0.5) > 1e-12 {
+		t.Fatalf("Fast strategic inventory prior must remain 50%%, got %v", got)
 	}
 	if strategy.MarketMaker.MacroInventory.ReversalAccumulation.ActiveExecution.Enabled {
 		t.Fatal("live ETHJPY config must keep Macro active execution disabled")
-	}
-	if !strategy.MarketMaker.HawkesDirection.Enabled {
-		t.Fatal("live ETHJPY config must enable Hawkes direction")
 	}
 	if document.Sync == nil || document.Sync.UserDataStream == nil ||
 		!document.Sync.UserDataStream.Trades || !document.Sync.UserDataStream.Orders {

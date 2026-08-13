@@ -33,7 +33,10 @@ type macroReversalComparisonReport struct {
 }
 
 func replayCappedInventoryCapacity(modelCap, hardCap, minimum float64) float64 {
-	if hardCap <= 0 {
+	// Match live semantics: zero is an authoritative model rejection. A
+	// positive sub-minimum allocation may still be rounded to one executable
+	// unit when the hard inventory band can absorb it.
+	if modelCap <= 0 || hardCap <= 0 {
 		return 0
 	}
 	capacity := math.Min(math.Max(0, modelCap), hardCap)

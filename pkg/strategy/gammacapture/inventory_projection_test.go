@@ -10,7 +10,7 @@ func TestInventoryActuationUsesExpectedRegimeFillsAsEffectiveLevels(t *testing.T
 	d := InventoryActuation(InventoryActuationInput{
 		CurrentInventoryNotionalJPY: 3_000, TargetInventoryNotionalJPY: 4_500,
 		ExpectedFillNotionalJPY: 100, BuyFillRatePerHour: 0.25,
-		RegimeHorizon: 3 * time.Hour, MaximumOrderLevels: 6,
+		RegimeHorizon: 3 * time.Hour,
 	})
 	if !d.Enabled || d.Direction != 1 || d.EffectiveOrderLevels != 1 || d.TargetContraction != 1 {
 		t.Fatalf("sparse regime should use one reachable tranche: %+v", d)
@@ -22,10 +22,24 @@ func TestInventoryActuationUsesExpectedRegimeFillsAsEffectiveLevels(t *testing.T
 	d = InventoryActuation(InventoryActuationInput{
 		CurrentInventoryNotionalJPY: 3_000, TargetInventoryNotionalJPY: 4_500,
 		ExpectedFillNotionalJPY: 100, BuyFillRatePerHour: 4,
-		RegimeHorizon: 3 * time.Hour, MaximumOrderLevels: 6, MomentumSignal: 1,
+		RegimeHorizon: 3 * time.Hour, MomentumSignal: 1,
 	})
-	if math.Abs(d.EffectiveOrderLevels-6) > 1e-12 || math.Abs(d.TargetContraction-1.0/6) > 1e-12 {
-		t.Fatalf("liquid regime must retain configured risk cap: %+v", d)
+	if math.Abs(d.EffectiveOrderLevels-12) > 1e-12 || math.Abs(d.TargetContraction-1.0/12) > 1e-12 {
+		t.Fatalf("liquid regime must use its reachable executable fills: %+v", d)
+	}
+}
+
+func TestInventoryActuationCannotCreateSubMinimumCorrectionTranches(t *testing.T) {
+	d := InventoryActuation(InventoryActuationInput{
+		CurrentInventoryNotionalJPY: 3_000, TargetInventoryNotionalJPY: 3_250,
+		ExpectedFillNotionalJPY: 100, BuyFillRatePerHour: 4,
+		RegimeHorizon: 3 * time.Hour,
+	})
+	if !d.Enabled || math.Abs(d.RequiredCorrectionFills-2.5) > 1e-12 || math.Abs(d.EffectiveOrderLevels-2.5) > 1e-12 {
+		t.Fatalf("exchange-sized correction gap must cap reachable levels: %+v", d)
+	}
+	if perFillCorrection := 250 * d.TargetContraction; perFillCorrection+1e-12 < 100 {
+		t.Fatalf("actuation produced a sub-minimum correction tranche: %.6f", perFillCorrection)
 	}
 }
 
@@ -33,7 +47,7 @@ func TestInventoryActuationConvergesInExpectedRegimeFills(t *testing.T) {
 	d := InventoryActuation(InventoryActuationInput{
 		CurrentInventoryNotionalJPY: 3_000, TargetInventoryNotionalJPY: 4_000,
 		ExpectedFillNotionalJPY: 100, BuyFillRatePerHour: 1,
-		RegimeHorizon: 3 * time.Hour, MaximumOrderLevels: 6,
+		RegimeHorizon: 3 * time.Hour,
 	})
 	if !d.Enabled || math.Abs(d.EffectiveOrderLevels-3) > 1e-12 {
 		t.Fatalf("expected three reachable correction tranches: %+v", d)
@@ -49,7 +63,7 @@ func TestInventoryActuationFailsClosedWithoutCorrectiveArrivalRate(t *testing.T)
 	d := InventoryActuation(InventoryActuationInput{
 		CurrentInventoryNotionalJPY: 4_000, TargetInventoryNotionalJPY: 3_000,
 		ExpectedFillNotionalJPY: 100, BuyFillRatePerHour: 10, SellFillRatePerHour: 0,
-		RegimeHorizon: time.Hour, MaximumOrderLevels: 6, MomentumSignal: -1,
+		RegimeHorizon: time.Hour, MomentumSignal: -1,
 	})
 	if d.Enabled || d.Direction != -1 || d.Reason != "corrective arrival rate unavailable" {
 		t.Fatalf("sell correction must not borrow the unrelated buy arrival rate: %+v", d)
@@ -60,16 +74,13 @@ func TestInventoryActuationFailsClosedOnNonFiniteInputs(t *testing.T) {
 	cases := []InventoryActuationInput{
 		{CurrentInventoryNotionalJPY: 3_000, TargetInventoryNotionalJPY: 4_000,
 			ExpectedFillNotionalJPY: 100, BuyFillRatePerHour: math.NaN(),
-			RegimeHorizon: time.Hour, MaximumOrderLevels: 6},
+			RegimeHorizon: time.Hour},
 		{CurrentInventoryNotionalJPY: 3_000, TargetInventoryNotionalJPY: 4_000,
 			ExpectedFillNotionalJPY: 100, BuyFillRatePerHour: math.Inf(1),
-			RegimeHorizon: time.Hour, MaximumOrderLevels: 6},
+			RegimeHorizon: time.Hour},
 		{CurrentInventoryNotionalJPY: 3_000, TargetInventoryNotionalJPY: 4_000,
 			ExpectedFillNotionalJPY: math.NaN(), BuyFillRatePerHour: 1,
-			RegimeHorizon: time.Hour, MaximumOrderLevels: 6},
-		{CurrentInventoryNotionalJPY: 3_000, TargetInventoryNotionalJPY: 4_000,
-			ExpectedFillNotionalJPY: 100, BuyFillRatePerHour: 1,
-			RegimeHorizon: time.Hour, MaximumOrderLevels: math.NaN()},
+			RegimeHorizon: time.Hour},
 	}
 	for i, in := range cases {
 		d := InventoryActuation(in)
@@ -83,7 +94,7 @@ func TestInventoryActuationMomentumIsPosteriorAlignmentProbability(t *testing.T)
 	base := InventoryActuationInput{
 		CurrentInventoryNotionalJPY: 3_000, TargetInventoryNotionalJPY: 4_000,
 		ExpectedFillNotionalJPY: 100, BuyFillRatePerHour: 1,
-		RegimeHorizon: time.Hour, MaximumOrderLevels: 6,
+		RegimeHorizon: time.Hour,
 	}
 	base.MomentumSignal = -1
 	adverse := InventoryActuation(base)
@@ -200,6 +211,13 @@ func TestProbabilityCenteredQuoteFindsNarrowMinimumOrderFeasibleRegion(t *testin
 	}
 	if d.ProjectedGrossNotionalJPY < 200 || d.ProjectedGrossNotionalJPY > 230 {
 		t.Fatalf("unexpected narrow-region upper boundary: %+v", d)
+	}
+}
+
+func TestProbabilityCenteredTargetGrossIsNonMinimumAndNonAllIn(t *testing.T) {
+	gross := probabilityCenteredTargetGross(2_400, 2_650, 0.25, 0.20, 100, 100, 3_000, 2_400)
+	if math.Abs(gross-1_180) > 1e-9 {
+		t.Fatalf("target correction should use 1,080 BUY + 100 SELL, got gross %v", gross)
 	}
 }
 
@@ -345,7 +363,20 @@ func TestProbabilityCenteredQuoteBearishRestraintDoesNotForceSell(t *testing.T) 
 	}
 	if restrained.DesiredInventoryNotionalJPY != unrestrained.DesiredInventoryNotionalJPY ||
 		restrained.TargetContraction != unrestrained.TargetContraction {
-		t.Fatalf("bearish BUY restraint must not rewrite Macro target: unrestrained=%+v restrained=%+v", unrestrained, restrained)
+		t.Fatalf("bearish BUY restraint must not rewrite unified target: unrestrained=%+v restrained=%+v", unrestrained, restrained)
+	}
+
+	base.FastBuyRestraint = 0
+	base.FastSellRestraint = 0.5
+	bullish := ProbabilityCenteredQuoteNotionals(base)
+	if !bullish.Enabled {
+		t.Fatalf("expected enabled bullish projection: %+v", bullish)
+	}
+	if math.Abs(bullish.SellNotionalJPY-unrestrained.SellNotionalJPY*0.5) > 1e-7 {
+		t.Fatalf("SELL was not attenuated continuously: unrestrained=%+v bullish=%+v", unrestrained, bullish)
+	}
+	if math.Abs(bullish.BuyNotionalJPY-unrestrained.BuyNotionalJPY) > 1e-7 {
+		t.Fatalf("bullish SELL restraint must not enlarge BUY: unrestrained=%+v bullish=%+v", unrestrained, bullish)
 	}
 }
 
@@ -445,5 +476,120 @@ func TestProbabilityCenteredQuoteJointCovarianceChangesRiskCapacity(t *testing.T
 			positiveDecision.ProjectedGrossNotionalJPY,
 			independentDecision.ProjectedGrossNotionalJPY,
 			negativeDecision.ProjectedGrossNotionalJPY)
+	}
+}
+func TestExposureUtilizationQuoteSizingUsesRiskMultiplier(t *testing.T) {
+	d := ExposureUtilizationQuoteSizing(ExposureUtilizationSizingInput{
+		ExecutableUnitJPY:                 100,
+		RiskSizedNotionalJPY:              1_000,
+		PairEquityJPY:                     10_000,
+		CurrentInventoryNotionalJPY:       4_000,
+		HardLowerInventoryNotionalJPY:     1_000,
+		HardUpperInventoryNotionalJPY:     8_000,
+		AvailableBuyCapitalJPY:            6_000,
+		AvailableSellInventoryNotionalJPY: 4_000,
+	})
+	if !d.Enabled || math.Abs(d.RiskMultiplier-10) > 1e-12 ||
+		math.Abs(d.BuyMultiplier-10) > 1e-12 ||
+		math.Abs(d.SellMultiplier-10) > 1e-12 {
+		t.Fatalf("risk capacity should scale the executable unit on both sides: %+v", d)
+	}
+	if math.Abs(d.GrossUtilizationRatio-0.2) > 1e-12 {
+		t.Fatalf("unexpected gross capital utilization: %+v", d)
+	}
+}
+
+func TestExposureUtilizationQuoteSizingUsesSideExposureHeadroom(t *testing.T) {
+	d := ExposureUtilizationQuoteSizing(ExposureUtilizationSizingInput{
+		ExecutableUnitJPY:                 100,
+		RiskSizedNotionalJPY:              1_000,
+		PairEquityJPY:                     10_000,
+		CurrentInventoryNotionalJPY:       7_900,
+		HardLowerInventoryNotionalJPY:     1_000,
+		HardUpperInventoryNotionalJPY:     8_000,
+		AvailableBuyCapitalJPY:            2_100,
+		AvailableSellInventoryNotionalJPY: 7_900,
+	})
+	if math.Abs(d.BuyMultiplier-1) > 1e-12 || math.Abs(d.SellMultiplier-10) > 1e-12 {
+		t.Fatalf("upper exposure must reduce only BUY capacity: %+v", d)
+	}
+	if math.Abs(d.CurrentExposureRatio-0.79) > 1e-12 ||
+		math.Abs(d.BuyHeadroomRatio-0.01) > 1e-12 {
+		t.Fatalf("unexpected exposure diagnostics: %+v", d)
+	}
+}
+
+func TestExposureUtilizationQuoteSizingUsesAvailableCapital(t *testing.T) {
+	d := ExposureUtilizationQuoteSizing(ExposureUtilizationSizingInput{
+		ExecutableUnitJPY:                 100,
+		RiskSizedNotionalJPY:              1_000,
+		PairEquityJPY:                     10_000,
+		CurrentInventoryNotionalJPY:       4_000,
+		HardLowerInventoryNotionalJPY:     1_000,
+		HardUpperInventoryNotionalJPY:     8_000,
+		AvailableBuyCapitalJPY:            250,
+		AvailableSellInventoryNotionalJPY: 600,
+	})
+	if math.Abs(d.BuyMultiplier-2.5) > 1e-12 ||
+		math.Abs(d.SellMultiplier-6) > 1e-12 {
+		t.Fatalf("available capital must cap each side independently: %+v", d)
+	}
+}
+
+// Fast retains its stochastic risk capacity without a completed-path posterior;
+// the Bernoulli quantity model, not an exchange-minimum fallback, allocates it.
+func TestFastQuantityCapacityKeepsUnifiedRiskSizingWithoutPathEvidence(t *testing.T) {
+	d := FastQuantityCapacity(ExposureUtilizationSizingInput{
+		ExecutableUnitJPY:                 153.40,
+		RiskSizedNotionalJPY:              2_733.20,
+		PairEquityJPY:                     6_855,
+		CurrentInventoryNotionalJPY:       3_500,
+		HardLowerInventoryNotionalJPY:     0,
+		HardUpperInventoryNotionalJPY:     6_855,
+		AvailableBuyCapitalJPY:            3_355,
+		AvailableSellInventoryNotionalJPY: 3_500,
+	})
+	if !d.Exposure.Enabled {
+		t.Fatalf("expected risk capacity, got %+v", d)
+	}
+	if math.Abs(d.BaselineBuyCapJPY-2_733.20) > 1e-9 ||
+		math.Abs(d.BaselineSellCapJPY-2_733.20) > 1e-9 {
+		t.Fatalf("Fast baseline must retain the whole-position risk feasible set: %+v", d)
+	}
+	if math.Abs(d.PathModelBuyCapJPY-2_733.20) > 1e-9 ||
+		math.Abs(d.PathModelSellCapJPY-2_733.20) > 1e-9 {
+		t.Fatalf("joint Fast posterior must retain the full risk feasible set: %+v", d)
+	}
+}
+
+func TestFastQuantityCapacityPreservesSideSpecificHardLimits(t *testing.T) {
+	d := FastQuantityCapacity(ExposureUtilizationSizingInput{
+		ExecutableUnitJPY:                 153.40,
+		RiskSizedNotionalJPY:              2_733.20,
+		PairEquityJPY:                     6_855,
+		CurrentInventoryNotionalJPY:       6_800,
+		HardLowerInventoryNotionalJPY:     0,
+		HardUpperInventoryNotionalJPY:     6_855,
+		AvailableBuyCapitalJPY:            55,
+		AvailableSellInventoryNotionalJPY: 6_800,
+	})
+	if math.Abs(d.BaselineBuyCapJPY-55) > 1e-9 ||
+		math.Abs(d.PathModelBuyCapJPY-55) > 1e-9 {
+		t.Fatalf("neither Fast feasible set may bypass BUY headroom: %+v", d)
+	}
+	if math.Abs(d.BaselineSellCapJPY-2_733.20) > 1e-9 ||
+		math.Abs(d.PathModelSellCapJPY-2_733.20) > 1e-9 {
+		t.Fatalf("both SELL paths must retain independently bounded risk capacity: %+v", d)
+	}
+}
+
+func TestSymmetricInventoryProjectionBoundsUsesNarrowerHardHeadroom(t *testing.T) {
+	lower, upper := SymmetricInventoryProjectionBounds(4_000, 1_000, 8_000)
+	if lower != 1_000 || upper != 7_000 {
+		t.Fatalf("asymmetric hard band must not lend upper capacity to the lower tail: lower=%f upper=%f", lower, upper)
+	}
+	lower, upper = SymmetricInventoryProjectionBounds(9_000, 1_000, 8_000)
+	if lower != 8_000 || upper != 8_000 {
+		t.Fatalf("out-of-band target must collapse at the nearest hard boundary: lower=%f upper=%f", lower, upper)
 	}
 }

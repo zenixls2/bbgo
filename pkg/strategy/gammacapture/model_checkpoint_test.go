@@ -65,6 +65,50 @@ func TestModelCheckpointRoundTripAndZeroDeltaWarmup(t *testing.T) {
 	}
 }
 
+func TestModelCheckpointRoundTripsFastDriftState(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 12, 1, 0, 0, 0, time.UTC)
+	window := 10 * time.Minute
+	first := newCheckpointTestStrategy(root)
+	first.MarketMaker.FastDrift.Enabled = true
+	first.State.LastReferenceTime = now.Add(-time.Minute)
+	first.State.Engine.Reset(100)
+	first.makerHorizonModel.fastDrift = map[time.Duration]*fastDriftRegression{
+		window: {
+			Samples: []fastDriftSample{{
+				At: now.Add(-window), Features: [fastDriftFeatureCount]float64{1, 0.4, -0.2},
+				AskReturnBps: 3.2, BidReturnBps: 3.0, CenterReturnBps: 3.1,
+				PredictedCenter: 2.7, PredictionReady: true,
+			}},
+			Anchor: &fastDriftAnchor{
+				At: now, MaturesAt: now.Add(window), StartBid: 99.9, StartAsk: 100.1,
+				Features:        [fastDriftFeatureCount]float64{1, -0.3, 0.5},
+				PredictedCenter: -1.4, PredictionReady: true,
+			},
+		},
+	}
+	if err := first.prepareModelCheckpoint(now); err != nil {
+		t.Fatal(err)
+	}
+	restarted := newCheckpointTestStrategy(root)
+	restarted.MarketMaker.FastDrift.Enabled = true
+	restarted.State = &State{
+		Engine: first.State.Engine, LastReferenceTime: first.State.LastReferenceTime,
+		ModelCheckpoint: first.State.ModelCheckpoint,
+	}
+	if _, restored, err := restarted.restoreModelCheckpoint(now); err != nil || !restored {
+		t.Fatalf("Fast drift checkpoint restore failed: restored=%v err=%v", restored, err)
+	}
+	model := restarted.makerHorizonModel.fastDrift[window]
+	if model == nil || len(model.Samples) != 1 || model.Anchor == nil {
+		t.Fatalf("Fast drift checkpoint state was lost: %+v", model)
+	}
+	if !model.Samples[0].PredictionReady || model.Samples[0].PredictedCenter != 2.7 ||
+		!model.Anchor.PredictionReady || model.Anchor.PredictedCenter != -1.4 {
+		t.Fatalf("Fast drift causal validation state changed: %+v", model)
+	}
+}
+
 func TestModelCheckpointRejectsChangedDataModel(t *testing.T) {
 	strategy := newCheckpointTestStrategy(t.TempDir())
 	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
@@ -105,7 +149,6 @@ func TestMakerStartupRestoresCheckpointWhenAggTradeWarmupDisabled(t *testing.T) 
 	first.AggTradeWarmup.Enabled = false
 	first.initializeAdaptiveFastModels()
 	first.makerExecutableCrossingModel = NewExecutableCrossingModel(first.Symbol, first.Barrier, first.Intensity)
-	first.makerHawkesDirectionModel = NewHawkesDirectionModel(first.MarketMaker.HawkesDirection)
 
 	config := first.MarketMaker
 	config.setDefaults()
@@ -150,7 +193,6 @@ func TestMakerStartupRestoresCheckpointWhenAggTradeWarmupDisabled(t *testing.T) 
 	restarted.State = &restoredState
 	restarted.initializeAdaptiveFastModels()
 	restarted.makerExecutableCrossingModel = NewExecutableCrossingModel(restarted.Symbol, restarted.Barrier, restarted.Intensity)
-	restarted.makerHawkesDirectionModel = NewHawkesDirectionModel(restarted.MarketMaker.HawkesDirection)
 	if err := restarted.restoreAndWarmMakerModelsFromBinanceCapture(t2.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}

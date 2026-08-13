@@ -22,7 +22,7 @@ func TestEffectiveInventoryRiskBudgetScalesWithPairEquity(t *testing.T) {
 func TestDynamicInventoryBandUsesPairCapital(t *testing.T) {
 	c := MarketMakerConfig{
 		QuoteNotional: 120, InventoryRiskBudgetJPY: 10, InventoryRiskBudgetRatio: 0.0025,
-		InventoryRiskZScore: 1.645, InventoryMaxOrderLevels: 32, InventoryTargetRatio: 0.5,
+		InventoryRiskZScore: 1.645, InventoryTargetRatio: 0.5,
 		InventoryCapitalMinRatio: 0.25, InventoryCapitalTargetRatio: 0.50, InventoryCapitalMaxRatio: 0.75,
 	}
 	band := c.DynamicInventoryBandWithCapital(12_200, 10, 10*time.Minute, 10_000)
@@ -95,6 +95,51 @@ func TestInventoryVariationHorizonTracksAdaptiveFastWindow(t *testing.T) {
 	}
 }
 
+func TestSelectInventoryControlKeepsMacroOutOfFastTradingZone(t *testing.T) {
+	fast := InventoryBand{MinInventory: 1, Target: 2, MaxInventory: 3}
+	macro := InventoryBand{MinInventory: 0, Target: 1.25, MaxInventory: 2.5}
+	inside := SelectInventoryControl(fast, macro, true, 0)
+	if !inside.FastTradingZone || inside.LongHorizonAdjustment ||
+		inside.Band.Target != fast.Target {
+		t.Fatalf("Macro replaced Fast inside its two-sided trading zone: %+v", inside)
+	}
+
+	bearishRegion := InventoryBand{MinInventory: 0.25, Target: 0.75, MaxInventory: 1.5}
+	projected := SelectInventoryControl(fast, bearishRegion, true, -1)
+	if projected.FastTradingZone || !projected.LongHorizonAdjustment ||
+		projected.Band.Target != bearishRegion.Target {
+		t.Fatalf("Fast target must strengthen to the active long-horizon boundary: %+v", projected)
+	}
+	if projected.Band.Target-projected.Band.MinInventory != fast.Target-fast.MinInventory ||
+		projected.Band.MaxInventory-projected.Band.Target != fast.MaxInventory-fast.Target {
+		t.Fatalf("long-horizon projection changed Fast risk-band widths: %+v", projected)
+	}
+}
+
+func TestSelectInventoryControlNeverWeakensFastCorrection(t *testing.T) {
+	fast := InventoryBand{MinInventory: 1, Target: 2, MaxInventory: 3}
+	weakBuy := InventoryBand{MinInventory: 0.5, Target: 1.5, MaxInventory: 2.5}
+	if got := SelectInventoryControl(fast, weakBuy, true, 1); got.LongHorizonAdjustment || got.Band.Target != fast.Target {
+		t.Fatalf("bullish Macro weakened Fast BUY correction: %+v", got)
+	}
+	weakSell := InventoryBand{MinInventory: 1.5, Target: 2.5, MaxInventory: 3.5}
+	if got := SelectInventoryControl(fast, weakSell, true, -1); got.LongHorizonAdjustment || got.Band.Target != fast.Target {
+		t.Fatalf("bearish Macro weakened Fast SELL correction: %+v", got)
+	}
+	strongBuy := InventoryBand{MinInventory: 2.5, Target: 3, MaxInventory: 3.5}
+	if got := SelectInventoryControl(fast, strongBuy, true, 1); !got.LongHorizonAdjustment || got.Band.Target != strongBuy.Target {
+		t.Fatalf("bullish boundary did not strengthen Fast BUY correction: %+v", got)
+	}
+}
+
+func TestSelectInventoryControlLeavesFastUntouchedWhenLongHorizonDisabled(t *testing.T) {
+	fast := InventoryBand{MinInventory: 1, Target: 2, MaxInventory: 3}
+	macro := InventoryBand{MinInventory: 3.5, Target: 4, MaxInventory: 4.5}
+	if got := SelectInventoryControl(fast, macro, false, -1); got.LongHorizonAdjustment || got.Band.Target != fast.Target {
+		t.Fatalf("disabled Macro must not replace Fast ownership: %+v", got)
+	}
+}
+
 func TestInventoryActuationHorizonUsesShortestCausalClock(t *testing.T) {
 	c := MarketMakerConfig{MinTradingWindow: types.Duration(10 * time.Minute)}
 	horizon, source := c.InventoryActuationHorizon(15*time.Minute, 3*time.Hour)
@@ -131,7 +176,7 @@ func TestProbabilisticInventoryVariationUsesOneFillBootstrapAndPolicyBoundary(t 
 func TestDynamicInventoryBandWithRuntimeBoundsPreservesExpectedTarget(t *testing.T) {
 	c := MarketMakerConfig{
 		QuoteNotional: 120, InventoryRiskBudgetJPY: 100,
-		InventoryRiskZScore: 1.645, InventoryMaxOrderLevels: 32,
+		InventoryRiskZScore:      1.645,
 		InventoryCapitalMinRatio: 0, InventoryCapitalTargetRatio: 0.5, InventoryCapitalMaxRatio: 1,
 	}
 	band := c.DynamicInventoryBandWithCapitalPolicyBounds(
@@ -241,6 +286,24 @@ func TestExchangeFeasibleInventoryCapsFloorSubMinimumTargetTranche(t *testing.T)
 	if !sellOK || sellQuantity.String() != "0.00035" {
 		t.Fatalf("sub-minimum SELL tranche should floor to an executable lattice quantity: capacity=%s quantity=%s ok=%v",
 			sellCapacity, sellQuantity, sellOK)
+	}
+}
+
+func TestExchangeFeasibleInventoryCapsPreserveAuthoritativeZero(t *testing.T) {
+	market := types.Market{
+		MinNotional: fixedpoint.MustNewFromString("100"),
+		MinQuantity: fixedpoint.MustNewFromString("0.00001"),
+		StepSize:    fixedpoint.MustNewFromString("0.00001"),
+		TickSize:    fixedpoint.MustNewFromString("1"),
+	}
+	price := fixedpoint.MustNewFromString("298000")
+	hardBuyCap := fixedpoint.MustNewFromString("1000")
+	hardSellCap := fixedpoint.MustNewFromString("0.01")
+	if got := makerBuyInventoryCapacity(market, price, fixedpoint.Zero, hardBuyCap); got.Sign() != 0 {
+		t.Fatalf("statistically rejected BUY must remain zero, got %s", got)
+	}
+	if got := makerSellInventoryCapacity(market, price, fixedpoint.Zero, hardSellCap); got.Sign() != 0 {
+		t.Fatalf("statistically rejected SELL must remain zero, got %s", got)
 	}
 }
 
@@ -462,7 +525,7 @@ func assertFixedpointEqual(t *testing.T, name string, got fixedpoint.Value, want
 func TestDynamicInventoryBandAllowsTargetAtMacroCap(t *testing.T) {
 	c := MarketMakerConfig{
 		QuoteNotional: 120, InventoryRiskBudgetJPY: 10, InventoryRiskBudgetRatio: 0.0025,
-		InventoryRiskZScore: 1.645, InventoryMaxOrderLevels: 32,
+		InventoryRiskZScore:      1.645,
 		InventoryCapitalMinRatio: 0, InventoryCapitalTargetRatio: 0.5, InventoryCapitalMaxRatio: 1,
 	}
 	band := c.DynamicInventoryBandWithCapitalPolicy(10_000, 0.5, 10*time.Minute, 10_000, 0.20, 0.20)

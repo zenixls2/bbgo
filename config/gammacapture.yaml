@@ -130,7 +130,6 @@ exchangeStrategies:
         inventoryRiskBudgetJPY: 10
         inventoryRiskBudgetRatio: 0.0025
         inventoryRiskZScore: 1.645
-        inventoryMaxOrderLevels: 32
         # Target-centered capital band: risk capacity is a half-width around
         # 50% SOL / 50% JPY, bounded by the configured minimum reserve and a 100% maximum.
         # Actual order quantities are additionally capped by remaining headroom.

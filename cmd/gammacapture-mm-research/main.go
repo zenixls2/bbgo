@@ -120,6 +120,11 @@ func main() {
 	macroReversalCompare := flag.Bool("macro-reversal-compare", false, "compare confirmed-only and early-sequential Macro reversal paths")
 	quantityProjectionCompare := flag.Bool("quantity-projection-compare", false, "compare staged and probability-centered quantity policies")
 	quantityProjectionCurrentOnly := flag.Bool("quantity-projection-current-only", false, "run only the current probability-centered policy")
+	posteriorBaseInventoryTarget := flag.Bool("posterior-base-inventory-target", false, "research-only choose Fast inventory target from the executable-bid terminal-return posterior")
+	enableFastDrift := flag.Bool("enable-fast-drift", false, "research-only enable endogenous causal Fast reservation-price drift")
+	enableBOCPD45Direction := flag.Bool("bocpd45-fast-direction", false, "research-only replace the retired 45-second Hawkes Fast-direction auxiliary with executable-BBO BOCPD")
+	bocpd45Calibration := flag.String("bocpd45-calibration", "platt", "research-only strictly-prequential BOCPD45 calibration: raw, platt, beta, or isotonic")
+	bocpd45SkillOnly := flag.Bool("bocpd45-skill-only", false, "research-only score 45-second executable-BBO BOCPD against a prequential climatology")
 	postFillUtilityCompare := flag.Bool("post-fill-utility-compare", false, "compare current policy with confidence-adjusted post-fill utility")
 	noTradeIOCCompare := flag.Bool("no-trade-ioc-compare", false, "comparison of trend/QV no-trade, legacy Macro, and bounded IOC")
 	trendQVOnly := flag.Bool("trend-qv-only", false, "with --no-trade-ioc-compare, run only trend-excursion+ioc and qv-only+ioc")
@@ -130,8 +135,6 @@ func main() {
 	holdProtectionOnly := flag.Bool("hold-protection-only", false, "with --no-trade-ioc-compare, compare QV no-trade with and without hold protection")
 	liveNoTradeToggleOnly := flag.Bool("live-no-trade-toggle-only", false, "with --no-trade-ioc-compare, compare current legacy maker with hold-protected no-trade maker")
 	fastOnlyFixedHalf := flag.Bool("fast-only-fixed-half", false, "with --no-trade-ioc-compare, run only Fast quoting around a fixed 50/50 inventory target with Macro and IOC disabled")
-	fastOnlyFixedHalfCompare := flag.Bool("fast-only-fixed-half-compare", false, "with --no-trade-ioc-compare, compare fixed-half fast with and without Hawkes")
-	multiscaleRegimeStudy := flag.Bool("multiscale-regime-study", false, "evaluate the standalone one-minute Bayesian regime model without Macro or order simulation")
 	multiscaleVarianceStudy := flag.Bool("multiscale-variance-study", false, "evaluate standalone side-specific online HAR variance forecasts without Macro or orders")
 	drawdownEProcessStudy := flag.Bool("drawdown-eprocess-study", false, "evaluate the standalone QV-time drawdown/recovery e-process without Macro or orders")
 	consolidationHazardStudy := flag.Bool("consolidation-hazard-study", false, "evaluate causal short-consolidation down/up competing risks without Macro or orders")
@@ -188,6 +191,9 @@ func main() {
 		DisableJointDistanceQuantity:  *disableJointDistanceQuantity,
 		ActivateJointDistanceQuantity: *activateJointDistanceQuantity,
 		JointDistanceCandidateCount:   *overrideJointDistanceCandidates,
+		EnableFastDrift:               *enableFastDrift,
+		EnableBOCPD45Direction:        *enableBOCPD45Direction,
+		BOCPD45Calibration:            string(parseBOCPD45CalibrationMethod(*bocpd45Calibration)),
 	}
 	if *cpuProfilePath != "" {
 		profileFile, err := os.Create(*cpuProfilePath)
@@ -259,18 +265,6 @@ func main() {
 		})
 		return
 	}
-	if *multiscaleRegimeStudy {
-		if *regimeHorizon <= 0 || *regimeAnchorStep < *regimeHorizon {
-			fatalf("regime horizon must be positive and anchor step must be at least the horizon")
-		}
-		runMultiscaleRegimeStudy(multiscaleRegimeStudyInput{
-			DataPath: *bboData, Symbol: *symbol, From: holdStart, To: holdEnd,
-			Horizon: *regimeHorizon, AnchorStep: *regimeAnchorStep,
-			RoundTripCostBps: 2 * *fee,
-			HazardMeans:      []time.Duration{time.Hour, 3 * time.Hour, 6 * time.Hour},
-		})
-		return
-	}
 	if *earlyBumpStudy {
 		testFrom := time.Time{}
 		if *earlyBumpTestFrom != "" {
@@ -324,10 +318,18 @@ func main() {
 			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
 			QueueMultiplier: *queueMultiplier, MaxDrawdownStopPct: *maxDrawdownStopPct,
 			ReplayCacheDir: *replayCacheDir, TrendQVOnly: *trendQVOnly,
-			ContinuationQVOnly: *continuationQVOnly, FastVarianceQVOnly: *fastVarianceQVOnly, ContinuationMixtureOnly: *continuationMixtureOnly, ContinuationMixtureQVOnly: *continuationMixtureQVOnly, HoldProtectionOnly: *holdProtectionOnly, LiveNoTradeToggleOnly: *liveNoTradeToggleOnly, FastOnlyFixedHalf: *fastOnlyFixedHalf, FastOnlyFixedHalfCompare: *fastOnlyFixedHalfCompare,
+			ContinuationQVOnly: *continuationQVOnly, FastVarianceQVOnly: *fastVarianceQVOnly, ContinuationMixtureOnly: *continuationMixtureOnly, ContinuationMixtureQVOnly: *continuationMixtureQVOnly, HoldProtectionOnly: *holdProtectionOnly, LiveNoTradeToggleOnly: *liveNoTradeToggleOnly, FastOnlyFixedHalf: *fastOnlyFixedHalf,
 		})
 		return
 	}
+	if *bocpd45SkillOnly {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--bocpd45-skill-only requires --replay-from and --replay-to")
+		}
+		runBOCPD45SkillStudy(*bboData, *symbol, parseTime(*replayFrom), parseTime(*replayTo))
+		return
+	}
+
 	if *postFillUtilityCompare {
 		if *replayFrom == "" || *replayTo == "" {
 			fatalf("--post-fill-utility-compare requires --replay-from and --replay-to")
@@ -343,6 +345,7 @@ func main() {
 	}
 
 	if *quantityProjectionCompare {
+		activeProductionReplayPosteriorBaseTarget = *posteriorBaseInventoryTarget
 		if *replayFrom == "" || *replayTo == "" {
 			fatalf("--quantity-projection-compare requires --replay-from and --replay-to")
 		}

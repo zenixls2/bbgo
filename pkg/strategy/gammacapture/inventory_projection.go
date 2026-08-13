@@ -27,14 +27,19 @@ type ProbabilityCenteredQuoteInput struct {
 	// DirectFillProbabilities identifies non-Poisson completed-window inputs.
 	// Zero is a valid measured probability, so an explicit switch is required.
 	DirectFillProbabilities bool
-	BuyFillProbability      float64
-	SellFillProbability     float64
-	BothFillProbability     float64
-	Horizon                 time.Duration
-	ConfidenceZScore        float64
-	// TargetContraction is the fraction of the current Macro target error that
-	// one fill should remove. Live trading uses one over the configured inventory
-	// order levels. The solver multiplies this by the corrective side's horizon
+	// FullRiskPromotion is set only by the terminal-path utility optimizer when
+	// confidence-supported evidence permits search beyond the target-sufficient
+	// baseline. Hard risk, inventory, and balance capacities still apply.
+	FullRiskPromotion   bool
+	BuyFillProbability  float64
+	SellFillProbability float64
+	BothFillProbability float64
+	Horizon             time.Duration
+	ConfidenceZScore    float64
+	// TargetContraction is the fraction of the current unified Fast target error that
+	// one fill should remove. Live trading derives it from the number of
+	// statistically reachable, exchange-sized correction fills. The solver
+	// multiplies this by the corrective side's horizon
 	// fill probability, preventing a low arrival probability from being inverted
 	// into an oversized resting order.
 	TargetContraction float64
@@ -42,6 +47,141 @@ type ProbabilityCenteredQuoteInput struct {
 	// only the BUY notional after the coherent bid/ask split; zero preserves
 	// legacy callers and one removes new BUY exposure.
 	FastBuyRestraint float64
+	// FastSellRestraint is symmetric bullish posterior strength. Both restraints
+	// preserve an executable opposite-side cell instead of creating the removed
+	// one-sided hard gate.
+	FastSellRestraint float64
+}
+
+// ExposureUtilizationSizingInput converts one exchange-executable notional
+// cell into side-specific risk capacity. RiskSizedNotionalJPY is the Fast
+// adverse-move budget before balances and inventory policy are applied.
+type ExposureUtilizationSizingInput struct {
+	ExecutableUnitJPY                 float64
+	RiskSizedNotionalJPY              float64
+	PairEquityJPY                     float64
+	CurrentInventoryNotionalJPY       float64
+	HardLowerInventoryNotionalJPY     float64
+	HardUpperInventoryNotionalJPY     float64
+	AvailableBuyCapitalJPY            float64
+	AvailableSellInventoryNotionalJPY float64
+}
+
+// ExposureUtilizationSizingDecision reports the dimensionless multiplier and
+// the resulting side capacities. A multiplier below one is retained rather
+// than rounded up: the exchange filter downstream decides whether the remaining
+// risk capacity can support an executable order.
+type ExposureUtilizationSizingDecision struct {
+	Enabled               bool
+	Reason                string
+	RiskMultiplier        float64
+	BuyMultiplier         float64
+	SellMultiplier        float64
+	BuyNotionalCapJPY     float64
+	SellNotionalCapJPY    float64
+	CurrentExposureRatio  float64
+	BuyHeadroomRatio      float64
+	SellHeadroomRatio     float64
+	GrossUtilizationRatio float64
+}
+
+// FastQuantityCapacityDecision gives the single Fast quantity controller a
+// common risk, inventory-headroom, and balance-backed feasible set. The
+// probability-only baseline risks one exchange-executable fill when completed
+// path payoffs are unidentifiable. Statistically supported path utility may
+// promote above that floor, bounded by the whole-position risk capacity. No
+// downstream module may exceed the selected hard capacity.
+type FastQuantityCapacityDecision struct {
+	Exposure            ExposureUtilizationSizingDecision
+	BaselineBuyCapJPY   float64
+	BaselineSellCapJPY  float64
+	PathModelBuyCapJPY  float64
+	PathModelSellCapJPY float64
+}
+
+// FastQuantityCapacity defines the feasible set for the unified Fast quantity
+// problem:
+//
+//	C_risk,s = min(Q_risk, H_s, B_s)
+//	C_baseline,s = min(q_min, C_risk,s), C_path,s = C_risk,s.
+//
+// This distinguishes a hard risk ceiling from the amount justified without an
+// identifiable terminal-path distribution.
+func FastQuantityCapacity(in ExposureUtilizationSizingInput) FastQuantityCapacityDecision {
+	exposure := ExposureUtilizationQuoteSizing(in)
+	return FastQuantityCapacityDecision{
+		Exposure:            exposure,
+		BaselineBuyCapJPY:   exposure.BuyNotionalCapJPY,
+		BaselineSellCapJPY:  exposure.SellNotionalCapJPY,
+		PathModelBuyCapJPY:  exposure.BuyNotionalCapJPY,
+		PathModelSellCapJPY: exposure.SellNotionalCapJPY,
+	}
+}
+
+// ExposureUtilizationQuoteSizing implements q_s=q0*m_s with
+//
+//	m_s = min(qRisk/q0, exposureHeadroom_s/q0, availableCapital_s/q0).
+//
+// The risk budget therefore chooses the desired scale while current exposure
+// and actually deployable capital provide independent, side-specific caps.
+// No configured order-level divisor or arbitrary maximum multiplier is used.
+func ExposureUtilizationQuoteSizing(in ExposureUtilizationSizingInput) ExposureUtilizationSizingDecision {
+	d := ExposureUtilizationSizingDecision{Reason: "invalid input"}
+	values := []float64{
+		in.ExecutableUnitJPY, in.RiskSizedNotionalJPY, in.PairEquityJPY,
+		in.CurrentInventoryNotionalJPY, in.HardLowerInventoryNotionalJPY,
+		in.HardUpperInventoryNotionalJPY, in.AvailableBuyCapitalJPY,
+		in.AvailableSellInventoryNotionalJPY,
+	}
+	for _, value := range values {
+		if !inventoryProjectionFinite(value) {
+			return d
+		}
+	}
+	if in.ExecutableUnitJPY <= 0 || in.RiskSizedNotionalJPY <= 0 ||
+		in.PairEquityJPY <= 0 ||
+		in.HardUpperInventoryNotionalJPY <= in.HardLowerInventoryNotionalJPY {
+		return d
+	}
+
+	current := in.CurrentInventoryNotionalJPY
+	buyHeadroom := math.Max(0, in.HardUpperInventoryNotionalJPY-current)
+	sellHeadroom := math.Max(0, current-in.HardLowerInventoryNotionalJPY)
+	buyCapital := math.Max(0, in.AvailableBuyCapitalJPY)
+	sellCapital := math.Max(0, in.AvailableSellInventoryNotionalJPY)
+
+	d.RiskMultiplier = in.RiskSizedNotionalJPY / in.ExecutableUnitJPY
+	d.BuyNotionalCapJPY = math.Min(in.RiskSizedNotionalJPY,
+		math.Min(buyHeadroom, buyCapital))
+	d.SellNotionalCapJPY = math.Min(in.RiskSizedNotionalJPY,
+		math.Min(sellHeadroom, sellCapital))
+	d.BuyMultiplier = d.BuyNotionalCapJPY / in.ExecutableUnitJPY
+	d.SellMultiplier = d.SellNotionalCapJPY / in.ExecutableUnitJPY
+	d.CurrentExposureRatio = current / in.PairEquityJPY
+	d.BuyHeadroomRatio = buyHeadroom / in.PairEquityJPY
+	d.SellHeadroomRatio = sellHeadroom / in.PairEquityJPY
+	d.GrossUtilizationRatio = (d.BuyNotionalCapJPY + d.SellNotionalCapJPY) / in.PairEquityJPY
+	d.Enabled = d.BuyNotionalCapJPY > 0 || d.SellNotionalCapJPY > 0
+	if d.Enabled {
+		d.Reason = "risk-exposure-capital minimum"
+	} else {
+		d.Reason = "no side capacity"
+	}
+	return d
+}
+
+// SymmetricInventoryProjectionBounds returns the widest target-centered
+// interval contained by the hard inventory band. The quantity solver uses one
+// second-moment radius, so asymmetric hard headroom must be reduced to its
+// narrower side instead of borrowing capacity from the wider side.
+func SymmetricInventoryProjectionBounds(target, hardLower, hardUpper float64) (lower, upper float64) {
+	if !inventoryProjectionFinite(target) || !inventoryProjectionFinite(hardLower) ||
+		!inventoryProjectionFinite(hardUpper) || hardUpper <= hardLower {
+		return target, target
+	}
+	center := math.Max(hardLower, math.Min(hardUpper, target))
+	halfWidth := math.Min(center-hardLower, hardUpper-center)
+	return center - halfWidth, center + halfWidth
 }
 
 // InventoryActuationInput describes the reachable-set problem between a Macro
@@ -55,7 +195,6 @@ type InventoryActuationInput struct {
 	BuyFillRatePerHour          float64
 	SellFillRatePerHour         float64
 	RegimeHorizon               time.Duration
-	MaximumOrderLevels          float64
 	MomentumSignal              float64
 }
 
@@ -92,16 +231,16 @@ type InventoryActuationDecision struct {
 // statistically reachable during the expected regime lifetime. If K=lambda*T
 // corrective fills are expected, splitting the error into K tranches gives an
 // expected inventory drift that closes one target error over T (before caps).
-// InventoryMaxOrderLevels remains an upper risk bound, not a fixed response
-// time. Price urgency is the unreachable fraction, weighted by the posterior
+// The required number of exchange-sized fills bounds the reachable fill count,
+// so a fixed configured divisor cannot create sub-minimum tranches. Price
+// urgency is the unreachable fraction, weighted by the posterior
 // probability that short-horizon momentum agrees with the correction.
 func InventoryActuation(in InventoryActuationInput) InventoryActuationDecision {
 	d := InventoryActuationDecision{Reason: "invalid input"}
 	errorJPY := in.TargetInventoryNotionalJPY - in.CurrentInventoryNotionalJPY
 	if math.IsNaN(errorJPY) || math.IsInf(errorJPY, 0) || math.Abs(errorJPY) <= 1e-9 ||
 		inventoryActuationFiniteNonNegative(in.ExpectedFillNotionalJPY) <= 0 ||
-		in.RegimeHorizon <= 0 || in.MaximumOrderLevels <= 0 ||
-		math.IsNaN(in.MaximumOrderLevels) || math.IsInf(in.MaximumOrderLevels, 0) {
+		in.RegimeHorizon <= 0 {
 		return d
 	}
 	if errorJPY > 0 {
@@ -120,9 +259,8 @@ func InventoryActuation(in InventoryActuationInput) InventoryActuationDecision {
 		d.Reason = "invalid actuation horizon"
 		return d
 	}
-	// A corrupted rate or an accidentally huge duration must not produce an
-	// infinite level count. Once the configured maximum is reached, larger
-	// expected fill counts have no further effect on the staged policy.
+	// A corrupted rate or accidentally huge duration must not produce an
+	// infinite level count.
 	d.ExpectedCorrectiveFills = d.CorrectiveFillRatePerHour * hours
 	if d.ExpectedCorrectiveFills <= 0 || math.IsNaN(d.ExpectedCorrectiveFills) || math.IsInf(d.ExpectedCorrectiveFills, 0) {
 		d.Reason = "invalid expected corrective fills"
@@ -134,7 +272,11 @@ func InventoryActuation(in InventoryActuationInput) InventoryActuationDecision {
 		d.Reason = "invalid required correction fills"
 		return d
 	}
-	d.EffectiveOrderLevels = math.Max(1, math.Min(in.MaximumOrderLevels, d.ExpectedCorrectiveFills))
+	// Never subdivide the correction into more pieces than the exchange-sized
+	// target gap can contain. This keeps every inferred tranche executable while
+	// allowing liquid regimes to stage genuinely larger corrections.
+	d.EffectiveOrderLevels = math.Max(1,
+		math.Min(d.RequiredCorrectionFills, d.ExpectedCorrectiveFills))
 	if math.IsNaN(d.EffectiveOrderLevels) || math.IsInf(d.EffectiveOrderLevels, 0) {
 		d.Reason = "invalid effective order levels"
 		return d
@@ -184,8 +326,8 @@ func InventoryTargetRealignmentRequired(currentTargetRatio, quotedTargetRatio, c
 //	Var[N_T] = pB(1-pB)B^2 + pS(1-pS)S^2.
 //
 // The solver preserves as much of Fast's requested gross B+S as fits the
-// available balances and the Macro confidence interval, while choosing the
-// split closest to the Macro expected target.
+// available balances and the unified Fast confidence interval, while choosing
+// the split closest to the unified Fast expected target.
 type ProbabilityCenteredQuoteDecision struct {
 	Enabled bool
 	Reason  string
@@ -210,6 +352,9 @@ type ProbabilityCenteredQuoteDecision struct {
 	FastBuyRestraint             float64
 	BuyRetention                 float64
 	UnrestrainedBuyNotionalJPY   float64
+	FastSellRestraint            float64
+	SellRetention                float64
+	UnrestrainedSellNotionalJPY  float64
 }
 
 func horizonFillProbability(ratePerHour float64, horizon time.Duration) float64 {
@@ -218,6 +363,29 @@ func horizonFillProbability(ratePerHour float64, horizon time.Duration) float64 
 	}
 	p := 1 - math.Exp(-ratePerHour*horizon.Hours())
 	return math.Max(0, math.Min(1, p))
+}
+
+// probabilityCenteredTargetGross is the smallest two-sided executable gross
+// that can deliver the requested expected inventory change. The baseline Fast
+// policy spends capacity on target correction, not merely because a wide hard
+// risk band exists. Terminal-path utility may promote above this baseline.
+func probabilityCenteredTargetGross(
+	current, desired, pBuy, pSell,
+	minBuy, minSell, maxBuy, maxSell float64,
+) float64 {
+	if minBuy <= 0 && minSell <= 0 {
+		return math.Max(0, maxBuy) + math.Max(0, maxSell)
+	}
+	buy := math.Min(maxBuy, minBuy)
+	sell := math.Min(maxSell, minSell)
+	delta := desired - current
+	baselineDelta := pBuy*buy - pSell*sell
+	if baselineDelta < delta && pBuy > 0 {
+		buy = math.Min(maxBuy, buy+(delta-baselineDelta)/pBuy)
+	} else if baselineDelta > delta && pSell > 0 {
+		sell = math.Min(maxSell, sell+(baselineDelta-delta)/pSell)
+	}
+	return math.Max(0, buy) + math.Max(0, sell)
 }
 
 // ProbabilityCenteredQuoteNotionals applies one coherent quantity model after
@@ -244,7 +412,8 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 		!inventoryProjectionFinite(in.BothFillProbability) ||
 		!inventoryProjectionFinite(in.ConfidenceZScore) ||
 		!inventoryProjectionFinite(in.TargetContraction) ||
-		!inventoryProjectionFinite(in.FastBuyRestraint) {
+		!inventoryProjectionFinite(in.FastBuyRestraint) ||
+		!inventoryProjectionFinite(in.FastSellRestraint) {
 		return d
 	}
 
@@ -299,6 +468,15 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 	d.TargetContraction = contraction
 	d.DesiredInventoryNotionalJPY = in.CurrentInventoryNotionalJPY +
 		contraction*(target-in.CurrentInventoryNotionalJPY)
+	if !in.FullRiskPromotion {
+		maxGross = math.Min(maxGross, probabilityCenteredTargetGross(
+			in.CurrentInventoryNotionalJPY, d.DesiredInventoryNotionalJPY,
+			d.BuyFillProbability, d.SellFillProbability,
+			minBuy, minSell, maxBuy, maxSell))
+	}
+	if maxGross <= 0 {
+		return ProbabilityCenteredQuoteDecision{Reason: "no target-correcting gross capacity"}
+	}
 	z := in.ConfidenceZScore
 	if z <= 0 {
 		z = 1.645
@@ -372,26 +550,32 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 	}
 	feasible := func(c ProbabilityCenteredQuoteDecision) bool { return constraintViolation(c) <= 0 }
 
-	// Apply the posterior restraint only after the coherent quantity split. The
-	// ask is deliberately unchanged: this is a restraint on adding exposure, not
-	// the removed legacy gate that forced one-sided inventory liquidation.
+	// Apply the directional posterior only after the coherent quantity split.
+	// It attenuates exposure-increasing BUYs in bearish states and inventory-
+	// reducing SELLs in bullish states. It does not restore the removed hard
+	// one-sided gate: an affordable executable cell remains on each side.
 	finalize := func(c ProbabilityCenteredQuoteDecision) ProbabilityCenteredQuoteDecision {
 		if !c.Enabled {
 			return c
 		}
-		restraint := math.Max(0, math.Min(1, in.FastBuyRestraint))
-		c.FastBuyRestraint = restraint
-		c.BuyRetention = 1 - restraint
+		buyRestraint := math.Max(0, math.Min(1, in.FastBuyRestraint))
+		sellRestraint := math.Max(0, math.Min(1, in.FastSellRestraint))
+		c.FastBuyRestraint = buyRestraint
+		c.FastSellRestraint = sellRestraint
+		c.BuyRetention = 1 - buyRestraint
+		c.SellRetention = 1 - sellRestraint
 		c.UnrestrainedBuyNotionalJPY = c.BuyNotionalJPY
-		if restraint <= 0 || c.BuyNotionalJPY <= 0 {
+		c.UnrestrainedSellNotionalJPY = c.SellNotionalJPY
+		if buyRestraint <= 0 && sellRestraint <= 0 {
 			return c
 		}
 		c.BuyNotionalJPY *= c.BuyRetention
-		// The posterior mapping is continuous; exchange minimums are discrete. A
-		// sub-minimum remainder is represented as no BUY rather than rounded up,
-		// which would erase strong bearish evidence.
 		if c.BuyNotionalJPY > 0 && c.BuyNotionalJPY+1e-9 < minBuy {
-			c.BuyNotionalJPY = 0
+			c.BuyNotionalJPY = minBuy
+		}
+		c.SellNotionalJPY *= c.SellRetention
+		if c.SellNotionalJPY > 0 && c.SellNotionalJPY+1e-9 < minSell {
+			c.SellNotionalJPY = minSell
 		}
 		c.ProjectedGrossNotionalJPY = c.BuyNotionalJPY + c.SellNotionalJPY
 		expected := in.CurrentInventoryNotionalJPY +
@@ -406,7 +590,7 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 		c.ConfidenceLowerNotionalJPY = expected - z*stddev
 		c.ConfidenceUpperNotionalJPY = expected + z*stddev
 		c.TargetErrorJPY = expected - target
-		c.Reason = "probability-centered+bearish-buy-restraint"
+		c.Reason = "probability-centered+directional-side-restraint"
 		return c
 	}
 

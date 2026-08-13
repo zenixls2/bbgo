@@ -11,6 +11,11 @@ import (
 // for hard carrying-loss and drawdown constraints.
 type NoTradeInventoryConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
+	// DownsideRiskControlEnabled keeps the risk-adjusted inventory aim
+	// independent from current holdings. The proportional-cost no-trade region
+	// then owns reductions in long spot exposure; hold protection continues to
+	// guard uncertain increases but cannot turn a risk target into w*=w.
+	DownsideRiskControlEnabled bool `json:"downsideRiskControlEnabled" yaml:"downsideRiskControlEnabled"`
 	// HoldProtectionEnabled blocks discretionary Macro movement unless the one-sided executable forecast lower bound clears round-trip cost.
 	HoldProtectionEnabled      bool    `json:"holdProtectionEnabled" yaml:"holdProtectionEnabled"`
 	HoldProtectionZScore       float64 `json:"holdProtectionZScore" yaml:"holdProtectionZScore"`
@@ -69,34 +74,40 @@ type NoTradeInventoryInput struct {
 // the target is the nearest boundary, which is the discrete maker-order
 // approximation of boundary-local-time reflection.
 type NoTradeInventoryDecision struct {
-	Enabled bool
-	Healthy bool
-	Reason  string
+	Enabled                    bool
+	DownsideRiskControlEnabled bool
+	Healthy                    bool
+	Reason                     string
 
-	PosteriorUpProbability     float64
-	MicroSignedDirection       float64
-	ExecutableSignedDirection  float64
-	SignedDirection            float64
-	DriftPerQV                 float64
-	QVRatePerSecond            float64
-	ForecastVariance           float64
-	BaseForecastVariance       float64
-	FastRiskForecastVariance   float64
-	FastRiskBaselineVariance   float64
-	FastRiskApplied            bool
-	FastRiskDenominatorScale   float64
-	FastRiskReentryCapApplied  bool
-	BaseAimRatio               float64
-	RiskAdjustedAimRatio       float64
-	ForecastObservation        time.Duration
-	ForecastReturn             float64
-	EffectivePriorStrength     float64
-	ContinuationMixtureApplied bool
-	ContinuationCapApplied     bool
-	ContinuationCapRatio       float64
-	ForecastReturnSE           float64
-	ForecastEdgeLowerBps       float64
-	HoldProtectionApplied      bool
+	PosteriorUpProbability       float64
+	MicroSignedDirection         float64
+	ExecutableSignedDirection    float64
+	SignedDirection              float64
+	DriftPerQV                   float64
+	QVRatePerSecond              float64
+	ForecastVariance             float64
+	BaseForecastVariance         float64
+	FastRiskForecastVariance     float64
+	FastRiskBaselineVariance     float64
+	FastRiskApplied              bool
+	FastRiskDenominatorScale     float64
+	FastRiskReentryCapApplied    bool
+	BaseAimRatio                 float64
+	RiskAdjustedAimRatio         float64
+	ForecastObservation          time.Duration
+	ForecastReturn               float64
+	EffectivePriorStrength       float64
+	ContinuationMixtureApplied   bool
+	ContinuationCapApplied       bool
+	ContinuationCapRatio         float64
+	ForecastReturnSE             float64
+	ForecastEdgeLowerBps         float64
+	HoldProtectionApplied        bool
+	HoldProtectionPreservesAim   bool
+	HoldProtectionEnabled        bool
+	HoldProtectionThresholdBps   float64
+	RiskReductionGrossUtilityBps float64
+	RiskReductionNetUtilityBps   float64
 
 	// RawAimRatio is the instantaneous Merton/QV-time observation. AimRatio is
 	// the causal, posterior-variance-filtered center used by live execution.
@@ -116,35 +127,40 @@ type NoTradeInventoryDecision struct {
 	TrendContinuation      TrendContinuationDecision
 }
 
-// FastBuyRestraintDecision projects the no-trade return posterior onto the
-// Fast quote horizon. It only attenuates new BUY quantity; it never changes the
-// inventory target, enlarges SELL quantity, or disables the bid through a
-// directional hard gate.
-type FastBuyRestraintDecision struct {
-	Enabled               bool
-	Reason                string
-	ForecastReturnBps     float64
-	ForecastReturnSEBps   float64
-	AdverseProbability    float64
-	ActivationProbability float64
-	Restraint             float64
-	BuyRetention          float64
+// FastReservationDecision projects the no-trade return posterior onto the
+// Fast quote horizon. It adds only signed long-horizon drift to Fast's unified
+// reservation price; it never changes the inventory target, gross risk budget,
+// quote quantity, or side gates.
+type FastReservationDecision struct {
+	Enabled                bool
+	Reason                 string
+	Direction              int
+	ForecastReturnBps      float64
+	ForecastReturnSEBps    float64
+	AdverseProbability     float64
+	DirectionalProbability float64
+	ActivationProbability  float64
+	Strength               float64
+	PathEfficiency         float64
+	ReservationShiftBps    float64
 }
 
-// FastBuyRestraint computes the posterior probability that executable return
-// over the Fast horizon is negative. Fast quote construction already charges
-// round-trip fees and adverse selection in its price edge; charging those costs
-// again here would double-count them. For a normal posterior,
-// pAdverse = P(R_H < 0). Restraint begins only when pAdverse exceeds 1/2:
+// FastReservation projects the signed executable-return posterior onto the
+// Fast horizon and adds it to Fast's existing reservation price,
 //
-//	restraint = max(0, 2*pAdverse-1), retention = 1-restraint.
+//	log(r/m) = eta*mu_H - gamma*sigma_H^2*(w-w*).
 //
-// Thus an uninformative posterior leaves Fast unchanged, while increasingly
-// bearish evidence reduces only the proposed BUY notional continuously. The
-// posterior-mean uncertainty scales linearly with the requested horizon because
-// it is uncertainty in estimated drift, not realized-price innovation.
-func (d NoTradeInventoryDecision) FastBuyRestraint(horizon time.Duration, confidenceZScore float64) FastBuyRestraintDecision {
-	r := FastBuyRestraintDecision{Reason: "posterior unavailable", BuyRetention: 1}
+// Quote already owns the second term, including current inventory and target.
+// This function supplies only eta*mu_H, preventing inventory risk from being
+// counted twice. eta is path efficiency (net log displacement over total log
+// variation), which tends to zero in a range without a fitted regime threshold.
+// Posterior confidence remains diagnostic rather than becoming a hard side gate.
+func (d NoTradeInventoryDecision) FastReservation(horizon time.Duration, confidenceZScore float64) FastReservationDecision {
+	r := FastReservationDecision{Reason: "posterior unavailable"}
+	if d.Direction != 0 {
+		r.Reason = "active no-trade boundary correction owns inventory adjustment"
+		return r
+	}
 	if !d.Enabled || !d.Healthy || horizon <= 0 || d.ForecastObservation <= 0 ||
 		d.ForecastReturnSE <= 0 || math.IsNaN(d.ForecastReturn) || math.IsInf(d.ForecastReturn, 0) ||
 		math.IsNaN(d.ForecastReturnSE) || math.IsInf(d.ForecastReturnSE, 0) {
@@ -156,9 +172,9 @@ func (d NoTradeInventoryDecision) FastBuyRestraint(horizon time.Duration, confid
 	if scale <= 0 || se <= 0 || math.IsNaN(se) || math.IsInf(se, 0) {
 		return r
 	}
-	z := -mean / se
-	adverseProbability := 0.5 * math.Erfc(-z/math.Sqrt2)
+	adverseProbability := 0.5 * math.Erfc(mean/(se*math.Sqrt2))
 	adverseProbability = clampRatio(adverseProbability, 0, 1)
+	directionalProbability := math.Max(adverseProbability, 1-adverseProbability)
 	zScore := confidenceZScore
 	if zScore <= 0 {
 		zScore = 1.6448536269514722
@@ -166,20 +182,155 @@ func (d NoTradeInventoryDecision) FastBuyRestraint(horizon time.Duration, confid
 	activationProbability := 0.5 * math.Erfc(-zScore/math.Sqrt2)
 	activationProbability = clampRatio(activationProbability, 0.5, 1-1e-9)
 	strength := math.Max(0, math.Min(1,
-		(adverseProbability-activationProbability)/(1-activationProbability)))
-	r.Enabled = strength > 0
+		(directionalProbability-activationProbability)/(1-activationProbability)))
+	pathEfficiency := 1.0
+	if d.TrendContinuation.Healthy {
+		pathEfficiency = 1 - clampRatio(d.TrendContinuation.ConsolidationScore, 0, 1)
+	}
+	r.Enabled = mean != 0 && pathEfficiency > 0
+	if mean > 0 {
+		r.Direction = 1
+	} else if mean < 0 {
+		r.Direction = -1
+	}
 	r.ForecastReturnBps = mean * 10_000
 	r.ForecastReturnSEBps = se * 10_000
 	r.AdverseProbability = adverseProbability
+	r.DirectionalProbability = directionalProbability
 	r.ActivationProbability = activationProbability
-	r.Restraint = strength
-	r.BuyRetention = 1 - strength
+	r.Strength = strength
+	r.PathEfficiency = pathEfficiency
 	if r.Enabled {
-		r.Reason = "bearish return posterior clears confidence threshold"
+		r.ReservationShiftBps = r.ForecastReturnBps * pathEfficiency
+		r.Reason = "signed posterior drift shifts the unified Fast reservation price"
 	} else {
-		r.Reason = "bearish return posterior below confidence threshold"
+		r.Reason = "posterior mean is neutral or path has no directional efficiency"
 	}
 	return r
+}
+
+// FastReservationRiskHorizon uses the causal horizon of the return posterior
+// that moves the reservation price. Public crossing intensity is deliberately
+// excluded: it is neither private fill intensity nor an identified liquidation
+// time, and shortening holding risk by its inverse would be a Poisson-style
+// assumption unsupported by the capture. The Fast horizon remains the fallback.
+func FastReservationRiskHorizon(fastHorizon, forecastHorizon time.Duration) time.Duration {
+	if forecastHorizon > 0 {
+		return forecastHorizon
+	}
+	if fastHorizon > 0 {
+		return fastHorizon
+	}
+	return 0
+}
+
+// ApplyFastReservationShift moves both Fast quotes by the signed posterior
+// drift. The inward target-side coordinate is projected onto current maker
+// touch; the opposite coordinate continues to express the common reservation.
+// Side gates, notionals and order lifetime remain exactly those chosen by Fast.
+func ApplyFastReservationShift(
+	plan MarketMakerQuotePlan, decision FastReservationDecision,
+	mid, bestBid, bestAsk float64,
+) MarketMakerQuotePlan {
+	if !decision.Enabled || decision.ReservationShiftBps == 0 ||
+		plan.BidPrice <= 0 || plan.AskPrice <= plan.BidPrice || mid <= 0 ||
+		bestBid <= 0 || bestAsk < bestBid {
+		return plan
+	}
+	scale := math.Exp(decision.ReservationShiftBps / 10_000)
+	adjustedBid := plan.BidPrice * scale
+	adjustedAsk := plan.AskPrice * scale
+	if decision.ReservationShiftBps > 0 {
+		adjustedBid = math.Min(bestBid, adjustedBid)
+	} else {
+		adjustedAsk = math.Max(bestAsk, adjustedAsk)
+	}
+	if adjustedBid <= 0 || adjustedAsk <= adjustedBid {
+		return plan
+	}
+	plan.BidPrice = adjustedBid
+	plan.AskPrice = adjustedAsk
+	plan.BidDistanceBps = math.Max(0, math.Log(mid/adjustedBid)*10_000)
+	plan.AskDistanceBps = math.Max(0, math.Log(adjustedAsk/mid)*10_000)
+	plan.BidHalfSpreadBps = plan.BidDistanceBps
+	plan.AskHalfSpreadBps = plan.AskDistanceBps
+	plan.HalfSpreadBps = math.Max(plan.BidHalfSpreadBps, plan.AskHalfSpreadBps)
+	plan.BidTouchDistanceBps, plan.AskTouchDistanceBps, _ =
+		MakerTouchDistances(bestBid, bestAsk, plan.BidPrice, plan.AskPrice)
+	return plan
+}
+
+type FastReservationUtilityDecision struct {
+	Applied             bool
+	Reason              string
+	EffectiveSamples    float64
+	ExpectedPnLJPY      float64
+	StdErrorJPY         float64
+	CertaintyEquivalent float64
+}
+
+// SelectFastReservationPlan applies signed drift only when one exchange-minimum
+// fill on its target side has positive mean and risk-adjusted terminal wealth.
+// Insufficient or rejected evidence returns base unchanged.
+func SelectFastReservationPlan(
+	model *MarketMakerHorizonModel,
+	config MarketMakerConfig,
+	now time.Time,
+	horizon time.Duration,
+	base MarketMakerQuotePlan,
+	decision FastReservationDecision,
+	mid, bestBid, bestAsk, executableUnitJPY, pairEquityJPY, riskAversion float64,
+) (MarketMakerQuotePlan, FastReservationUtilityDecision) {
+	u := FastReservationUtilityDecision{Reason: "signed reservation candidate unavailable"}
+	if !decision.Enabled || decision.ReservationShiftBps == 0 {
+		return base, u
+	}
+	candidate := ApplyFastReservationShift(base, decision, mid, bestBid, bestAsk)
+	if candidate.BidPrice == base.BidPrice && candidate.AskPrice == base.AskPrice {
+		u.Reason = "signed reservation candidate unchanged"
+		return base, u
+	}
+	if model == nil || now.IsZero() || horizon <= 0 || executableUnitJPY <= 0 || pairEquityJPY <= 0 {
+		u.Reason = "terminal path utility unavailable"
+		return base, u
+	}
+	stats := model.JointPathPayoffStatistics(
+		now, config, horizon, candidate.BidTouchDistanceBps, candidate.AskTouchDistanceBps)
+	u.EffectiveSamples = stats.EffectiveSamples
+	if stats.EffectiveSamples <= 1 {
+		u.Reason = "terminal path dispersion not identifiable"
+		return base, u
+	}
+	var payoff JointPathPayoffDecision
+	if decision.ReservationShiftBps > 0 {
+		payoff = stats.Evaluate(executableUnitJPY, 0, pairEquityJPY, riskAversion, 0)
+	} else {
+		payoff = stats.Evaluate(0, executableUnitJPY, pairEquityJPY, riskAversion, 0)
+	}
+	u.ExpectedPnLJPY = payoff.ExpectedPnLJPY
+	u.StdErrorJPY = payoff.StdErrorJPY
+	u.CertaintyEquivalent = payoff.CertaintyEquivalent
+	if payoff.ExpectedPnLJPY <= 0 || payoff.CertaintyEquivalent <= 0 {
+		u.Reason = "target-side terminal path utility is not positive"
+		return base, u
+	}
+	u.Applied = true
+	u.Reason = "signed reservation candidate has positive terminal path utility"
+	return candidate, u
+}
+
+// FastReservationRealignmentRequired reprices immediately only when an accepted
+// drift changes sign or grows by at least one exchange tick. A shrinking signal
+// keeps queue priority and waits for Fast's normal review window.
+func FastReservationRealignmentRequired(candidateBps, quotedBps, tickBps float64) bool {
+	if candidateBps == 0 || math.IsNaN(candidateBps) || math.IsInf(candidateBps, 0) {
+		return false
+	}
+	threshold := math.Max(1e-9, tickBps)
+	if candidateBps*quotedBps < 0 {
+		return math.Abs(candidateBps-quotedBps) > threshold
+	}
+	return math.Abs(candidateBps) > math.Abs(quotedBps)+threshold
 }
 
 func clampRatio(value, minimum, maximum float64) float64 {
@@ -210,8 +361,9 @@ func EvaluateNoTradeInventory(c NoTradeInventoryConfig, in NoTradeInventoryInput
 	current := clampRatio(in.CurrentRiskyWeight, minimum, maximum)
 	d := NoTradeInventoryDecision{
 		Enabled: c.Enabled, Reason: "disabled",
-		PosteriorUpProbability: 0.5,
-		AimRatio:               prior, LowerRatio: prior, UpperRatio: prior,
+		DownsideRiskControlEnabled: c.DownsideRiskControlEnabled,
+		PosteriorUpProbability:     0.5,
+		AimRatio:                   prior, LowerRatio: prior, UpperRatio: prior,
 		ExecutionTargetRatio:   current,
 		EffectivePriorStrength: in.PriorStrength,
 	}
@@ -273,7 +425,7 @@ func EvaluateNoTradeInventory(c NoTradeInventoryConfig, in NoTradeInventoryInput
 			(d.ForecastReturn+in.PriorStrength*prior)/baseDenominator,
 			minimum, maximum)
 	}
-	if d.SignedDirection == 0 {
+	if d.SignedDirection == 0 && !c.DownsideRiskControlEnabled {
 		// The robust posterior identified set contains zero. Without a confirmed
 		// directional premium, variance alone must widen the no-trade region, not
 		// silently drag the strategic allocation below its configured prior.
@@ -286,6 +438,10 @@ func EvaluateNoTradeInventory(c NoTradeInventoryConfig, in NoTradeInventoryInput
 			d.FastRiskReentryCapApplied = true
 		}
 	} else if denominator > 0 {
+		// This is the regularized Merton target. In downside-risk mode it also
+		// applies when the signed mean is zero: uncertainty lowers the optimal
+		// long-only exposure instead of being silently discarded. The
+		// proportional-cost boundary prevents variance noise from creating turnover.
 		d.AimRatio = clampRatio(
 			(d.ForecastReturn+in.PriorStrength*prior)/denominator,
 			minimum, maximum)
@@ -397,16 +553,23 @@ func applyNoTradeHoldProtection(d *NoTradeInventoryDecision, c NoTradeInventoryC
 	if d == nil || !c.HoldProtectionEnabled || !d.Healthy {
 		return
 	}
+	d.HoldProtectionEnabled = true
+	d.HoldProtectionPreservesAim = c.DownsideRiskControlEnabled
 	z := c.HoldProtectionZScore
 	if z <= 0 {
 		z = 1.6448536269514722
 	}
 	thresholdBps := 2*math.Max(0, in.OneWayCostBps) + math.Max(0, c.HoldProtectionMinEdgeBps)
+	d.HoldProtectionThresholdBps = thresholdBps
 	if d.ForecastReturnSE <= 0 {
 		// Missing uncertainty is not evidence of certainty.
 		d.ForecastEdgeLowerBps = -math.Inf(1)
 	} else {
 		d.ForecastEdgeLowerBps = (math.Abs(d.ForecastReturn) - z*d.ForecastReturnSE) * 10_000
+	}
+	if c.DownsideRiskControlEnabled {
+		applyRiskAwareHoldProtection(d, in, current)
+		return
 	}
 	needIncrease := d.AimRatio > current+1e-12
 	needDecrease := d.AimRatio < current-1e-12
@@ -420,6 +583,48 @@ func applyNoTradeHoldProtection(d *NoTradeInventoryDecision, c NoTradeInventoryC
 	d.RawAimRatio = d.AimRatio
 	d.RiskAdjustedAimRatio = d.AimRatio
 	d.Reason = "hold-protection: executable forecast lower bound below round-trip cost"
+}
+
+// applyRiskAwareHoldProtection compares the regularized Merton objective at
+// current holdings and the independent latent aim. A risk-reducing SELL may
+// bypass the posterior-mean fee gate only when its utility gain also clears the
+// one-way execution cost; the cost-derived no-trade boundary remains the final
+// turnover control.
+func applyRiskAwareHoldProtection(d *NoTradeInventoryDecision, in NoTradeInventoryInput, current float64) {
+	d.HoldProtectionApplied = false
+	needIncrease := d.AimRatio > current+1e-12
+	needDecrease := d.AimRatio < current-1e-12
+	if !needIncrease && !needDecrease {
+		return
+	}
+	if needDecrease {
+		prior := in.PriorTargetRatio
+		utility := func(weight float64) float64 {
+			return weight*d.ForecastReturn -
+				0.5*in.RiskAversion*d.ForecastVariance*weight*weight -
+				0.5*in.PriorStrength*(weight-prior)*(weight-prior)
+		}
+		gross := utility(d.AimRatio) - utility(current)
+		cost := math.Max(0, in.OneWayCostBps) / 10_000 * math.Abs(d.AimRatio-current)
+		d.RiskReductionGrossUtilityBps = gross * 10_000
+		d.RiskReductionNetUtilityBps = (gross - cost) * 10_000
+		if gross > cost {
+			return
+		}
+	}
+	passes := (needIncrease && d.ForecastReturn > 0 &&
+		d.ForecastEdgeLowerBps >= d.HoldProtectionThresholdBps) ||
+		(needDecrease && d.ForecastReturn < 0 &&
+			d.ForecastEdgeLowerBps >= d.HoldProtectionThresholdBps)
+	if passes {
+		return
+	}
+	d.HoldProtectionApplied = true
+	if needIncrease {
+		d.Reason = "hold-protection: inventory increase lower bound below round-trip cost"
+	} else {
+		d.Reason = "hold-protection: risk-reduction utility below execution cost"
+	}
 }
 
 // noTradeAimMeasurementVariance propagates the symmetric Beta posterior for
@@ -508,6 +713,16 @@ func materializeNoTradeInventory(d *NoTradeInventoryDecision, in NoTradeInventor
 		d.Direction = 0
 		d.ExecutionTargetRatio = clampRatio(current, d.LowerRatio, d.UpperRatio)
 		d.Reason = "inside no-trade region"
+	}
+	if d.HoldProtectionApplied && d.HoldProtectionPreservesAim {
+		// Keep the execution band internally ordered around current holdings while
+		// preserving AimRatio as the independent latent state. Otherwise lower >
+		// execution-target makes the Fast allocator buy despite a protected increase.
+		d.LowerRatio = math.Max(minimum, current-d.BuyHalfWidthRatio)
+		d.UpperRatio = math.Min(maximum, current+d.SellHalfWidthRatio)
+		d.Direction = 0
+		d.ExecutionTargetRatio = current
+		d.Reason = "hold-protection: inventory increase lower bound below round-trip cost"
 	}
 	if !d.Healthy {
 		d.Reason = "signed crossing posterior unavailable; strategic-prior no-trade region"

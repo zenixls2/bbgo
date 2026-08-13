@@ -15,8 +15,8 @@ func TestNoTradeIOCVariantsCoverFactorialWithoutMutatingInput(t *testing.T) {
 	cfg.MacroInventory.NoTradeRegion.ContinuationEnabled = true
 	cfg.MacroInventory.ReversalAccumulation.ActiveExecution.Enabled = true
 	variants := noTradeIOCVariants(cfg)
-	if len(variants) != 13 {
-		t.Fatalf("expected thirteen ablation variants, got %d", len(variants))
+	if len(variants) != 12 {
+		t.Fatalf("expected twelve ablation variants after retiring Hawkes, got %d", len(variants))
 	}
 	seen := make(map[[3]bool]bool)
 	for _, variant := range variants {

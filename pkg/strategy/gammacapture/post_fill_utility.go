@@ -96,7 +96,7 @@ func (c MarketMakerConfig) ApplyPostFillUtility(model *MarketMakerHorizonModel, 
 		d.Reason = "ordinary quote already at inward economic boundary"
 		return d
 	}
-	levels := int(math.Ceil(math.Max(2, math.Min(16, c.InventoryMaxOrderLevels))))
+	levels := int(math.Ceil(math.Max(2, math.Min(16, float64(c.PostFillUtility.CandidateCount)))))
 	distances := make([]float64, 0, levels)
 	distances = append(distances, baseDistance)
 	for i := 1; i < levels; i++ {

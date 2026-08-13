@@ -60,6 +60,7 @@ func TestReplayCappedInventoryCapacityMatchesLiveMinimumRescue(t *testing.T) {
 		{name: "rescue executable minimum", model: 5, hard: 200, minimum: 100, want: 100},
 		{name: "hard cap wins", model: 500, hard: 150, minimum: 100, want: 150},
 		{name: "do not cross subminimum hard cap", model: 5, hard: 50, minimum: 100, want: 5},
+		{name: "preserve authoritative zero", model: 0, hard: 200, minimum: 100, want: 0},
 		{name: "zero headroom", model: 100, hard: 0, minimum: 100, want: 0},
 	}
 	for _, test := range tests {

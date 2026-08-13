@@ -22,14 +22,18 @@ import (
 const DefaultCancelOrderWaitTime = 50 * time.Millisecond
 const DefaultOrderCancelTimeout = 15 * time.Second
 
+const activeOrderTerminalRetention = 10 * time.Minute
+const activeOrderTerminalCapacity = 2048
+
 // ActiveOrderBook manages the local active order books.
 //
 //go:generate callbackgen -type ActiveOrderBook
 type ActiveOrderBook struct {
 	Symbol string
 
-	orders              *types.SyncOrderMap
-	pendingOrderUpdates *types.SyncOrderMap
+	orders               *types.SyncOrderMap
+	pendingOrderUpdates  *types.SyncOrderMap
+	recentTerminalOrders map[uint64]time.Time
 
 	newCallbacks      []func(o types.Order)
 	filledCallbacks   []func(o types.Order)
@@ -56,13 +60,14 @@ func NewActiveOrderBook(symbol string) *ActiveOrderBook {
 
 	logger := log.WithFields(logFields)
 	return &ActiveOrderBook{
-		Symbol:              symbol,
-		orders:              types.NewSyncOrderMap(),
-		pendingOrderUpdates: types.NewSyncOrderMap(),
-		C:                   sigchan.New(1),
-		cancelOrderWaitTime: DefaultCancelOrderWaitTime,
-		cancelOrderTimeout:  DefaultOrderCancelTimeout,
-		logger:              logger,
+		Symbol:               symbol,
+		orders:               types.NewSyncOrderMap(),
+		pendingOrderUpdates:  types.NewSyncOrderMap(),
+		recentTerminalOrders: make(map[uint64]time.Time),
+		C:                    sigchan.New(1),
+		cancelOrderWaitTime:  DefaultCancelOrderWaitTime,
+		cancelOrderTimeout:   DefaultOrderCancelTimeout,
+		logger:               logger,
 	}
 }
 
@@ -336,6 +341,36 @@ func (b *ActiveOrderBook) Print() {
 // When order is filled, the order will be removed from the internal order storage.
 // When order is New or PartiallyFilled, the internal order will be updated according to the latest order update.
 // When the order is cancelled, it will be removed from the internal order storage.
+func (b *ActiveOrderBook) pruneTerminalStateLocked(now time.Time) {
+	cutoff := now.Add(-activeOrderTerminalRetention)
+	for orderID, completedAt := range b.recentTerminalOrders {
+		if completedAt.Before(cutoff) {
+			delete(b.recentTerminalOrders, orderID)
+		}
+	}
+	for _, pending := range b.pendingOrderUpdates.Orders() {
+		updatedAt := time.Time(pending.UpdateTime)
+		if pending.Status.Closed() && !updatedAt.IsZero() && updatedAt.Before(cutoff) {
+			b.pendingOrderUpdates.Remove(pending.OrderID)
+		}
+	}
+	for len(b.recentTerminalOrders) > activeOrderTerminalCapacity {
+		var oldestID uint64
+		var oldestAt time.Time
+		for orderID, completedAt := range b.recentTerminalOrders {
+			if oldestAt.IsZero() || completedAt.Before(oldestAt) {
+				oldestID, oldestAt = orderID, completedAt
+			}
+		}
+		delete(b.recentTerminalOrders, oldestID)
+	}
+}
+
+func (b *ActiveOrderBook) rememberTerminalLocked(orderID uint64, now time.Time) {
+	b.recentTerminalOrders[orderID] = now
+	b.pruneTerminalStateLocked(now)
+}
+
 func (b *ActiveOrderBook) Update(order types.Order) {
 	hasSymbol := len(b.Symbol) > 0
 	if hasSymbol && order.Symbol != b.Symbol {
@@ -343,7 +378,16 @@ func (b *ActiveOrderBook) Update(order types.Order) {
 	}
 
 	b.mu.Lock()
+	now := time.Now()
+	b.pruneTerminalStateLocked(now)
 	if !b.orders.Exists(order.OrderID) {
+		if order.Status.Closed() {
+			if _, completed := b.recentTerminalOrders[order.OrderID]; completed {
+				b.mu.Unlock()
+				b.logger.Debugf("[ActiveOrderBook] duplicate terminal update for completed order #%d %s ignored", order.OrderID, order.Status)
+				return
+			}
+		}
 		b.logger.Debugf("[ActiveOrderBook] order #%d %s does not exist, adding it to pending order update", order.OrderID, order.Status)
 		b.pendingOrderUpdates.Add(order)
 		b.mu.Unlock()
@@ -376,6 +420,7 @@ func (b *ActiveOrderBook) Update(order types.Order) {
 	case types.OrderStatusFilled, types.OrderStatusFinished:
 		// make sure we have the order and we remove it
 		removed := b.orders.Remove(order.OrderID)
+		b.rememberTerminalLocked(order.OrderID, now)
 		b.mu.Unlock()
 
 		if removed {
@@ -398,6 +443,7 @@ func (b *ActiveOrderBook) Update(order types.Order) {
 		// TODO: note that orders transit to "canceled" may have partially filled
 		b.logger.Debugf("[ActiveOrderBook] order is %s, removing order %s", order.Status, order)
 		b.orders.Remove(order.OrderID)
+		b.rememberTerminalLocked(order.OrderID, now)
 		b.mu.Unlock()
 
 		if order.Status == types.OrderStatusCanceled {
@@ -492,6 +538,7 @@ func isNewerOrderUpdateTime(a, b types.Order) bool {
 // add the order to the active order book and check the pending order
 func (b *ActiveOrderBook) add(order types.Order) {
 	b.mu.Lock()
+	delete(b.recentTerminalOrders, order.OrderID)
 	if pendingOrder, ok := b.pendingOrderUpdates.Get(order.OrderID); ok {
 		// if the pending order update time is newer than the adding order
 		// we should use the pending order rather than the adding order.

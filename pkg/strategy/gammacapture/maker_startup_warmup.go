@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strconv"
 	"time"
 
@@ -56,8 +55,6 @@ func (s *Strategy) restoreAndWarmMakerModelsFromBinanceCapture(now time.Time) er
 	if !restored {
 		s.resetMakerLearningState()
 		cursor = now.Add(-lookback)
-	} else {
-		s.rebuildMakerHawkesFromCheckpoint(now)
 	}
 
 	stats, err := s.replayMakerBBOCapture(cursor, now, restored)
@@ -90,6 +87,10 @@ func (s *Strategy) restoreAndWarmMakerModelsFromBinanceCapture(now time.Time) er
 	s.makerCheckpointReplayAfter = last
 	snapshot := s.model.Snapshot(now)
 	fast := s.adaptiveFastSnapshot(now)
+	bocpd45 := BOCPD45Snapshot{}
+	if s.makerBOCPD45 != nil {
+		bocpd45 = s.makerBOCPD45.Snapshot()
+	}
 	log.WithFields(map[string]interface{}{
 		"symbol":             s.Symbol,
 		"checkpointRestored": restored,
@@ -106,6 +107,11 @@ func (s *Strategy) restoreAndWarmMakerModelsFromBinanceCapture(now time.Time) er
 		"fastUp":             fast.Model.Up,
 		"fastDown":           fast.Model.Down,
 		"fastEvidenceHealth": fast.Evidence.Health,
+		"bocpd45Enabled":     bocpd45.Enabled, "bocpd45Ready": bocpd45.Ready,
+		"bocpd45Calibration":        bocpd45.Calibration,
+		"bocpd45CalibrationReady":   bocpd45.CalibrationReady,
+		"bocpd45CalibrationSamples": bocpd45.CalibrationSamples,
+		"bocpd45MaturedLabels":      bocpd45.MaturedLabels,
 	}).Info("restored and warmed gamma-capture models from Binance capture")
 	return nil
 }
@@ -128,6 +134,13 @@ func (s *Strategy) makerStartupWarmupLookback() time.Duration {
 	if window := s.maxFastEvidenceWindow(); window > lookback {
 		lookback = window
 	}
+	if config.BOCPD45.Enabled {
+		window := time.Duration(config.BOCPD45.CalibrationWindow) +
+			time.Duration(config.BOCPD45.Horizon)
+		if window > lookback {
+			lookback = window
+		}
+	}
 	if lookback <= 0 {
 		lookback = 6 * time.Hour
 	}
@@ -142,31 +155,7 @@ func (s *Strategy) resetMakerLearningState() {
 	s.makerHorizonModel = MarketMakerHorizonModel{}
 	s.makerMacroInventoryModel = MacroInventoryModel{}
 	s.makerExecutableCrossingModel = NewExecutableCrossingModel(s.Symbol, s.Barrier, s.Intensity)
-	s.makerHawkesDirectionModel = NewHawkesDirectionModel(s.MarketMaker.HawkesDirection)
 	s.makerCheckpointCaptureFiles = nil
-}
-
-// rebuildMakerHawkesFromCheckpoint reconstructs the short-memory Hawkes state
-// from the largest retained fast-evidence window. Fast windows contain the
-// same public trades, so using one window avoids multiplying events.
-func (s *Strategy) rebuildMakerHawkesFromCheckpoint(now time.Time) {
-	if s.makerHawkesDirectionModel == nil || s.State == nil || s.State.ModelCheckpoint == nil {
-		return
-	}
-	var selected fastEvidenceCheckpoint
-	for _, state := range s.State.ModelCheckpoint.Evidence {
-		if len(state.Trades) > len(selected.Trades) {
-			selected = state
-		}
-	}
-	trades := append([]fastEvidenceCheckpointTrade(nil), selected.Trades...)
-	sort.SliceStable(trades, func(i, j int) bool { return trades[i].At.Before(trades[j].At) })
-	for _, trade := range trades {
-		if trade.At.IsZero() || trade.At.After(now) || trade.Notional <= 0 {
-			continue
-		}
-		s.makerHawkesDirectionModel.ObserveDirection(trade.At, trade.Signed >= 0, trade.Notional)
-	}
 }
 
 func (s *Strategy) replayMakerBBOCapture(cutoff, now time.Time, deltaOnly bool) (makerStartupWarmupStats, error) {
@@ -251,6 +240,9 @@ func (s *Strategy) observeMakerReplayBBO(at time.Time, ticker types.BookTicker, 
 	bid, ask := ticker.Buy.Float64(), ticker.Sell.Float64()
 	mid := (bid + ask) / 2
 	s.makerHorizonModel.ObserveBookWithGap(at, bid, ask, config, gapBefore)
+	if s.makerBOCPD45 != nil {
+		s.makerBOCPD45.Observe(at, bid, ask, gapBefore)
+	}
 	if config.MacroInventory.Enabled {
 		s.makerMacroInventoryModel.ObserveBBO(at, mid, bid, ask, gapBefore, config.MacroInventory)
 		if s.makerExecutableCrossingModel != nil {
@@ -272,5 +264,6 @@ func (s *Strategy) observeMakerReplayBBO(at time.Time, ticker types.BookTicker, 
 			s.updateMakerDirectionModels(event)
 		}
 	}
+	s.observeFastDriftModels(at, ticker, gapBefore, config)
 	s.State.LastReferenceTime = at
 }

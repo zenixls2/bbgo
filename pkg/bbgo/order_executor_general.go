@@ -2,6 +2,7 @@ package bbgo
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
@@ -141,6 +142,18 @@ func (e *GeneralOrderExecutor) SetMaxRetries(maxRetries uint) {
 
 func (e *GeneralOrderExecutor) BindEnvironment(environ *Environment) {
 	e.tradeCollector.OnProfit(func(trade types.Trade, profit *types.Profit) {
+		trade.StrategyID = sql.NullString{String: e.strategy, Valid: e.strategy != ""}
+		if profit != nil {
+			trade.PnL = sql.NullFloat64{Float64: profit.NetProfit.Float64(), Valid: true}
+		}
+		// The generic user-data writer runs before strategy ownership can be
+		// resolved. Re-upsert the enriched record after OrderStore matching so
+		// live audit rows retain strategy and fee-adjusted PnL attribution.
+		if environ.TradeService != nil {
+			if err := environ.TradeService.Insert(trade); err != nil {
+				log.WithError(err).WithField("tradeID", trade.ID).Error("can not persist enriched strategy trade")
+			}
+		}
 		environ.RecordPosition(e.position, trade, profit)
 	})
 }

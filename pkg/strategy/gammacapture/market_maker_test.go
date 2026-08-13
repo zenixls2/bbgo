@@ -383,6 +383,22 @@ func TestOwnedMakerTradeAcceptsPartialExecution(t *testing.T) {
 	}
 }
 
+func TestMakerTerminalFillDefersNormalReplacement(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	if !makerTerminalFillDefersReplacement(0, 4, 5, time.Time{}, now) {
+		t.Fatal("a fill observed during planning must defer the normal replacement")
+	}
+	if !makerTerminalFillDefersReplacement(0, 5, 5, now.Add(-time.Second), now) {
+		t.Fatal("a recent fill must defer a normal refresh whose planning started afterward")
+	}
+	if makerTerminalFillDefersReplacement(0, 5, 5, now.Add(-3*time.Second), now) {
+		t.Fatal("an old terminal fill must not suppress unrelated refreshes")
+	}
+	if makerTerminalFillDefersReplacement(7, 5, 6, now, now) {
+		t.Fatal("the generation-matched fill worker must be allowed to replace quotes")
+	}
+}
+
 func TestMakerFillRebalanceQuoteGenerationGate(t *testing.T) {
 	if !makerFillRebalanceQuoteAllowed(false, 0, 0) {
 		t.Fatal("ordinary BBO evaluation should run when no fill rebalance is scheduled")
@@ -632,7 +648,7 @@ func TestHorizonDecisionRejectsMismatchedDirectionalFallback(t *testing.T) {
 func TestDynamicInventoryBandUsesRiskAndOrderLevels(t *testing.T) {
 	c := MarketMakerConfig{
 		QuoteNotional: 120, InventoryRiskBudgetJPY: 10, InventoryRiskZScore: 1.645,
-		InventoryMaxOrderLevels: 32, InventoryTargetRatio: 0.5,
+		InventoryTargetRatio: 0.5,
 		MinimumHalfSpreadBps: 15, MaximumHalfSpreadBps: 80,
 	}
 	band := c.DynamicInventoryBand(12_200, 0.48, 10*time.Minute)
@@ -681,7 +697,7 @@ func TestQuoteUsesExplicitCenteredInventoryEdges(t *testing.T) {
 func TestDynamicQuoteNotionalUsesRiskBudget(t *testing.T) {
 	c := MarketMakerConfig{
 		QuoteNotional: 120, MinimumQuoteNotional: 100, MaximumQuoteNotional: 480,
-		InventoryRiskBudgetJPY: 10, InventoryRiskZScore: 1.645, InventoryMaxOrderLevels: 32,
+		InventoryRiskBudgetJPY: 10, InventoryRiskZScore: 1.645,
 	}
 	quiet := c.DynamicQuoteNotional(0.10, 10*time.Minute)
 	normal := c.DynamicQuoteNotional(0.48, 10*time.Minute)
@@ -700,7 +716,7 @@ func TestDynamicQuoteNotionalUsesRiskBudget(t *testing.T) {
 func TestDynamicQuoteNotionalIgnoresLegacyBounds(t *testing.T) {
 	c := MarketMakerConfig{
 		QuoteNotional: 120, MinimumQuoteNotional: 10_000, MaximumQuoteNotional: 1,
-		InventoryRiskBudgetJPY: 10, InventoryRiskZScore: 1.645, InventoryMaxOrderLevels: 32,
+		InventoryRiskBudgetJPY: 10, InventoryRiskZScore: 1.645,
 	}
 	got := c.DynamicQuoteNotional(0.48, 10*time.Minute)
 	if got <= 0 || got >= 10_000 {
@@ -742,7 +758,7 @@ func TestShrinkVolatilityUsesSampleWeightedVariance(t *testing.T) {
 func TestDynamicQuoteNotionalUsesTwoSidedFillLoad(t *testing.T) {
 	c := MarketMakerConfig{
 		QuoteNotional: 120, MinimumQuoteNotional: 100, MaximumQuoteNotional: 480,
-		InventoryRiskBudgetJPY: 10, InventoryRiskZScore: 1.645, InventoryMaxOrderLevels: 32,
+		InventoryRiskBudgetJPY: 10, InventoryRiskZScore: 1.645,
 	}
 	coldStart := c.DynamicQuoteNotionalWithFillRates(0.48, 10*time.Minute, 0, 0)
 	balanced := c.DynamicQuoteNotionalWithFillRates(0.48, 10*time.Minute, 12, 12)

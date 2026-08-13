@@ -335,6 +335,11 @@ func (s *Config) Validate() error {
 			return err
 		}
 	}
+	if s.MarketMaker.BOCPD45.Enabled {
+		if err := s.MarketMaker.BOCPD45.validate(); err != nil {
+			return err
+		}
+	}
 	acquisition := s.MarketMaker.AcquisitionReset
 	if acquisition.MinDeficitAge < 0 || acquisition.AdverseMoveBps < 0 || acquisition.MaxSlippageBps < 0 ||
 		acquisition.Cooldown < 0 || acquisition.MinSamples < 0 || acquisition.ConfidenceZScore < 0 ||

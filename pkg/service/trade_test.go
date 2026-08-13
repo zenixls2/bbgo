@@ -24,7 +24,7 @@ func Test_tradeService(t *testing.T) {
 	xdb := sqlx.NewDb(db.DB, "sqlite3")
 	service := &TradeService{DB: xdb}
 
-	err = service.Insert(types.Trade{
+	trade := types.Trade{
 		ID:            1,
 		OrderID:       1,
 		Exchange:      "binance",
@@ -35,8 +35,22 @@ func Test_tradeService(t *testing.T) {
 		Side:          "BUY",
 		IsBuyer:       true,
 		Time:          types.Time(time.Now()),
-	})
+	}
+	err = service.Insert(trade)
 	assert.NoError(t, err)
+	trade.StrategyID = sql.NullString{String: "gammacapture", Valid: true}
+	trade.PnL = sql.NullFloat64{Float64: -1.25, Valid: true}
+	assert.NoError(t, service.Insert(trade))
+	var stored struct {
+		StrategyID sql.NullString  `db:"strategy"`
+		PnL        sql.NullFloat64 `db:"pnl"`
+	}
+	assert.NoError(t, xdb.Get(&stored, "SELECT strategy, pnl FROM trades WHERE exchange = ? AND symbol = ? AND side = ? AND id = ?", trade.Exchange, trade.Symbol, trade.Side, trade.ID))
+	assert.Equal(t, trade.StrategyID, stored.StrategyID)
+	assert.Equal(t, trade.PnL, stored.PnL)
+	var count int
+	assert.NoError(t, xdb.Get(&count, "SELECT COUNT(*) FROM trades WHERE exchange = ? AND symbol = ? AND side = ? AND id = ?", trade.Exchange, trade.Symbol, trade.Side, trade.ID))
+	assert.Equal(t, 1, count)
 }
 
 func Test_queryTradingVolumeSQL(t *testing.T) {

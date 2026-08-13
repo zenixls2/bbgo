@@ -142,7 +142,24 @@ exchangeStrategies:
         inventoryRiskBudgetJPY: 10
         inventoryRiskBudgetRatio: 0.0025
         inventoryRiskZScore: 1.282
-        inventoryMaxOrderLevels: 6 # staged correction levels used by both legacy and no-trade paths
+        # Center Fast quantity on the posterior expectation between the
+        # persisted session base anchor and the 50% policy target. Falling
+        # prices no longer create an unconditional constant-mix BUY demand.
+        posteriorInventoryTarget: true
+        # Same-symbol 45-second executable-BBO direction auxiliary. Its raw
+        # BOCPD probability is mapped by rolling Platt calibration only after
+        # each future label matures; no offline artifact or future label is
+        # available to the current prediction.
+        bocpd45:
+          enabled: true
+          calibration: platt
+          horizon: 45s
+          calibrationWindow: 6h
+          minimumChanges: 8
+          minimumSamples: 32
+          maximumStates: 128
+          refitEvery: 8
+          priorStrength: 8
         probabilityCenteredQuantity:
           enabled: true
           # Live canary enabled after paired-replay review; retain quantityProjection diagnostics.
@@ -154,10 +171,15 @@ exchangeStrategies:
         # the old soft-band/6 fixed tranche cap is not applied a second time.
         jointDistanceQuantity:
           enabled: true
-          # Posterior-sign fractional Kelly uses hard headroom only after the
-          # joint candidate is accepted; a rejection leaves the established
-          # soft-cap allocator byte-for-byte equivalent. Thirteen points are
-          # numerical resolution, not thirteen simultaneous orders.
+          # Fast has sole ownership of final quantity. The one-sided terminal-return
+          # posterior uses fractional Kelly inside live risk/headroom/balance
+          # capacity. For a non-positive marginal BUY, the selected-window Beta
+          # posterior advantage scales only the target-acquisition cells above the
+          # exchange minimum; a bearish terminal path still caps BUY at one cell.
+          # This avoids both unconditional multi-cell averaging-down and the former
+          # duplicate one-cell penalty that suppressed bullish acquisition. No Macro
+          # or downstream profitability overlay resizes this result. Thirteen points
+          # are numerical resolution, not simultaneous orders.
           shadowOnly: false
           candidateCount: 13
         # After a private fill, compare inward opposite-side prices against the
@@ -168,29 +190,31 @@ exchangeStrategies:
           enabled: true
           minimumSamples: 6
           confidenceZScore: 1.645
+          candidateCount: 8 # numerical price-grid resolution; not an inventory-risk weight
 
         # Portfolio policy bounds: 50% ETH / 50% JPY is the strategic prior,
-        # while 0% and 100% are outer limits before the macro controller derives
-        # a tighter target/cap. Orders are also capped by remaining headroom.
-        inventoryTargetRatio: 0.5 # legacy fallback without pair-equity balances
+        # while 0% and 100% are hard outer limits. Fast alone derives price,
+        # quantity, expected 50/50 correction, and whole-position risk within
+        # these limits; remaining balance/inventory headroom is authoritative.
+        inventoryTargetRatio: 0.5 # fallback when pair-equity balances are unavailable
         inventoryCapitalMinRatio: 0.0
         inventoryCapitalTargetRatio: 0.50
         inventoryCapitalMaxRatio: 1.0
-        # A single signed first-passage posterior supplies drift per unit QV.
-        # Executable ask/bid volatility and one-way cost solve asymmetric
-        # no-trade boundaries. Inside them Macro adds zero turnover; outside,
-        # the nearest boundary becomes the execution target. This supersedes
-        # 3h/6h/24h target weighting and reversal lease. Staged order-level
-        # contraction remains active; bounded Macro IOC is enabled only when
-        # its confidence-adjusted waiting loss exceeds crossing cost. The rolling horizons remain only as carrying-loss and
-        # drawdown hard-risk intersections. Fast still owns two-sided price and
-        # gross risk sizing; probability-centered quantity allocates that risk.
+        # Retained below only for backward-compatible YAML decoding and offline
+        # research. The live Macro target, no-trade rebalancer, reversal lease,
+        # and IOC actuator are disabled; they cannot alter Fast inventory bands.
         macroInventory:
-          enabled: true
+          enabled: false
           noTradeRegion:
             enabled: true
+            # Keep the latent Merton/no-trade aim independent from current
+            # holdings. Risk-reducing SELL adjustments are costed by the
+            # no-trade boundary itself; hold protection remains one-sided on
+            # uncertain inventory increases.
+            downsideRiskControlEnabled: true
             # If enabled, Macro may leave the hold inventory only when the
             # one-sided executable forecast lower bound clears round-trip cost.
+            # With downside risk control this applies to increases only.
             holdProtectionEnabled: true
             holdProtectionZScore: 1.645
             holdProtectionMinEdgeBps: 0
@@ -234,12 +258,6 @@ exchangeStrategies:
             # Resting maker orders stay live unless the IOC actually fills.
             activeExecution:
               enabled: false
-        hawkesDirection:
-          enabled: true
-          halfLife: 45s
-          selfExcitation: 0.35
-          crossExcitation: 0.05
-          minEvents: 8
         # The joint quote policy derives reservation price, spread, and side
         # quantity from the same normalized evidence and hazard inputs. Legacy
         # coefficient keys are intentionally omitted from the live profile.
@@ -270,8 +288,10 @@ exchangeStrategies:
         # BBO-tick cancel loop. Crossed/missing-side recovery remains faster.
         adverseRepriceBps: 20
         # Maintain all candidate crossing, public-evidence, and direction models
-        # continuously. Select the shortest HEALTHY window; a longer healthy
-        # window takes over immediately when a shorter one degrades.
+        # continuously. Select the HEALTHY horizon with maximum fee-net crossing
+        # edge per hour using that horizon's own executable-side volatility, then
+        # align Fast direction to the same window. Health-ranked fallback applies
+        # only when the expected-value-selected window is not admissible.
         fastWindows: [10m, 15m, 30m]
         # Observational raw trade/BBO coverage thresholds. These do not
         # override crossing health or prove fee-adjusted profitability.

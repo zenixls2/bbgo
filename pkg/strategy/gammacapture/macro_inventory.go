@@ -447,6 +447,7 @@ type MacroInventoryState struct {
 	NoTradeTrendDirection      int           `json:"noTradeTrendDirection,omitempty"`
 	NoTradeTrendProbability    float64       `json:"noTradeTrendProbability,omitempty"`
 	NoTradeContinuationMixture bool          `json:"noTradeContinuationMixture,omitempty"`
+	NoTradeDownsideRiskControl bool          `json:"noTradeDownsideRiskControl,omitempty"`
 }
 
 func (s *MacroInventoryState) ObserveWealth(now time.Time, wealthJPY float64) {

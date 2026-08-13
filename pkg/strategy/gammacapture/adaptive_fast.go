@@ -123,6 +123,11 @@ func inferFastCrossing(window time.Duration, fast ModelSnapshot, evidence FastEv
 
 func (s *Strategy) initializeAdaptiveFastModels() {
 	windows := s.MarketMaker.FastModelWindows()
+	if s.MarketMaker.BOCPD45.Enabled {
+		s.makerBOCPD45 = NewBOCPD45Model(s.MarketMaker.BOCPD45)
+	} else {
+		s.makerBOCPD45 = nil
+	}
 	s.fastModels = make(map[time.Duration]*IntensityModel, len(windows))
 	s.fastEvidenceModels = make(map[time.Duration]*FastEvidenceModel, len(windows))
 	s.makerDirectionModels = make(map[time.Duration]*DecayedDirectionModel, len(windows))
@@ -163,6 +168,33 @@ func (s *Strategy) observeFastModelExposure(at time.Time, gapBefore bool) {
 	}
 }
 
+// observeFastDriftModels trains every configured horizon from the same raw
+// crossing snapshot and BBO imbalance in live and startup replay. It avoids
+// FastEvidence inputs here because those streams are restored on a different
+// replay pass and would make the learned coefficients restart-path dependent.
+func (s *Strategy) observeFastDriftModels(
+	at time.Time,
+	ticker types.BookTicker,
+	gapBefore bool,
+	config MarketMakerConfig,
+) {
+	if !config.FastDrift.Enabled {
+		return
+	}
+	imbalance := bookImbalance(ticker)
+	lookback := time.Duration(config.HorizonLookback)
+	for _, window := range config.FastModelWindows() {
+		model := s.fastModels[window]
+		if model == nil {
+			continue
+		}
+		s.makerHorizonModel.ObserveFastDrift(
+			at, ticker.Buy.Float64(), ticker.Sell.Float64(), window, lookback,
+			FastDriftFeatures{Direction: rawFastDirection(model.Snapshot(at)), BookImbalance: imbalance},
+			gapBefore)
+	}
+}
+
 func (s *Strategy) updateFastModels(event CrossingEvent) {
 	if len(s.fastModels) > 0 {
 		for _, model := range s.fastModels {
@@ -198,9 +230,6 @@ func (s *Strategy) makerDirectionSnapshot(window time.Duration, now time.Time) D
 }
 
 func (s *Strategy) observeFastEvidenceTrade(at time.Time, trade types.Trade) {
-	if s.makerHawkesDirectionModel != nil {
-		s.makerHawkesDirectionModel.ObserveTrade(at, trade)
-	}
 	if len(s.fastEvidenceModels) > 0 {
 		for _, model := range s.fastEvidenceModels {
 			model.ObserveTrade(at, trade)
@@ -250,6 +279,10 @@ func fastHealthRank(health ModelHealth) int {
 }
 
 func (s *Strategy) adaptiveFastSnapshot(now time.Time) adaptiveFastSnapshot {
+	return s.adaptiveFastSnapshotForWindow(now, 0)
+}
+
+func (s *Strategy) adaptiveFastSnapshotForWindow(now time.Time, preferredWindow time.Duration) adaptiveFastSnapshot {
 	if len(s.fastModels) == 0 {
 		model := ModelSnapshot{Health: HealthInsufficient}
 		if s.fastModel != nil {
@@ -268,13 +301,22 @@ func (s *Strategy) adaptiveFastSnapshot(now time.Time) adaptiveFastSnapshot {
 			HealthSummary: fmt.Sprintf("%s=%s/%s", window, model.Health, evidence.Health),
 		}
 	}
-	return SelectAdaptiveFastSnapshot(now, s.fastModels, s.fastEvidenceModels)
+	return SelectAdaptiveFastSnapshotForWindow(
+		now, s.fastModels, s.fastEvidenceModels, preferredWindow)
 }
 
 // SelectAdaptiveFastSnapshot applies the live strategy's adaptive-window
 // selection to a supplied set of models. Keeping this logic shared prevents
 // offline production replay from silently testing a different fast window.
 func SelectAdaptiveFastSnapshot(now time.Time, fastModels map[time.Duration]*IntensityModel, fastEvidenceModels map[time.Duration]*FastEvidenceModel) AdaptiveFastSnapshot {
+	return SelectAdaptiveFastSnapshotForWindow(now, fastModels, fastEvidenceModels, 0)
+}
+
+// SelectAdaptiveFastSnapshotForWindow aligns the directional Fast posterior
+// with the fee-adjusted quote horizon selected by MarketMakerHorizonModel.  A
+// preferred window is admissible only while its crossing model is healthy;
+// otherwise the established health-ranked fallback remains in force.
+func SelectAdaptiveFastSnapshotForWindow(now time.Time, fastModels map[time.Duration]*IntensityModel, fastEvidenceModels map[time.Duration]*FastEvidenceModel, preferredWindow time.Duration) AdaptiveFastSnapshot {
 	if len(fastModels) == 0 {
 		return AdaptiveFastSnapshot{
 			Model:    ModelSnapshot{Health: HealthInsufficient},
@@ -297,11 +339,20 @@ func SelectAdaptiveFastSnapshot(now time.Time, fastModels map[time.Duration]*Int
 	for _, window := range windows {
 		model := fastModels[window].Snapshot(now)
 		candidates = append(candidates, candidate{window: window, model: model})
-		if selected < 0 && model.Health == HealthHealthy {
-			// The shortest healthy crossing window is the most responsive
-			// statistically admissible estimate. Raw evidence health remains a
-			// separate gate for volatility and IOC behavior.
+		if preferredWindow > 0 && window == preferredWindow && model.Health == HealthHealthy {
 			selected = len(candidates) - 1
+		} else if preferredWindow <= 0 && selected < 0 && model.Health == HealthHealthy {
+			// The shortest healthy crossing window is the most responsive
+			// statistically admissible fallback when no quote horizon is supplied.
+			selected = len(candidates) - 1
+		}
+	}
+	if selected < 0 {
+		for index, current := range candidates {
+			if current.model.Health == HealthHealthy {
+				selected = index
+				break
+			}
 		}
 	}
 	if selected < 0 {

@@ -164,6 +164,20 @@ func TestProductionReplayInitializesEveryConfiguredFastWindow(t *testing.T) {
 		}
 	}
 }
+
+func TestProductionReplayHonorsLiveBOCPD45Config(t *testing.T) {
+	cfg := gammacapture.MarketMakerConfig{
+		BOCPD45: gammacapture.BOCPD45Config{Enabled: true, Calibration: "platt"},
+	}
+	s := newProductionReplayState(
+		cfg, gammacapture.BarrierConfig{}, gammacapture.IntensityConfig{},
+		nil, replayLegacy, "ETHJPY", 1_000, 0, 1, time.Time{}, true)
+	if !s.bocpd45DirectionEnabled || s.bocpd45Calibration == nil ||
+		s.bocpd45Calibration.calibrator.method != bocpd45CalibrationPlatt {
+		t.Fatalf("replay did not honor live BOCPD45 config: %+v", s)
+	}
+}
+
 func TestReplayNearFillSidesPreservesApproachingBid(t *testing.T) {
 	book := bboSnapshot{bid: 302_172, ask: 302_173}
 	bid := productionReplayOrder{active: true, side: types.SideTypeBuy, price: 302_158}
@@ -180,8 +194,8 @@ func TestReplayNearFillSidesPreservesApproachingBid(t *testing.T) {
 func TestMeanFillMarkoutUsesSideSign(t *testing.T) {
 	at := time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)
 	books := []bboSnapshot{{time: at, bid: 99, ask: 101}, {time: at.Add(time.Minute), bid: 109, ask: 111}}
-	buy := meanFillMarkout([]replayFill{{at: at, side: types.SideTypeBuy, price: 100}}, books, time.Minute)
-	sell := meanFillMarkout([]replayFill{{at: at, side: types.SideTypeSell, price: 100}}, books, time.Minute)
+	buy := meanFillMarkout([]replayFill{{At: at, Side: types.SideTypeBuy, Price: 100}}, books, time.Minute)
+	sell := meanFillMarkout([]replayFill{{At: at, Side: types.SideTypeSell, Price: 100}}, books, time.Minute)
 	if buy <= 0 || sell >= 0 {
 		t.Fatalf("unexpected markouts buy=%f sell=%f", buy, sell)
 	}

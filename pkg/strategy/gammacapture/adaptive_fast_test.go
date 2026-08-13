@@ -73,6 +73,18 @@ func TestAdaptiveFastSnapshotFallsBackToShortestHealthyWindow(t *testing.T) {
 	}
 }
 
+func TestAdaptiveFastSnapshotPrefersHealthyQuoteHorizon(t *testing.T) {
+	strategy := adaptiveFastTestStrategy()
+	now := time.Date(2026, 8, 13, 2, 0, 0, 0, time.UTC)
+	strategy.updateFastModels(adaptiveFastCrossing(now.Add(-2*time.Minute), DirectionUp))
+	strategy.updateFastModels(adaptiveFastCrossing(now.Add(-time.Minute), DirectionDown))
+
+	selected := strategy.adaptiveFastSnapshotForWindow(now, 30*time.Minute)
+	if selected.Window != 30*time.Minute || selected.Model.Health != HealthHealthy {
+		t.Fatalf("direction must align with the healthy EV-selected quote horizon: %+v", selected)
+	}
+}
+
 func TestExplicitFastWindowsDefineSelectableTradingHorizons(t *testing.T) {
 	config := MarketMakerConfig{
 		MinTradingWindow: types.Duration(10 * time.Minute),

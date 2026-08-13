@@ -27,8 +27,10 @@ func (s *MacroInventoryState) ApplyNoTradeState(
 	prior := clampRatio(in.PriorTargetRatio, minimum, maximum)
 	current := clampRatio(in.CurrentRiskyWeight, minimum, maximum)
 	changed := false
-	modeChanged := s.NoTradeContinuationMixture != d.ContinuationMixtureApplied &&
-		(!s.NoTradeAimUpdatedAt.IsZero() || !s.NoTradeAimClosedBarAt.IsZero())
+	stateInitialized := !s.NoTradeAimUpdatedAt.IsZero() || !s.NoTradeAimClosedBarAt.IsZero()
+	modeChanged := stateInitialized &&
+		(s.NoTradeContinuationMixture != d.ContinuationMixtureApplied ||
+			s.NoTradeDownsideRiskControl != d.DownsideRiskControlEnabled)
 	if modeChanged {
 		s.NoTradeFilteredAimRatio = 0
 		s.NoTradeAimVariance = 0
@@ -37,6 +39,7 @@ func (s *MacroInventoryState) ApplyNoTradeState(
 		changed = true
 	}
 	s.NoTradeContinuationMixture = d.ContinuationMixtureApplied
+	s.NoTradeDownsideRiskControl = d.DownsideRiskControlEnabled
 
 	if !d.Healthy {
 		resetAim := prior
@@ -113,7 +116,7 @@ func (s *MacroInventoryState) ApplyNoTradeState(
 	}
 
 	filteredAim := clampRatio(s.NoTradeFilteredAimRatio, minimum, maximum)
-	if d.HoldProtectionApplied {
+	if d.HoldProtectionApplied && !d.HoldProtectionPreservesAim {
 		// A rejected directional target must not leak through the persisted
 		// Kalman mean. Project the mean to current inventory immediately, but
 		// preserve the posterior covariance: declining to trade is a control
@@ -160,6 +163,11 @@ func (s *MacroInventoryState) ApplyNoTradeState(
 	d.AimRatio = filteredAim
 	d.AimFilterVariance = math.Max(0, s.NoTradeAimVariance)
 	d.AimUpdatedAt = s.NoTradeAimUpdatedAt
+	if d.HoldProtectionPreservesAim && d.HoldProtectionEnabled {
+		// Re-evaluate utility at the filtered aim so a raw decision cannot leak
+		// through a materially different causal target.
+		applyRiskAwareHoldProtection(&d, in, current)
+	}
 	materializeNoTradeInventory(&d, in, minimum, maximum, current)
 
 	return d, changed

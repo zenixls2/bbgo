@@ -77,6 +77,24 @@ func TestActiveOrderBook_pendingOrders(t *testing.T) {
 	assert.True(t, filled, "filled event should be fired")
 }
 
+func TestActiveOrderBookDuplicateTerminalUpdateDoesNotLeakPending(t *testing.T) {
+	now := time.Now()
+	book := NewActiveOrderBook("ETHJPY")
+	order := types.Order{
+		OrderID:      77,
+		SubmitOrder:  types.SubmitOrder{Symbol: "ETHJPY"},
+		Status:       types.OrderStatusNew,
+		CreationTime: types.Time(now), UpdateTime: types.Time(now),
+	}
+	book.Add(order)
+	order.Status = types.OrderStatusFilled
+	order.UpdateTime = types.Time(now.Add(time.Second))
+	book.Update(order)
+	book.Update(order)
+	assert.Equal(t, 0, book.pendingOrderUpdates.Len())
+	assert.Equal(t, 0, book.NumOfOrders())
+}
+
 func TestActiveOrderBook_RestoreParametersOnUpdateHandler(t *testing.T) {
 	now := time.Now()
 	t1 := now
@@ -158,8 +176,8 @@ func Test_isNewerUpdateTime(t *testing.T) {
 // When order a is Finished, it is considered newer than b when b is Triggering, Triggered, or New.
 func Test_isNewerOrderUpdate_OrderStatusFinished(t *testing.T) {
 	baseOrderA := types.Order{
-		OrderID:   1,
-		Status:    types.OrderStatusFinished,
+		OrderID:    1,
+		Status:     types.OrderStatusFinished,
 		UpdateTime: types.NewTimeFromUnix(100, 0),
 	}
 

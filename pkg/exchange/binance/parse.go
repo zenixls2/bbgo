@@ -173,7 +173,7 @@ func (e *ExecutionReportEvent) Order(isMargin, isIsolated bool) (*types.Order, e
 		Status:           toGlobalOrderStatus(binance.OrderStatusType(e.CurrentOrderStatus)),
 		ExecutedQuantity: e.CumulativeFilledQuantity,
 		CreationTime:     types.Time(orderCreationTime),
-		UpdateTime:       types.Time(orderCreationTime),
+		UpdateTime:       types.Time(e.TransactionTime.Time()),
 		IsMargin:         isMargin,
 		IsIsolated:       isIsolated,
 	}, nil

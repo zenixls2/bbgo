@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const modelCheckpointVersion = 1
+const modelCheckpointVersion = 3
 
 // ModelCheckpoint is the bounded, causal state required to continue live
 // learning from a capture delta. It contains no orders, balances, or fills.
@@ -25,8 +25,10 @@ type ModelCheckpoint struct {
 	CaptureFiles map[string]captureFileCheckpoint
 	Slow         intensityCheckpoint               `json:"slow"`
 	Fast         map[string]intensityCheckpoint    `json:"fast,omitempty"`
+	BOCPD45      *bocpd45Checkpoint                `json:"bocpd45,omitempty"`
 	Direction    map[string]directionCheckpoint    `json:"direction,omitempty"`
 	Evidence     map[string]fastEvidenceCheckpoint `json:"evidence,omitempty"`
+	FastDrift    map[string]fastDriftCheckpoint    `json:"fastDrift,omitempty"`
 	Horizon      horizonCheckpoint                 `json:"horizon"`
 	Macro        macroInventoryCheckpoint          `json:"macro"`
 }
@@ -69,6 +71,31 @@ type fastEvidenceCheckpoint struct {
 	Trades      []fastEvidenceCheckpointTrade `json:"trades,omitempty"`
 	BBO         []fastEvidenceCheckpointBBO   `json:"bbo,omitempty"`
 	LastTradeID uint64                        `json:"lastTradeID,omitempty"`
+}
+
+type fastDriftSampleCheckpoint struct {
+	At              time.Time                      `json:"at"`
+	Features        [fastDriftFeatureCount]float64 `json:"features"`
+	AskReturnBps    float64                        `json:"askReturnBps"`
+	BidReturnBps    float64                        `json:"bidReturnBps"`
+	CenterReturnBps float64                        `json:"centerReturnBps"`
+	PredictedCenter float64                        `json:"predictedCenter"`
+	PredictionReady bool                           `json:"predictionReady"`
+}
+
+type fastDriftAnchorCheckpoint struct {
+	At              time.Time                      `json:"at"`
+	MaturesAt       time.Time                      `json:"maturesAt"`
+	StartBid        float64                        `json:"startBid"`
+	StartAsk        float64                        `json:"startAsk"`
+	Features        [fastDriftFeatureCount]float64 `json:"features"`
+	PredictedCenter float64                        `json:"predictedCenter"`
+	PredictionReady bool                           `json:"predictionReady"`
+}
+
+type fastDriftCheckpoint struct {
+	Samples []fastDriftSampleCheckpoint `json:"samples,omitempty"`
+	Anchor  *fastDriftAnchorCheckpoint  `json:"anchor,omitempty"`
 }
 
 type horizonCheckpoint struct {
@@ -118,6 +145,8 @@ func (s *Strategy) modelCheckpointHash() (string, error) {
 		FastEvidenceWindow        time.Duration
 		FastEvidenceMinTrades     int
 		FastEvidenceMinBBOUpdates int
+		FastDriftEnabled          bool
+		BOCPD45                   BOCPD45Config
 		MacroBarInterval          time.Duration
 		MacroLookback             time.Duration
 		MacroRiskHorizons         []time.Duration
@@ -132,6 +161,8 @@ func (s *Strategy) modelCheckpointHash() (string, error) {
 		FastEvidenceWindow:        time.Duration(marketMaker.FastEvidenceWindow),
 		FastEvidenceMinTrades:     marketMaker.FastEvidenceMinTrades,
 		FastEvidenceMinBBOUpdates: marketMaker.FastEvidenceMinBBOUpdates,
+		FastDriftEnabled:          marketMaker.FastDrift.Enabled,
+		BOCPD45:                   marketMaker.BOCPD45,
 		MacroBarInterval:          time.Duration(macro.BarInterval),
 		MacroLookback:             time.Duration(macro.Lookback),
 		MacroRiskHorizons:         macro.horizons(),
@@ -207,9 +238,11 @@ func (s *Strategy) prepareModelCheckpoint(now time.Time) error {
 		Engine:       *s.State.Engine,
 		CaptureFiles: captureFiles,
 		Slow:         checkpointIntensity(s.model),
+		BOCPD45:      s.makerBOCPD45.checkpoint(),
 		Fast:         make(map[string]intensityCheckpoint, len(s.fastModels)),
 		Direction:    make(map[string]directionCheckpoint, len(s.makerDirectionModels)),
 		Evidence:     make(map[string]fastEvidenceCheckpoint, len(s.fastEvidenceModels)),
+		FastDrift:    make(map[string]fastDriftCheckpoint, len(s.makerHorizonModel.fastDrift)),
 		Horizon: horizonCheckpoint{
 			Points:     append([]MarketMakerHorizonPoint(nil), s.makerHorizonModel.points...),
 			LastSecond: s.makerHorizonModel.lastSecond,
@@ -250,6 +283,26 @@ func (s *Strategy) prepareModelCheckpoint(now time.Time) error {
 		model.mu.Unlock()
 		checkpoint.Evidence[checkpointWindowKey(window)] = state
 	}
+	for window, model := range s.makerHorizonModel.fastDrift {
+		state := fastDriftCheckpoint{Samples: make([]fastDriftSampleCheckpoint, 0, len(model.Samples))}
+		for _, sample := range model.Samples {
+			state.Samples = append(state.Samples, fastDriftSampleCheckpoint{
+				At: sample.At, Features: sample.Features,
+				AskReturnBps: sample.AskReturnBps, BidReturnBps: sample.BidReturnBps,
+				CenterReturnBps: sample.CenterReturnBps,
+				PredictedCenter: sample.PredictedCenter, PredictionReady: sample.PredictionReady,
+			})
+		}
+		if model.Anchor != nil {
+			state.Anchor = &fastDriftAnchorCheckpoint{
+				At: model.Anchor.At, MaturesAt: model.Anchor.MaturesAt,
+				StartBid: model.Anchor.StartBid, StartAsk: model.Anchor.StartAsk,
+				Features: model.Anchor.Features, PredictedCenter: model.Anchor.PredictedCenter,
+				PredictionReady: model.Anchor.PredictionReady,
+			}
+		}
+		checkpoint.FastDrift[checkpointWindowKey(window)] = state
+	}
 	for _, bar := range s.makerMacroInventoryModel.bars {
 		checkpoint.Macro.Bars = append(checkpoint.Macro.Bars, macroCheckpointBar{
 			At: bar.At, Mid: bar.Mid, Bid: bar.Bid, Ask: bar.Ask, Segment: bar.Segment,
@@ -280,6 +333,9 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 	if checkpoint.Engine.Width <= 0 {
 		return time.Time{}, false, fmt.Errorf("model checkpoint crossing engine is invalid")
 	}
+	if s.MarketMaker.BOCPD45.Enabled && checkpoint.BOCPD45 == nil {
+		return time.Time{}, false, fmt.Errorf("model checkpoint is missing BOCPD45 calibration state")
+	}
 	for window := range s.fastModels {
 		key := checkpointWindowKey(window)
 		if _, ok := checkpoint.Fast[key]; !ok {
@@ -290,6 +346,11 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 		}
 		if _, ok := checkpoint.Evidence[key]; !ok {
 			return time.Time{}, false, fmt.Errorf("model checkpoint is missing evidence window %s", window)
+		}
+		if s.MarketMaker.FastDrift.Enabled {
+			if _, ok := checkpoint.FastDrift[key]; !ok {
+				return time.Time{}, false, fmt.Errorf("model checkpoint is missing Fast drift window %s", window)
+			}
 		}
 	}
 	// The top-level state can be persisted after the most recent bounded model
@@ -316,6 +377,11 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 			model.events = append(model.events, decayedDirectionEvent{at: event.At, direction: event.Direction})
 		}
 		model.last = state.Last
+	}
+	if s.MarketMaker.BOCPD45.Enabled {
+		if err := s.makerBOCPD45.restore(checkpoint.BOCPD45); err != nil {
+			return time.Time{}, false, err
+		}
 	}
 	for window, model := range s.fastEvidenceModels {
 		state, ok := checkpoint.Evidence[checkpointWindowKey(window)]
@@ -344,6 +410,31 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 	// the first live BBO to recompute distance under the current quote algorithm.
 	s.makerHorizonModel.lastUpdate = time.Time{}
 	s.makerHorizonModel.decision = checkpoint.Horizon.Decision
+	if s.MarketMaker.FastDrift.Enabled {
+		s.makerHorizonModel.fastDrift = make(map[time.Duration]*fastDriftRegression, len(checkpoint.FastDrift))
+		for _, window := range s.MarketMaker.FastModelWindows() {
+			state := checkpoint.FastDrift[checkpointWindowKey(window)]
+			model := &fastDriftRegression{Samples: make([]fastDriftSample, 0, len(state.Samples))}
+			for _, sample := range state.Samples {
+				model.Samples = append(model.Samples, fastDriftSample{
+					At: sample.At, Features: sample.Features,
+					AskReturnBps: sample.AskReturnBps, BidReturnBps: sample.BidReturnBps,
+					CenterReturnBps: sample.CenterReturnBps,
+					PredictedCenter: sample.PredictedCenter, PredictionReady: sample.PredictionReady,
+				})
+			}
+			if state.Anchor != nil {
+				model.Anchor = &fastDriftAnchor{
+					At: state.Anchor.At, MaturesAt: state.Anchor.MaturesAt,
+					StartBid: state.Anchor.StartBid, StartAsk: state.Anchor.StartAsk,
+					Features: state.Anchor.Features, PredictedCenter: state.Anchor.PredictedCenter,
+					PredictionReady: state.Anchor.PredictionReady,
+				}
+			}
+			model.trim(now, time.Duration(s.MarketMaker.HorizonLookback))
+			s.makerHorizonModel.fastDrift[window] = model
+		}
+	}
 	s.makerHorizonModel.rebuildSideHARVarianceRisk(s.MarketMaker)
 	if s.makerExecutableCrossingModel != nil {
 		s.makerExecutableCrossingModel.Rebuild(s.makerHorizonModel.points)

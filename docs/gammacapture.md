@@ -955,29 +955,29 @@ mid-marked risky notional `N`, Macro expectation `M`, horizon fill probabilities
 gross `G = qBuy + qSell`, one executable fill removes at most one statistically
 reachable stage of the Macro target error. For correction-side arrival rate
 `lambdaCorrection`, the selected Fast/order waiting clock `TFast`, the Macro
-signal's causal forecast horizon `TRegime`, and configured maximum
-`Lmax = inventoryMaxOrderLevels`, define the staged actuation clock as:
+signal's causal forecast horizon `TRegime`, and exchange-sized executable
+correction cell `qExec`, define the staged actuation clock as:
 
     Tact = min(TFast, TRegime), using the configured minimum only when one or both clocks are unavailable.
 
-    K = lambdaCorrection*Tact
-    Leffective = clip(K, 1, Lmax)
+    Karrival = lambdaCorrection*Tact
+    Krequired = |M-N|/qExec
+    Leffective = max(1,min(Karrival,Krequired))
     kappa = pCorrection/Leffective
     M_step = N + kappa*(M-N)
     qBuy  = (M_step - N + pSell*G)/(pBuy + pSell)
     qSell = G - qBuy.
 
-Thus, whenever `1 < K < Lmax`, `K*(1/Leffective)=1`: the expected corrective
-fills over the forecast regime remove one current target error rather than
-requiring the old fixed six-stage response. `inventoryMaxOrderLevels` is now a
-maximum single-fill risk subdivision, not a fixed time constant. Missing
-correction-side arrival evidence fails closed to the previous configured-level
-behavior; the controller never borrows the opposite side's rate.
+When arrival capacity and the correction gap support multiple exchange-sized
+fills, the expected fills over the forecast regime remove one current target
+error. No configured level count divides ordinary quotes. Missing correction-
+side arrival evidence falls back to one level; the controller never borrows the
+opposite side's rate.
 
 The shortest-clock rule is important: a 24-hour Macro lease expresses signal
 survival, not permission for one maker order to wait 24 hours. It prevents a
 long regime horizon from shrinking every correction to an economically
-irrelevant ticket, while the `Lmax` cap and the probability-centered quantity
+irrelevant ticket, while the executable-gap bound and probability-centered
 constraint still prevent a single fill from becoming a full portfolio jump.
 
 Balances and absolute 0%/100% inventory headroom bound each side. In addition,
@@ -1064,9 +1064,8 @@ and the active economic floor.
 Whenever two-sided fill probabilities are unavailable or the joint projection
 is infeasible, fallback order construction separates absolute hard-band
 headroom from one executable ticket. Let `W` be the smaller target-to-edge band
-half-width in quote notional and `L`
-be `Leffective` above (falling back to `inventoryMaxOrderLevels` when actuation
-evidence is unavailable). Let `eBuy` and `eSell` be the current
+half-width in quote notional and `L` be `Leffective` above, falling back to one
+when actuation evidence is unavailable. Let `eBuy` and `eSell` be the current
 target error on each side in quote notional:
 
     qExplore = W/max(1,L)
@@ -1204,10 +1203,10 @@ The interaction contract is deliberately one-way:
 | 3h/6h/24h Macro returns | Keep only the strict carrying-loss/drawdown floor and cap intersection; do not weight a target. |
 | Macro reversal and regime lease | Skipped; they cannot shift the single QV-time aim a second time. |
 | Probabilistic inventory variation | Skipped; the free boundaries are materialized directly and are not widened again. |
-| `inventoryMaxOrderLevels` / arrival actuation | Retained as staged correction; one fill removes only a reachability-sized fraction of the boundary gap. |
-| Macro marketable IOC | Retained as a bounded correction only when confidence-adjusted waiting loss exceeds executable crossing cost. |
+| Arrival actuation | Removed from the unified runtime path; Fast risk sizing and probability-centered allocation size the correction once. |
+| Macro marketable IOC | Disabled; the long-horizon boundary is expressed through the Fast target rather than a second execution path. |
 | Fast direction, OFI, volume, spread, arrival model | Retained for two-sided quote price and total statistical risk budget; they do not move the Macro center. |
-| Probability-centered quantity | Retained as the sole allocator of Fast gross risk between sides, using the execution target and no-trade boundaries. |
+| Probability-centered quantity | Retained as the sole allocator of Fast gross risk between sides, using the one-sided unified target and global hard bounds. |
 | Account balance, exchange filters, absolute and Macro risk caps | Retained as hard intersections and may still remove a side when an executable order would violate them. |
 
 Live and production replay pass the same slow crossing snapshot, barrier,
@@ -2789,8 +2788,9 @@ The joint mean is projected onto the Frechet bounds
 `max(0,pB+pS-1)<=pBoth<=min(pB,pS)` so separate Jeffreys pseudo-counts cannot
 create an impossible covariance matrix.
 
-The old `noTradeWidth/inventoryMaxOrderLevels` cap is removed only from this
-final stochastic projection. Available balances, hard portfolio min/max,
+The old fixed no-trade width/order-level cap is removed from live and
+production-replay sizing. Data-derived reachable fills may still stage a real
+correction. Available balances, hard portfolio min/max,
 exchange filters, the Fast gross budget, posterior bearish BUY restraint, and
 the existing second-moment inventory constraint remain binding.
 
@@ -2879,3 +2879,1362 @@ positive lower confidence bound. Live logs therefore retain posterior
 confidence, effective samples, expected/lower P&L, Kelly penalty/utility, and
 both Fast-relative and pair-equity-relative capital utilization for continued
 promotion review.
+
+
+### Independent downside-risk inventory aim (2026-08-11)
+
+Live diagnostics exposed a self-anchoring failure in hold protection. Even with
+roughly 314--426 bps of rolling downside loss, the rejected Macro aim was
+written back as the current risky weight. The no-trade error was consequently
+zero and passive spread capture was left to absorb the entire marked ETH loss.
+
+`downsideRiskControlEnabled` separates estimation from execution. The latent
+regularized Merton aim and its covariance remain independent of holdings. A
+protected inventory increase keeps an execution band centered on current
+holdings without overwriting that aim. A risk-reducing SELL is admitted only
+when either the original posterior lower bound clears round-trip cost or the
+regularized objective clears one-way execution cost:
+
+`Delta U = U(w*) - U(w) - c |w* - w| > 0`,
+
+`U(w) = w mu - gamma w^2 sigma^2 / 2 - k (w - w0)^2 / 2`.
+
+The proportional-cost no-trade boundary remains the final partial-adjustment
+controller; this utility test is not a market-order stop and introduces no
+fixed drawdown-bps threshold. When signed QV direction is neutral but healthy,
+the same Merton denominator now lets variance reduce long-only exposure rather
+than silently resetting the aim to the strategic prior. Live logs expose gross
+and fee-net risk-reduction utility in bps.
+
+Exact next-BBO ETHJPY replay used zero visible-queue multiplier and a 5% early
+drawdown stop. Relative to the immediately preceding binary:
+
+| causal interval | old PnL / DD | new PnL / DD | fill change |
+| --- | ---: | ---: | ---: |
+| 2026-08-10 03:00--15:00 UTC | -36.9441 JPY / 0.7987% | -36.9441 JPY / 0.7987% | identical 6 BUY / 3 SELL |
+| 2026-08-03 00:00--08:00 UTC decline | -101.0212 JPY / 1.6774% | -96.7798 JPY / 1.5799% | 7/3 to 9/6 BUY/SELL |
+| 2026-07-29 03:04--05:04 UTC range | -4.2137 JPY / 0.8035% | -5.4724 JPY / 0.7456% | 3/1 to 5/3 BUY/SELL |
+| 2026-07-26 22:10--23:10 UTC rise | 47.4927 JPY / 0.1186% | 47.4927 JPY / 0.1186% | identical 0 BUY / 1 SELL |
+
+The decline improved by 4.2413 JPY and 0.0975 drawdown percentage points; the
+range path paid 1.2587 JPY for 0.0579 points less drawdown. Therefore this is a
+risk-return tradeoff, not a claim of pathwise PnL dominance or a positive lower
+confidence bound. The running service was not restarted by this research pass.
+
+### Removal of the configured inventory-level divisor (2026-08-11)
+
+The configured inventory order-level count was removed from live configuration,
+strategy code, and production replay. It had been treated as an unconditional
+divisor even though the no-trade half-width could be only 1.5 exchange-executable
+cells. In that state every configured count above one produced a sub-minimum
+model tranche which the Binance filter adapter silently promoted back to the
+same minimum order. The setting therefore reduced capital utilization without
+providing the intended staged-risk control.
+
+Staged Macro actuation is now entirely data-derived:
+
+    Karrival = lambdaCorrection*Tact
+    Krequired = |M-N|/qExec
+    Leffective = max(1,min(Karrival,Krequired)).
+
+`Krequired` prevents the controller from subdividing a correction into pieces
+smaller than the exchange-sized executable cell. Missing actuation evidence
+uses one level rather than a fixed configured fallback. The Fast risk budget,
+probability-centered second-moment constraint, hard capital bounds, balances,
+and exchange filters remain independent limits.
+
+`qExec` is an execution unit, not a complete risk-sized ticket. The implemented
+multiplier below derives its scale from live risk and capital state.
+
+### Exposure- and utilization-scaled execution multiplier (2026-08-11)
+
+The execution unit is now scaled independently on BUY and SELL:
+
+    m_s = min(qRisk/qExec, H_s/qExec, A_s/qExec)
+    q_s,max = qExec*m_s.
+
+Here, `qRisk` is the Fast adverse-move risk notional already derived from the
+live side volatility, selected horizon, risk budget, and expected two-sided fill
+load. `H_s` is remaining hard inventory headroom on side `s`, and `A_s` is
+the actually deployable quote capital or marked base inventory. Consequently,
+higher risk capacity increases order size, while an account near its upper
+inventory bound reduces only BUY and an account near its lower bound reduces
+only SELL. There is no fixed maximum multiplier.
+
+The probability-centered solver still determines the final bid/ask split. Its
+expected filled inventory remains centered on the current Macro execution
+target, while its second-moment confidence constraint now uses the hard
+portfolio band. The proportional-cost no-trade region decides whether Macro
+should move the target; it no longer doubles as a one-exchange-cell Fast size
+ceiling. Every realized single-side order remains capped by hard inventory
+headroom, available balances, and exchange filters.
+
+Live diagnostics expose `riskUtilizationRiskMultiplier`, side multipliers and
+caps, current exposure, side headroom ratios, and maximum gross deployable
+capital ratio. Production replay uses the identical sizing function.
+
+#### Profitability-adjusted multiplier and hold benchmark
+
+Risk capacity answers how much the account can quote; it does not prove that
+deploying all of it has positive expected terminal wealth. The final fallback
+capacity therefore applies a side-specific, confidence-adjusted fractional
+Kelly multiplier to the hard capacity above. For side `s`,
+
+    lowerEdge_s = meanEdge_s - z*sqrt(varEdge_s/nEff)
+    qKelly_s = lowerEdge_s*10000*pairEquity/(gamma*varEdge_s)
+    qCap_s = min(qHard_s,qKelly_s).
+
+The path edge is marked at the terminal executable BBO relative to retaining
+the opening inventory. It therefore charges a BUY that is followed by a
+continued fall and a SELL followed by a continued rise, rather than treating a
+touch as a completed spread cycle. Once dispersion is identifiable, a
+non-positive lower edge receives zero capacity. Before dispersion is
+identifiable, at most one exchange-executable unit is exposed while public BBO
+paths continue accumulating.
+
+The joint distance/quantity optimizer had a separate implementation error: it
+reported the `z`-adjusted certainty equivalent but ranked and admitted
+candidates using the `z=0` value. Ranking, admission, diagnostics, and the
+final positive-utility check now use the same confidence-adjusted objective.
+A regression test uses an extreme confidence bound to ensure a positive sample
+mean with a non-positive conservative utility cannot be promoted.
+
+Exact next-BBO ETHJPY replay used 6,830.6723 JPY opening equity,
+0.01024405 ETH, zero visible-queue multiplier, current configuration, and a 5%
+early drawdown stop. The multiplier materially reduced the large losses caused
+by deploying the full risk cap, but it did not establish excess return over
+holding the identical opening portfolio:
+
+| causal interval | strategy PnL | hold PnL | excess vs hold | BUY / SELL |
+| --- | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 UTC decline | -87.4370 | -80.0265 | -7.4105 | 11 / 5 |
+| 2026-08-05 15:00--21:00 UTC rise | +60.5236 | +68.7376 | -8.2139 | 3 / 7 |
+| 2026-08-08 00:00--12:00 UTC range | +11.7788 | +12.0675 | -0.2887 | 1 / 3 |
+| 2026-08-10 00:00--18:00 UTC mixed | -36.9996 | -36.8376 | -0.1620 | 13 / 13 |
+
+Two rejected alternatives were also replayed and are intentionally not in the
+runtime: a hard pair-level confidence gate reduced every interval to zero
+fills and exactly matched hold, while an unmatched-exposure recovery corridor
+increased turnover even though pre-fee excess return remained negative. A
+multiplier cannot turn a negative gross execution edge positive; the remaining
+hold gap belongs to quote-price/adverse-selection calibration, not additional
+size. These results are a risk-control improvement, not a claim that the
+strategy now dominates hold.
+
+### Risk-conditioned quote point and side capacity (2026-08-11)
+
+The original Fast quote could still reappear after the joint distance/quantity
+optimizer rejected every candidate. That fallback was internally inconsistent:
+the path model could reject a distance for adverse terminal wealth, then the
+runtime would submit the more inward original distance with an independently
+computed size. Increasing that size would amplify a point-selection error.
+
+The optimizer now evaluates every outward distance separately for BUY and SELL.
+For side `s`, its terminal executable-BBO payoff includes untouched paths and
+adverse continuation after a touch. A side is supported only when one
+exchange-executable unit has positive posterior-mean Kelly utility. Candidate
+ranking uses
+
+    score_s(delta) = CE_s(delta,qExec) *
+                     max(0,2*Phi(mu_s/SE_s)-1).
+
+The selected quantity is not a constant position multiplier. Let `qHard,s`
+be the capacity already constrained by current side volatility, Fast risk
+budget, hard inventory headroom, available balance, and portfolio bounds. The
+posterior-risk capacity is
+
+    q_s = qHard,s *
+          min(1, E[PnL_s(qHard,s)] /
+                 (2*KellyPenalty_s(qHard,s))) *
+          max(0,2*Phi(mu_s/SE_s)-1).
+
+The exchange cell is retained when this continuous result is smaller than one
+cell only if the cell itself still has positive certainty equivalent. Thus
+stronger evidence can use more of the current risk capacity, weak evidence
+shrinks to one cell, negative expected edge receives zero, and no result can
+exceed the live hard capacity. A negative utility at the full hard capacity
+does not reject a smaller positive-utility order; this nonlinear case is
+covered by a regression test.
+
+If neither side has a positive posterior-risk distance, the joint optimizer
+does not replace the established Fast plan. It remains a confidence-gated
+refinement rather than an authoritative controller: the Fast quote and its
+probability-centered quantity allocation continue to use the common crossing,
+volatility, balance, and hard-risk constraints. The model still ingests every
+BBO and may apply a later joint candidate as soon as its posterior becomes
+positive. This avoids turning uncertainty in an optional optimizer into a
+second hard gate over the statistically established Fast path.
+
+Exact next-BBO ETHJPY replay used the same 6,830.6723 JPY opening equity,
+0.01024405 ETH, zero visible-queue multiplier, current configuration, and 5%
+early drawdown stop:
+
+| causal interval | strategy PnL | hold PnL | excess vs hold | BUY / SELL |
+| --- | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 UTC decline | -80.5333 | -80.0265 | -0.5068 | 1 / 0 |
+| 2026-08-05 15:00--21:00 UTC rise | +68.7376 | +68.7376 | 0.0000 | 0 / 0 |
+| 2026-08-08 00:00--12:00 UTC range | +12.0675 | +12.0675 | 0.0000 | 0 / 0 |
+| 2026-08-10 00:00--18:00 UTC mixed | -35.5959 | -36.8376 | +1.2417 | 1 / 3 |
+
+Across these 44 hours, aggregate excess PnL is +0.7349 JPY. This is a material
+improvement over the previous multiplier's -16.0751 JPY aggregate excess, but
+it is not pathwise dominance or a statistically positive lower confidence
+bound: the decline interval still trails hold by 0.5068 JPY and only five
+fills changed inventory. The appropriate conclusion is that point selection
+and size now share one risk-conditioned objective; broader out-of-sample data
+is still required before claiming stable alpha.
+
+
+### Fast ownership with one-sided long-horizon correction (2026-08-11)
+
+A controller audit found that recent inventory changes had broken the original Fast contract. The same Macro evidence could move the target, alter price urgency, contract quantity, enable an IOC, and authorize joint rejection. Inside the no-trade region the Macro execution target also became current inventory, erasing the Fast inventory ratio. In the 44-hour validation sample, authoritative joint rejection suppressed 93.1% of evaluated quotes and left only five fills. This was duplicate control applied after Fast, not evidence that Fast found no opportunities.
+
+Live and production replay now use one execution controller. Fast retains its dynamic risk band, crossing-derived price, probability-centered side quantity, post-fill rebalance, and order lifetime. The long-horizon model supplies only an active boundary correction after current inventory exits its proportional-cost no-trade region. Let `wF` be the Fast target, `wMexec` the nearest Macro boundary, and `dM` the Macro correction direction:
+
+    wUnified = max(wF,wMexec),  dM = +1,
+             = min(wF,wMexec),  dM = -1,
+             = wF,              dM = 0.
+
+This is a one-sided minimum-intervention projection. Macro can strengthen a BUY or SELL correction but cannot weaken a more conservative Fast target. When current inventory is inside the Macro region, `dM=0`, so Macro adds no turnover and cannot recenter Fast. Fast lower and upper risk widths translate with `wUnified`; hard carrying-loss, drawdown, balance, and exchange constraints remain global intersections. Separate Macro arrival contraction, Fast BUY restraint, marketable IOC, and authoritative joint rejection are no longer execution paths. An accepted joint candidate may refine Fast; rejection falls back to the established Fast plan.
+
+Exact next-BBO ETHJPY replay used 6,830.6723 JPY opening equity, 0.01024405 ETH, zero visible-queue multiplier, current configuration, and a 5% early drawdown stop:
+
+| causal interval | strategy PnL | hold PnL | excess vs hold | BUY / SELL | long-horizon decisions |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 UTC decline | -83.0019 | -80.0265 | -2.9753 | 5 / 1 | 2,201 |
+| 2026-08-05 15:00--21:00 UTC rise | +68.6342 | +68.7376 | -0.1034 | 2 / 0 | 523 |
+| 2026-08-08 00:00--12:00 UTC range | +11.7487 | +12.0675 | -0.3188 | 0 / 2 | 0 |
+| 2026-08-10 00:00--18:00 UTC mixed | -33.9621 | -36.8376 | +2.8755 | 7 / 7 | 0 |
+
+The revised ownership restores 24 fills versus five under authoritative joint rejection. The four-interval aggregate remains approximately -0.522 JPY versus hold, so this validates the engineering ownership fix, not statistically significant alpha. The service was not restarted by this implementation pass.
+
+### Signed, inventory-aware Fast reservation value (2026-08-11)
+
+The bearish-only reservation extension fixed the fixed decline replay but created
+a structural SELL bias in a range: local downside legs moved both quotes down,
+while equally strong upside legs could not move them up. It also passed the
+already-shifted plan to the joint optimizer, so an optimizer rejection could
+fall back to a modified plan instead of the immutable Fast quote. On the fixed
+2026-08-08 range this produced one BUY, six SELLs, 0.7 JPY maker fees, and
+10.9556 JPY PnL, versus two SELLs and 11.7487 JPY before the one-sided overlay.
+
+The replacement is one unified reservation-price equation:
+
+    log(r_t / m_t) =
+        eta_t * mu_H,t
+        - gamma * sigma_H,t^2 * (w_t - w_t*).
+
+Here `mu_H,t` is the causal signed executable-return posterior over the
+selected forecast horizon and
+
+    eta_t = |sum_i r_i| / sum_i |r_i|
+          = 1 - consolidation_t.
+
+The existing Fast `Quote` implementation already computes the second term
+from current inventory, the unified target/band, side-specific executable
+volatility, and Fast evidence. The new code therefore adds only
+`eta_t * mu_H,t`; adding another inventory term would double-count the same
+risk. This also makes post-fill behavior immediate: after a SELL lowers
+`w_t`, the next quote loop recomputes the original Fast reservation upward
+toward `w_t*` before applying the signed drift. No cooldown, stale fill state,
+or second side controller is needed.
+
+The signed drift is symmetric. A positive value moves bid and ask upward and
+clips only the inward bid at maker touch; a negative value moves both downward
+and clips only the inward ask. It never changes `allowBid`, `allowAsk`,
+notionals, risk capacity, or order lifetime. When an active Macro no-trade
+boundary correction already owns inventory movement, the drift is disabled to
+avoid applying the same long-horizon evidence twice.
+
+Every shifted quote is a candidate, not an unconditional replacement. At the
+candidate's actual bid/ask distances, the rolling terminal-BBO path model
+evaluates one exchange-minimum fill on the drift's target side:
+
+    CE_s(q_min) =
+        E_t[Pi_s(q_min)]
+        - gamma Var_t[Pi_s(q_min)] / (2 W_t).
+
+The candidate is accepted only when more than one effective path identifies
+dispersion, `E_t[Pi_s] > 0`, and `CE_s > 0`. A one-sided fill is marked at
+terminal executable BBO and includes the entry fee, so this test values
+inventory continuation rather than nominal spread. Missing or non-positive
+utility returns the original Fast plan exactly. The later joint distance and
+quantity optimizer can still refine an accepted plan; it no longer supplies
+the fallback contract for this model.
+
+Queue-aware repricing is also symmetric. An accepted drift causes immediate
+realignment only when its sign changes or its absolute magnitude grows by at
+least one exchange tick. A shrinking drift waits for Fast's ordinary dynamic
+review window, preserving queue priority and avoiding an order loop.
+
+Regression tests cover signed posterior symmetry, maker-touch projection,
+exact unsupported-candidate fallback, signed one-tick realignment, Macro
+ownership exclusion, and the monotone post-fill inventory response. Live and
+production replay call the same selector and expose candidate count, acceptance
+reason, effective path samples, expected PnL, and certainty equivalent.
+
+Exact next-BBO ETHJPY replay used the same fixed intervals and predeclared
+conditions as the prior result: 6,830.6723 JPY opening equity, 0.01024405 ETH,
+zero visible-queue multiplier, current YAML, and a 5% early drawdown stop.
+
+| causal interval | old PnL | signed PnL | change | hold PnL | signed excess | old -> new BUY/SELL | old -> new fees | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 UTC decline | -79.7607 | -79.7607 | 0.0000 | -80.0265 | +0.2658 | 2/2 -> 2/2 | 0.4 -> 0.4 | 1.3236% |
+| 2026-08-05 15:00--21:00 UTC rise | +68.6766 | +68.7337 | +0.0571 | +68.7376 | -0.0039 | 1/0 -> 1/0 | 0.1 -> 0.1 | 0.2954% |
+| 2026-08-08 00:00--12:00 UTC range | +10.9556 | +11.9119 | +0.9563 | +12.0675 | -0.1556 | 1/6 -> 1/2 | 0.7 -> 0.3 | 0.1186% |
+| 2026-08-10 00:00--18:00 UTC mixed | -27.0833 | -25.7799 | +1.3033 | -36.8376 | +11.0577 | 4/5 -> 2/4 | 1.3464 -> 1.1984 | 1.0642% |
+
+None hit the drawdown stop. Aggregate excess versus hold is +11.1640 JPY,
+versus +8.8473 JPY for the bearish-only version. The range result is also
++0.1632 JPY above the pre-overlay Fast baseline, but remains 0.1556 JPY below
+hold; it is therefore evidence that the structural bias was removed, not proof
+of pathwise dominance or a positive lower confidence bound. Replay artifacts
+are `/tmp/gc-{decline,rise,range,mixed}-signed-reservation.json`. The service
+was not restarted by this implementation and replay pass.
+
+
+### Marginal post-fill utility and statistically identified side rejection (2026-08-11)
+
+Live verification of the first signed-reservation fill exposed an execution-unit
+mismatch. The post-fill inventory utility treated the full dynamic risk budget
+as the next hypothetical fill even though the actual order was one
+exchange-minimum cell. When the budget exceeds pair equity, its clipped weight
+can overshoot the inventory target and reverse the risk-benefit sign. Live and
+production replay now evaluate the marginal executable cell:
+
+    Delta U_inventory = (gamma sigma_H^2 / 2)
+        [(w - w*)^2 - (w + s q_min/W - w*)^2].
+
+The terminal-path sizing layer also distinguishes a statistical zero from a
+small positive continuous allocation. A strictly positive sub-minimum amount
+may be rounded to the exchange lattice, but an exact zero is no longer
+resurrected by the minimum-order adapter. This zero is used only when one side
+has positive conservative terminal-wealth support and the opposite side does
+not. If neither one-sided terminal mark is supported, it cannot distinguish a
+bad direction from an unfinished Fast round trip, so the model retains one
+exploratory cell on every exchange-feasible side. Missing path dispersion has
+the same unit fallback. This preserves Fast quote uptime and avoids restoring
+the removed directional hard gate.
+
+Focused GammaCapture and production-replay tests pass. Exact next-BBO ETHJPY
+replay used the same fixed four intervals, 6,830.6723 JPY opening equity,
+0.01024405 ETH, zero visible-queue multiplier, current YAML, and a 5% early
+drawdown stop:
+
+| causal interval | old PnL | revised PnL | change | old to new BUY/SELL | old to new fees | old to new max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 UTC decline | -79.7607 | -76.3185 | +3.4422 | 2/2 to 3/11 | 0.4000 to 1.4004 | 1.3236% to 1.2414% |
+| 2026-08-05 15:00--21:00 UTC rise | +68.7337 | +68.5422 | -0.1915 | 1/0 to 2/0 | 0.1000 to 0.2000 | 0.2954% to 0.2954% |
+| 2026-08-08 00:00--12:00 UTC range | +11.9119 | +11.8348 | -0.0771 | 1/2 to 1/2 | 0.3000 to 0.3005 | 0.1186% to 0.1197% |
+| 2026-08-10 00:00--18:00 UTC mixed | -25.7799 | -27.5987 | -1.8188 | 2/4 to 6/10 | 1.1984 to 2.0361 | 1.0642% to 1.0779% |
+
+Aggregate PnL improves by 1.3549 JPY, but the change is not pathwise dominant:
+the decline benefit offsets smaller rise/range losses and a 1.8188 JPY mixed
+loss. Post-fill utility evaluated the new marginal input after fills but did
+not pass its conservative lower bound in these intervals, so the observed
+replay changes come from statistically identified one-sided capacity rather
+than from forced post-fill chasing. Artifacts are
+`/tmp/gc-{decline,rise,range,mixed}-marginal-utility.json`. The service was not
+restarted by this implementation and validation pass.
+
+
+### Signed adverse-side target cap (2026-08-11)
+
+Live order-size analysis found that the side-safe joint fallback can assign
+multiple exchange-minimum cells from posterior-sign/Kelly confidence even when
+the accepted signed Fast return points against that side. This is not in itself
+evidence of a bug: a BUY below the inventory target can reduce tracking risk
+during a decline. The unsafe case is allowing that adverse-side fill to carry
+inventory through the target as if the same weak terminal-path estimate were
+independent directional evidence.
+
+Let s=+1 for BUY and s=-1 for SELL, mu_H be the accepted signed Fast return,
+I the current risky notional, I-star the Fast target, q-min the minimum
+executable notional, and Q-hard the existing balance and hard-band capacity.
+Only the adverse side, s mu_H < 0, receives the target-centered cap:
+
+    gap_BUY  = I-star - I
+    gap_SELL = I - I-star
+    Q-side = min(Q-hard, max(q-min, gap-side)).
+
+When s mu_H is non-negative, Q-side remains Q-hard. The existing
+posterior-sign/Kelly allocation is then evaluated inside Q-side. Thus the rule
+does not add a second continuous weight, does not change quote price, does not
+gate either side, and preserves one exploratory exchange cell when current
+inventory is already beyond the target. It only prevents adverse signed drift
+from being used to justify a multi-cell target overshoot.
+
+Two stronger alternatives were rejected before selection. Scaling every order
+from the confidence-adjusted lower bound changed the mixed replay from
+-27.5987 to -41.8613 JPY and reduced SELL fills from 10 to 3. Applying the
+target cap to both sides produced the same mixed loss and reduced quote uptime
+from 99.9324% to 97.9787%. Those variants duplicated risk control and damaged
+Fast path continuity.
+
+The selected signed-only rule was replayed with exact next-BBO execution,
+current ETHJPY YAML, 6,830.6723 JPY opening equity, 0.01024405 ETH, zero
+visible-queue multiplier, and a 5% early drawdown stop. It was exactly neutral
+to the existing baseline on all measured outputs:
+
+| interval | PnL JPY | BUY/SELL fills | fees JPY | quote uptime | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 UTC decline | -76.3185 | 3/11 | 1.4004 | 99.5257% | 1.2414% |
+| 2026-08-05 15:00--21:00 UTC rise | +68.5422 | 2/0 | 0.2000 | 96.4930% | 0.2954% |
+| 2026-08-08 00:00--12:00 UTC range | +11.8348 | 1/2 | 0.3005 | 99.9807% | 0.1197% |
+| 2026-08-10 00:00--18:00 UTC mixed | -27.5987 | 6/10 | 2.0361 | 99.9324% | 1.0779% |
+
+The equality is intentional: these historical paths did not present the
+counterfactual adverse-side target overshoot. Unit tests cover bearish BUY,
+bullish SELL, trend-aligned capacity preservation, and the one-cell
+already-beyond-target case. Replay artifacts are
+/tmp/gc-{decline,rise,range,mixed}-adverse-target-cap.json. The running service
+was not restarted by this implementation and validation pass.
+
+
+### Mixed-path loss attribution and sizing-ablation comparison (2026-08-11)
+
+The fixed mixed interval is 2026-08-10 00:00--18:00 UTC. Execution is
+causal at the next BBO, with the current ETHJPY configuration, 6,830.6723 JPY
+opening pair equity, 0.01024405 ETH, zero visible-queue multiplier, and the same
+5% drawdown stop used by the earlier comparisons.
+
+The interval is a losing market path, not a case where market making
+underperformed passive holding. Mid fell from 301,582.5 to 298,185.5 JPY,
+or -113.2783 log bps. The accounting is:
+
+| component | JPY |
+| --- | ---: |
+| passive-hold PnL | -36.8376 |
+| strategy PnL | -27.5987 |
+| strategy excess over hold | +9.2389 |
+| maker fees | -2.0361 |
+| gross execution/inventory-timing benefit before fees | +11.2750 |
+
+The first three SELL fills, at 303,385.5, 305,016.7, and 305,065.7, contribute
+approximately +13.7789 JPY net versus carrying the same initial ETH to the final
+mark. The 12:41--13:36 reacquisition cluster contributes approximately
+-3.7509 JPY, and the remaining 15:13--17:27 churn contributes approximately
+-0.7891 JPY. Thus early de-risking worked, but later reacquisition and repeated
+small reversals returned part of that benefit.
+
+Several local BUY-to-SELL gaps cannot individually carry the two 10 bps maker
+fees:
+
+| observed local reversal | gross gap | after 20 bps fees |
+| --- | ---: | ---: |
+| 13:34 BUY to 13:36 SELL | 13.6230 bps | -6.3770 bps |
+| 15:13 BUY to 15:53 SELL | 3.9800 bps | -16.0200 bps |
+| 16:21 BUY to 16:22 SELL A | 3.6296 bps | -16.3704 bps |
+| 16:21 BUY to 16:22 SELL B | 12.6100 bps | -7.3900 bps |
+| 16:44 BUY to 17:09 SELL | 7.7566 bps | -12.2434 bps |
+| 16:44 BUY to 17:27 SELL | 17.9477 bps | -2.0523 bps |
+
+These are path diagnostics rather than FIFO realized-PnL assignments because
+the strategy begins with ETH inventory and can sell that inventory before a
+later BUY. They nevertheless show that separately valid quote decisions can
+form a fee-negative local cycle after the reservation center moves.
+
+The preceding signed-reservation artifact ended this same interval at
+38.6605% risky weight with 2 BUY and 4 SELL fills. The marginal-utility/current
+baseline ended at 33.2950% with 6 BUY and 10 SELL fills:
+
+| implementation | PnL JPY | excess over hold | BUY/SELL | fees JPY | max DD | ending risky weight |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| signed reservation before marginal fallback change | -25.7799 | +11.0577 | 2/4 | 1.1984 | 1.0642% | 38.6605% |
+| marginal-utility/current baseline | -27.5987 | +9.2389 | 6/10 | 2.0361 | 1.0779% | 33.2950% |
+
+The current baseline is 1.8188 JPY worse: +0.8376 JPY comes from additional
+fees and approximately +0.9812 JPY from worse gross execution/inventory timing.
+It sells more ETH near the bottom yet finishes with lower equity, so the
+additional turnover is not buying useful drawdown protection.
+
+The inventory controller also explains why bearish BUY fills can still occur.
+At 12:56, 13:34, 15:13, and 16:21 the signed Fast forecasts were respectively
+-28.70, -11.74, -1.30, and -14.34 bps, but risky weight remained only
+37.84%, 39.21%, 39.22%, and 39.12% against the 50% Fast target. A BUY therefore
+reduces target-tracking error even while it increases short-horizon downside
+exposure. The signed adverse-side cap implemented above prevents such a BUY
+from crossing the target, but intentionally does not prohibit a target-restoring
+BUY below it.
+
+The post-fill layer evaluated 17 reversals and applied none; every rejection
+was recorded as no inward candidate having a positive paired-utility lower
+bound. Its current fallback semantics then preserve the ordinary base quote.
+Consequently, rejecting a more aggressive inward price does not prevent the
+unchanged reverse quote from filling only 3--18 bps from the preceding fill.
+This is the principal remaining model/engineering mismatch: a post-fill
+utility rejection is advisory for price improvement, not authoritative for the
+choice among waiting, quoting farther out, keeping the base quote, or crossing.
+
+Sizing variants tested during this investigation are retained here to avoid
+selecting them again without new evidence:
+
+| variant | mixed PnL | BUY/SELL | fees | quote uptime | max DD | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| marginal-utility baseline | -27.5987 | 6/10 | 2.0361 | 99.9324% | 1.0779% | comparison baseline |
+| conservative lower-bound scaling on every fallback | -41.8613 | 6/3 | 0.9008 | 97.9787% | 1.3767% | rejected |
+| conservative multi-cell guard | -41.8613 | 6/3 | 0.9008 | 97.9787% | 1.3767% | rejected |
+| unconditional target-centered cap | -41.8613 | 6/3 | 0.9008 | 97.9787% | 1.3767% | rejected |
+| signed adverse-side target cap | -27.5987 | 6/10 | 2.0361 | 99.9324% | 1.0779% | selected; exact baseline preservation |
+
+The next statistically coherent correction should make the last fill and
+current inventory explicit state in one conditional terminal-wealth decision.
+For the opposite-side action it should compare wait, farther passive quote,
+current passive quote, and marketable IOC under the same fee, terminal mark,
+fill-probability, and inventory-risk distribution. This is a probabilistic
+impulse-control choice, not a hard last-fill price floor. It directly targets
+the extra 0.8376 JPY fee and 0.9812 JPY timing loss without suppressing the
+profitable early de-risking fills.
+
+
+### Unified Fast quantity ownership (2026-08-11)
+
+The fixed minimum-size regression came from an ownership error, not from the
+exchange filter. The live path first computed a dynamic risk multiplier, then a
+separate profitability sizing pass replaced both Fast capacities with one
+executable cell when neither side was distinguished. That made the logged
+risk multiplier observational only.
+
+Quantity now has one Fast owner. For side s, the feasible capacity is
+
+    C_s = min(Q_risk, inventory_headroom_s, available_balance_s).
+
+Without an identifiable terminal path, the probability baseline is limited to
+min(q0, C_s), where q0 is the exchange lattice cell. With one-sided terminal
+path evidence, Fast chooses a posterior-sign fractional-Kelly size inside C_s.
+For a two-sided promotion above q0, the same Fast path distribution must satisfy
+
+    U(q) = E[dW] - z SE[dW] - gamma Var(dW)/(2 W) > 0.
+
+The accepted price and quantity are solved together. There is no subsequent
+profitability cap. Macro may still set the inventory target and the portfolio
+hard band, but its reservation return is no longer a quantity input; those are
+constraints, not an independent sizing controller. Live and production replay
+call the same OptimizeUnifiedFastQuantity function.
+
+Exact next-BBO ETHJPY replay used the same four causal intervals, 6,830.6723
+JPY opening pair equity, 0.01024405 ETH, zero queue multiplier, current YAML,
+and a 5 percent drawdown stop. The selected refactor is bit-for-bit identical
+to the immediately preceding implementation on all reported execution and risk
+metrics:
+
+| interval UTC | previous / revised PnL JPY | BUY/SELL | fees JPY | max DD | quote uptime | mean joint pair utilization |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -76.3185 / -76.3185 | 3/11 | 1.4004 | 1.2414% | 99.5257% | 2.9646% |
+| 2026-08-05 15:00--21:00 rise | +68.5422 / +68.5422 | 2/0 | 0.2000 | 0.2954% | 96.4930% | 1.5963% |
+| 2026-08-08 00:00--12:00 range | +11.8348 / +11.8348 | 1/2 | 0.3005 | 0.1197% | 99.9807% | 3.7169% |
+| 2026-08-10 00:00--18:00 mixed | -27.5987 / -27.5987 | 6/10 | 2.0361 | 1.0779% | 99.9324% | 4.1944% |
+
+The non-trivial utilization values confirm that the historical Fast policy was
+not permanently fixed at one cell: one-sided posterior/Kelly decisions used
+multiple cells when supported. Three rejected ablations are retained as a
+warning: giving the probability-only fallback the full risk capacity worsened
+the mixed interval to -66.7400 JPY; using confidence as a direction gate
+worsened it to -41.8613 JPY; allowing posterior-mean joint multi-cell promotion
+without a robust lower-bound constraint worsened it to -35.4745 JPY. The
+selected model changes ownership and future safe promotion semantics without
+selecting any of those losing behaviors. Replay artifacts are
+/tmp/gc-{decline,rise,range,mixed}-fast-independent.json.
+
+### Whole-position marginal terminal wealth (2026-08-12)
+
+The previous Fast quantity utility priced only the candidate maker orders. A
+fall in ETH reduced marked pair equity and therefore reduced both side
+capacities, but the objective did not contain the existing ETH inventory or
+its covariance with a new order. This was pro-cyclical: the strategy could
+become smaller after a loss without recognizing that a SELL was a hedge of the
+larger inventory already on the book.
+
+Every completed executable-BBO path now records three random variables: BUY
+payoff, SELL payoff, and the return of current inventory marked from the start
+mid to the terminal bid. For current marked risky notional `X`, candidate
+notionals `qB` and `qS`, and incremental order payoff `dW`, Fast evaluates
+
+    Delta Var(W) = Var(dW) + 2 Cov(W_inventory, dW),
+
+and selects quantity by the marginal certainty equivalent
+
+    Delta CE = E[dW] - z SE[dW]
+               - gamma Delta Var(W) / (2 pairEquity).
+
+The unchanged-inventory expected PnL is reported but not added to candidate
+alpha because it is common to every action. Its covariance is not common and
+therefore remains in the decision. A SELL negatively correlated with existing
+long inventory can have `Delta Var(W) < 0`; its Kelly term is then a risk
+benefit and is deliberately not clamped to zero. A BUY with the same local
+spread edge can be rejected when it compounds whole-position downside risk.
+
+Inventory target ownership is unchanged. The Macro/no-trade result supplies
+the target and global hard band; `ProbabilityCenteredQuoteNotionals` supplies
+the feasible bid/ask split and chance constraint. Whole-position utility then
+chooses price and gross size inside that feasible set. No Macro return or
+second quantity multiplier is reintroduced.
+
+Average cost is not an input to this objective. It is logged as accounting
+state together with current mark-to-market PnL,
+
+    unrealizedPnL = baseInventory * (currentMid - averageCost),
+
+but using it as BUY encouragement or a minimum SELL price would double-count a
+sunk loss and recreate averaging-down/death-spiral behavior. The future target
+price is the empirical terminal executable bid/ask distribution on the active
+Fast horizon, not a fixed configured price.
+
+New live diagnostics are `jointQuoteBaselineVarianceJPY2`,
+`jointQuoteWholePositionVarianceJPY2`, `jointQuoteMarginalVarianceJPY2`,
+`jointQuoteInventoryOrderCovarianceJPY2`, `jointQuoteRiskReducing`, current and
+target risky weights, average cost, and unrealized JPY PnL. Unit tests require:
+
+1. a high-inventory SELL with negative inventory covariance receives a risk
+   benefit and may beat a small negative standalone edge;
+2. a locally positive BUY is rejected when it increases larger whole-position
+   risk;
+3. a strong executable-price reversal BUY remains admissible at low inventory;
+4. zero current inventory is exactly backward-compatible with the old
+   incremental payoff model.
+
+This change owns resting Fast quote size. The existing stale-ask IOC reset is
+still a separate execution-style comparison and retains its fail-closed gates;
+it must not infer permission to realize a loss merely from average cost or from
+an unconditioned volatility threshold. A future unified maker-versus-IOC action
+must reuse the same terminal paths and whole-position marginal utility before
+changing that behavior.
+
+### Fast terminal-downside exposure constraint (2026-08-12)
+
+Expanding the probability-centered fallback from one exchange cell to a
+target-sufficient Fast quantity improved capital use, but exposed a specific
+regression: during a persistent decline it could repeatedly add several BUY
+cells even when completed executable-price paths assigned non-positive
+whole-position utility to a new BUY. This is a Fast quantity defect, not a
+reason to restore Macro sizing or a rolling-return controller.
+
+For active Fast horizon (H), let (R_I) be the completed-path return of
+existing inventory, marked to the terminal executable bid. Let
+(Delta CE_B(q_0)) be the confidence-adjusted marginal whole-position
+certainty equivalent of one minimum executable BUY cell (q_0):
+
+    Delta CE_B(q0)
+      = E[dW_B(q0)] - z SE[dW_B(q0)]
+        - gamma Delta Var(W | BUY q0) / (2 pairEquity).
+
+Fast rejects BUY promotion above (q_0) only when all three statements hold:
+
+    FastDirection < 0,
+    E[R_I | completed Fast paths] < 0,
+    Delta CE_B(q0) <= 0.
+
+There is no fitted BPS threshold and no duplicate feature weight. Direction
+comes from the existing Fast crossing mixture; return and marginal
+wealth come from the same side-specific executable-BBO terminal paths already
+used by the joint optimizer. Insufficient samples, non-bearish direction,
+non-negative terminal inventory return, or positive BUY certainty equivalent
+all fail open to the original Fast decision. The bid is never deleted:
+multi-cell BUY is reduced to one exchange cell.
+
+The risk constraint is applied after the original Fast price/lifetime
+selection. An earlier implementation shrank the feasible quantity set before
+the joint search; that changed quote prices, order replacement timing, and
+worsened the mixed holdout by 1.38 JPY. The accepted ordering preserves the
+selected bid and ask exactly, changes only harmful additional BUY exposure,
+and recomputes the Bernoulli inventory moments and every terminal-wealth log
+field at the final quantity.
+
+Exact next-BBO ETHJPY replay used current YAML, 6,830.672313565 JPY opening
+pair equity, 0.01024405 ETH, zero queue multiplier, and a five-percent
+drawdown stop. Results compare against the deployed target-sufficient Fast
+baseline:
+
+| interval UTC | baseline PnL JPY | downside constraint PnL JPY | delta | baseline / revised max DD | baseline / revised BUY-SELL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -94.5173 | -83.7933 | +10.7240 | 1.5580% / 1.3954% | 6-3 / 7-3 |
+| 2026-08-05 15:00--21:00 rise | +70.7287 | +70.7287 | 0.0000 | 0.3173% / 0.3173% | 4-4 / 4-4 |
+| 2026-08-08 00:00--12:00 range | +11.8523 | +11.8523 | 0.0000 | 0.1209% / 0.1209% | 0-2 / 0-2 |
+| 2026-08-10 00:00--18:00 mixed holdout | -45.4615 | -45.4615 | 0.0000 | 1.4640% / 1.4640% | 15-13 / 15-13 |
+
+These four segments are an acceptance regression set, not a proof that every
+future non-decline path is invariant. They do show the intended locality:
+rise, range, and untouched mixed execution metrics are exactly unchanged,
+while the selected decline loses 10.72 JPY less and reduces drawdown. Replay
+artifacts are
+`/tmp/gc-fast-downside-postcap-{decline,rise,range,holdout}.json`; deployed
+baseline artifacts are
+`/tmp/gc-fast-only-directional-{decline,rise,range,holdout}.json`.
+
+## 2026-08-12: fee-scale pivot audit and posterior inventory target
+
+The 2026-08-08 00:00--12:00 UTC interval was previously called a range from
+its full-sample high/low span. That label is not sufficient for a maker with a
+20 bps round-trip fee. Minute-level causal directional-change pivots show:
+
+| reversal threshold | confirmed pivots | low-to-high legs | high-to-low legs |
+| ---: | ---: | ---: | ---: |
+| 20 bps | 3 | 1 | 1 |
+| 22 bps | 3 | 1 | 1 |
+| 26 bps | 1 | 0 | 0 |
+| 30 bps | 1 | 0 | 0 |
+| 40 bps | 1 | 0 | 0 |
+
+The 26 bps threshold is the configured two-sided 20 bps maker fee, 4 bps
+adverse-selection allowance, and 2 bps residual edge. At that economically
+relevant scale the sample confirms only the 00:03 low, at 03:32; it never
+completes the opposite pivot. The observed zero BUY plus two SELL full fills
+therefore do not prove that Fast ignored a profitable oscillation. This sample
+is a low-volatility upward path, not a fee-net ranging acceptance case. Future
+range selection must require causal pivot richness at the configured cost
+scale rather than a large full-period high/low range.
+
+Extending Fast windows to 1h and 3h in a temporary research YAML increased
+mean quote life from 1,797 to 5,366 seconds but still produced zero BUY, two
+SELL, and zero completed cycles; PnL fell from 11.8523 to 11.5810 JPY. Lowering
+the quote globally or interpreting a confidence interval containing zero as a
+range also failed. The latter is a statistical error: failure to reject drift
+is not an equivalence test. A valid drift-neutral claim would require the
+entire confidence interval to lie inside an economically defined equivalence
+band.
+
+The mixed holdout exposed a separate constant-mix error. Recomputing a 50%
+JPY-value target at every price mechanically asks for additional base after a
+decline, even when the executable BUY terminal-return posterior is negative.
+Fast now uses a persisted base anchor and the executable-bid posterior to form
+an expected inventory target:
+
+    p_t = Phi(mu_B,t / SE_B,t)
+    Q_low  = min(Q_anchor, Q_policy,t)
+    Q_high = max(Q_anchor, Q_policy,t)
+    Q_target,t = Q_low + p_t (Q_high - Q_low).
+
+Here `mu_B,t` and `SE_B,t` are learned online from completed side-specific BBO
+paths at the selected Fast horizon. With insufficient variance samples the
+symmetric prior `p_t = 0.5` is used. Hard inventory bounds remain authoritative.
+The anchor is persisted across restarts and is adjusted by externally
+reconciled base-balance changes; ordinary strategy fills do not reset it.
+Price construction remains the original Fast model, so this formula changes
+only the probability-centered quantity target and does not add a second Macro
+controller.
+
+Exact next-BBO replay against the previously deployed downside-aware Fast:
+
+| interval UTC | old PnL JPY | posterior-target PnL JPY | delta | old/new max DD | new BUY-SELL / cycles |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -83.7933 | -83.0548 | +0.7385 | 1.3954% / 1.3746% | 7-2 / 2 |
+| 2026-08-05 15:00--21:00 rise | +70.7287 | +70.9943 | +0.2655 | 0.3173% / 0.3149% | 4-7 / 4 |
+| 2026-08-08 00:00--12:00 low-volatility rise | +11.8523 | +11.8523 | 0.0000 | 0.1209% / 0.1209% | 0-2 / 0 |
+| 2026-08-10 00:00--18:00 mixed holdout | -45.4615 | -44.8942 | +0.5674 | 1.4640% / 1.4244% | 15-13 / 13 |
+
+The mixed holdout still trails hold (-36.8376 JPY) by 8.0566 JPY, so this is a
+strictly local improvement, not evidence of hold dominance. Maker fees were
+5.0016 JPY and remaining adverse markout explains much of the residual gap.
+The accepted artifacts are `/tmp/gc-fast-shared-{decline,rise,range,holdout}.json`.
+Rejected inward-price, fixed-anchor, one-cell hard fallback, continuous-sizing,
+and long-horizon experiments were not enabled in the live configuration.
+
+## 2026-08-12: endogenous Fast quote-center drift
+
+Fast quote prices can follow a forecasted price center, but the forecast is
+part of the original quote optimization rather than a post-quote overlay. For
+each active Fast horizon `H`, a causal rolling regression uses only information
+available at the anchor:
+
+    x_t = [1, raw crossing direction_t, BBO imbalance_t]
+    Y^ask_t = 10000 log(Ask_(t+H) / Ask_t)
+    Y^bid_t = 10000 log(Bid_(t+H) / Bid_t)
+    mu_raw,t = x_t beta_center.
+
+Anchors do not overlap. The label is the first BBO at or just after `t+H`, and
+a data gap invalidates the pending anchor. Ask and bid are fitted separately so
+wide-spread symbols are never trained on an unexecutable midpoint label. The
+center is formed only after the two side regressions are fitted. Startup BBO
+replay and the version-2 model checkpoint rebuild/persist the exact same causal
+state; no pre-trained artifact or other symbol is used.
+
+The raw forecast is not accepted merely because in-sample OLS is fitted. Each
+matured anchor stores the raw forecast made before its label existed. Relative
+to the zero-drift forecast, define the prequential squared-error gain
+
+    g_i = Y_i^2 - (Y_i - mu_raw,i)^2,
+    p_skill = Phi(mean(g) / SE(mean(g))),
+    omega = max(0, 2 p_skill - 1),
+    mu_t = omega mu_raw,t.
+
+If there are fewer than three validation samples or `mean(g) <= 0`, the model
+fails closed and the exact old Fast quote is retained. `omega` is Bayesian
+model averaging between the zero-drift and learned models, not a fitted bps
+threshold. Conditional-mean uncertainty and model-selection uncertainty enter
+the risk scale; the residual return innovation does not, because executable
+side QV already prices that risk and adding it again would double-count
+volatility.
+
+When accepted, the unified Fast quote uses
+
+    reservationShiftBps
+      = -[(inventory pressure + fill-rate pressure) riskScale - mu_t].
+
+A positive forecast therefore brings the bid inward and moves the ask outward;
+a negative forecast does the reverse. The old direction/book/volume heuristic
+center shift, posterior directional inventory target, direction quantity
+restraints, and legacy post-quote Fast reservation overlay are bypassed only
+while drift is accepted. This prevents the same crossing/book evidence from
+changing price, target, and quantity multiple times. Spread selection,
+side-specific QV, historical crossing probabilities evaluated at the final
+bid/ask distances, inventory hard bounds, and exchange filters remain active.
+
+A rejected prototype scored the already-shrunk forecast in prequential
+validation. That made weak forecasts resemble zero and created a self-validating
+feedback loop. On the decline segment it worsened PnL from -83.0548 to -91.9701
+JPY. The accepted implementation always scores `mu_raw`, then applies `omega`
+only to the current quote. Another rejected prototype put the full posterior
+return innovation variance into the quote risk scale; this duplicated side QV
+and was removed.
+
+Exact next-BBO ETHJPY replay used current YAML, 6,830.672313565 JPY opening pair
+equity, 0.01024405 ETH, zero queue multiplier, and a five-percent drawdown stop.
+Baseline is the current posterior-target Fast model without drift:
+
+| interval UTC | baseline PnL JPY | drift PnL JPY | delta | baseline / drift max DD | drift BUY-SELL / cycles | max accepted weight |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -83.0548 | -83.0548 | 0.0000 | 1.3746% / 1.3746% | 7-2 / 2 | 0.1172 |
+| 2026-08-05 15:00--21:00 rise | +70.9943 | +71.6325 | +0.6382 | 0.3149% / 0.3271% | 5-8 / 5 | 0.3464 |
+| 2026-08-08 00:00--12:00 low-volatility rise | +11.8523 | +11.8523 | 0.0000 | 0.1209% / 0.1209% | 0-2 / 0 | 0.0000 |
+| 2026-08-10 00:00--18:00 mixed holdout | -44.8942 | -43.5309 | +1.3633 | 1.4244% / 1.4219% | 13-11 / 11 | 0.4603 |
+
+The mixed sample still trails hold (-36.8376 JPY), and the maximum mixed
+weight comes from only this finite historical sample. These results establish
+non-regression on this acceptance set, not generalizable alpha. The feature is
+therefore implemented with `enabled` and `shadowOnly` controls and is not
+enabled in the live YAML by this change. Research activation uses
+`--enable-fast-drift`; accepted artifacts are
+`/tmp/gc-fast-drift-final-{decline,rise,range,mixed}.json`.
+
+The features deliberately exclude trade-volume inputs for now. Live and
+startup replay currently consume BBO and trade files in different passes;
+including those features would make a restart train a different model from the
+continuous live path. They can be added only after replay ordering is unified
+and equivalence-tested.
+
+## 2026-08-12: target-aware minimum-BUY admission
+
+The mixed holdout exposed a discrete-exchange failure that remained after the
+continuous quantity optimization. Between 12:00 and 15:20 UTC, seven 100 JPY
+BUY fills accumulated while ETHJPY fell about 211 log bps. Marking that BUY
+cohort at the 15:19:31 public trade gives approximately -10.51 JPY after maker
+fees. From 11:55 to 15:25 the strategy deteriorated about 7.17 JPY relative to
+hold. The individual 100 JPY orders were small, but the model reconsidered each
+minimum exchange cell independently and had no constraint on their cumulative
+overshoot above the posterior inventory target.
+
+For one executable minimum BUY cell `q_min`, the existing completed-path model
+already calculates the whole-position confidence equivalent
+
+    CE_t(q_min) = E_t[Delta W]
+                  - z sqrt(Var_t(Delta W) / n_eff)
+                  - lambda/(2 E_t) [Var_t(W + Delta W) - Var_t(W)].
+
+This includes the covariance between the current inventory and the new BUY.
+No return-bps cutoff or fitted drawdown threshold is added. If this statistic
+is positive, the unified Fast optimizer keeps its original quantity. If it is
+non-positive, the admissible acquisition interval is restricted to the
+posterior target deficit:
+
+    q_buy* = min(q_fast, max(0, Q_target - Q_current)).
+
+If the right-hand side is below `q_min`, `q_buy*` is zero. Therefore a sequence
+of individually minimal orders cannot keep accumulating above the same target.
+The SELL side is independent and remains available. Missing or invalid
+terminal-path samples fail open and preserve the original Fast BUY. The rule is
+applied after Fast has selected price and order lifetime; only quantity changes,
+and the Bernoulli inventory moments and terminal-wealth diagnostics are then
+recomputed at the admitted size.
+
+A strict counterfactual that selected zero BUY whenever `CE_t(q_min) <= 0`
+improved the mixed replay to -27.3388 JPY, but produced zero BUY fills and was
+rejected as incompatible with market making. The accepted target-aware rule was
+validated with the same next-BBO simulator, current ETHJPY YAML, 6,830.672313565
+JPY opening pair equity, 0.01024405 ETH, zero queue multiplier, and a five-percent
+drawdown stop:
+
+| interval UTC | prior PnL JPY | admitted PnL JPY | delta | prior / admitted max DD | admitted BUY-SELL / cycles |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -83.0548 | -80.5291 | +2.5257 | 1.3746% / 1.3305% | 2-2 / 2 |
+| 2026-08-05 15:00--21:00 rise | +71.6325 | +69.6533 | -1.9792 | 0.3271% / 0.3154% | 3-7 / 3 |
+| 2026-08-08 00:00--12:00 low-volatility rise | +11.8523 | +11.8523 | 0.0000 | 0.1209% / 0.1209% | 0-2 / 0 |
+| 2026-08-10 00:00--18:00 mixed holdout | -43.5309 | -36.8586 | +6.6722 | 1.4219% / 1.3287% | 4-10 / 4 |
+
+Across these four fixed acceptance intervals, PnL improved by 7.2187 JPY. The
+rise interval gave back 1.9792 JPY versus the prior strategy but remained about
+0.916 JPY above hold; decline and mixed drawdown both improved, and the
+low-volatility interval was exactly unchanged. This is finite-sample regression
+evidence rather than a general profitability guarantee. Integrated replay
+artifacts are `/tmp/gc-buy-admission-integrated-{decline,rise,range,mixed}.json`;
+the unchanged reference artifacts are
+`/tmp/gc-fast-drift-final-{decline,rise,range,mixed}.json`.
+
+Live diagnostics are `fastBuyAdmissionEvaluated`,
+`fastBuyAdmissionApplied`, `fastBuyAdmissionMaximumJPY`, and
+`fastBuyAdmissionReason`. The evaluated flag is essential: a numeric zero from
+an unavailable estimate must never be interpreted as zero economic utility.
+
+### Two-sided extension and long-only asymmetric confidence
+
+SELL has the same exchange-lattice leakage mechanism as BUY: an unconditional
+bilateral fallback can repeatedly sell one minimum cell while inventory is
+already below the posterior target. It cannot, however, use exactly the same
+hypothesis test as BUY. ETHJPY inventory is long-only, so a false-positive BUY
+adds downside tail exposure while a false-positive SELL reduces exposure but
+may lose upside. The accepted controller uses one target-aware side function
+with side-specific confidence evidence evaluated at the final selected bid and
+ask distances:
+
+    LCB_buy = CE_t(q_buy,min, 0; z),
+
+    UCB_sell = [CE_t(q_buy, q_sell,min; 0) - CE_t(q_buy, 0; 0)]
+               + z [SE_with + SE_without].
+
+`SE_with + SE_without` is a conservative upper bound on the standard error of
+the paired difference when its covariance is not separately identified. BUY
+is allowed to cross the posterior target only when `LCB_buy > 0`; SELL is
+prevented from crossing the target only when even `UCB_sell < 0`. An exact
+SELL upper bound of zero is treated as unidentified, not harmful. Thus risk-
+increasing acquisition requires positive evidence, whereas a risk-reducing
+sale is removed only with negative evidence. If the confidence-adjusted joint
+two-sided CE is positive, both sides are retained as a complementary Fast
+cycle even if an isolated side statistic is weaker. Missing path evidence
+fails open.
+
+For a non-positive decision bound the common lattice projection is
+
+    q_buy*  = min(q_buy,  max(0, Q_target - Q_current)),
+    q_sell* = min(q_sell, max(0, Q_current - Q_target)).
+
+Any positive remainder below the venue minimum is rounded to zero. After one
+or both sides are changed, fill-weighted expected inventory, Bernoulli
+variance, confidence limits, target error, whole-position utility, and capital
+utilization are recomputed. Price and order lifetime are unchanged.
+
+Two rejected prototypes explain why both qualifications matter. Subtracting
+two lower confidence bounds as if it were a confidence bound for their
+difference killed all rise fills and changed the rise result to hold. Applying
+an upper-bound test to BUY as well as SELL preserved rise but restored all 13
+mixed BUY fills and the old -43.5309 JPY result. The accepted long-only policy
+was replayed against the prior BUY-only implementation:
+
+| interval UTC | BUY-only PnL JPY | two-sided PnL JPY | max DD | two-sided BUY-SELL / cycles |
+| --- | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -80.5291 | -80.5291 | 1.3305% | 2-2 / 2 |
+| 2026-08-05 15:00--21:00 rise | +69.6533 | +69.6533 | 0.3154% | 3-7 / 3 |
+| 2026-08-08 00:00--12:00 low-volatility rise | +11.8523 | +11.8523 | 0.1209% | 0-2 / 0 |
+| 2026-08-10 00:00--18:00 mixed holdout | -36.8586 | -36.8586 | 1.3287% | 4-10 / 4 |
+
+PnL, drawdown, and fill counts are exactly unchanged on all four fixed
+intervals. SELL admission was evaluated at 39, 36, 18, and 76 quote decisions
+in decline, rise, range, and mixed respectively, but never activated: the
+candidate upper bounds were zero or positive, not strictly negative. A rejected
+`UCB <= 0` prototype activated six times in mixed, but it incorrectly treated
+zero payoff/touch evidence as proof of harm. The final result is a safe
+behavioral extension on the current acceptance set, not proof that future
+results are invariant. Accepted artifacts are
+`/tmp/gc-two-sided-final-{decline,rise,range,mixed}.json`.
+
+Live diagnostics now include `fastBuyAdmissionUtilityBoundJPY`,
+`fastSellAdmissionUtilityBoundJPY`, `fastSellAdmissionApplied`,
+`fastSellAdmissionMaximumJPY`, `fastAdmissionJointCEJPY`, and
+`fastAdmissionJointComplementary`, in addition to the evaluated/reason fields
+for both sides.
+## Retired BOCPD and Hawkes direction experiments
+
+The executable-side BOCPD quantity target and the 45-second marked-Hawkes
+direction mixture were retired on 2026-08-12. They are absent from the live
+configuration, quote decision, trade observer, startup warmup, model checkpoint,
+and production-equivalent replay. Their source is build-excluded temporarily so
+the rejected experiment remains auditable without entering any binary.
+
+The decision was empirical, not stylistic. On 260 non-overlapping ETHJPY
+10-minute anchors, neither posterior had positive probability skill:
+
+| posterior | directional accuracy | Brier skill vs 50/50 |
+| --- | ---: | ---: |
+| executable-side BOCPD | 48.85% | -9.26% |
+| Hawkes intensity only | 48.85% | -3.91% |
+| confidence-tempered fusion | 50.38% | -14.38% |
+
+The fusion's 50.38% sign accuracy was not useful: its more extreme wrong
+probabilities made calibration worse. Four fixed-regime next-BBO replays gave:
+
+| interval UTC | baseline PnL | BOCPD PnL | Hawkes PnL | fused PnL |
+| --- | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -81.5314 | -82.3836 | -89.4998 | -112.2982 |
+| 2026-08-05 15:00--21:00 rise | +69.2059 | +63.0981 | +59.8952 | +42.6171 |
+| 2026-08-08 00:00--12:00 low-volatility/range | +11.9158 | +11.9158 | +11.8524 | +11.9158 |
+| 2026-08-10 00:00--18:00 mixed | -38.6742 | -52.2093 | -56.8783 | -88.6917 |
+| aggregate | -39.0839 | -59.5790 | -74.6305 | -146.4569 |
+
+Aggregate fills/fees were baseline 27/4.2116 JPY, BOCPD 29/22.0939 JPY,
+Hawkes 41/26.9307 JPY, and fused 39/62.5793 JPY. The 45-second Hawkes state was
+horizon-mismatched to a 10-minute inventory decision, while BOCPD and Hawkes
+reused correlated public-market information and made the fused posterior
+needlessly confident.
+
+### Research-only 45-second BOCPD replacement test
+
+A 45-second executable-BBO BOCPD was tested in the exact former Hawkes
+Fast-direction slot. It did not control the inventory target: its ask/bid
+posterior direction and variance-derived confidence were combined with Fast
+crossing confidence before the existing side restraints, while the unified
+price/quantity solver remained authoritative. The model is research-only and
+is absent from live YAML, checkpoints, and warmup.
+
+On non-overlapping 45-second anchors, the raw posterior had higher sign
+accuracy than a prequential climatology, but worse probability calibration:
+
+| interval UTC | anchors | BOCPD accuracy | prequential base | Brier skill |
+| --- | ---: | ---: | ---: | ---: |
+| decline | 595 | 52.94% | 50.76% | -7.82% |
+| rise | 452 | 52.65% | 49.34% | -8.55% |
+| range | 563 | 57.73% | 52.22% | +2.29% |
+| mixed | 1,313 | 54.84% | 49.89% | -4.61% |
+| weighted | 2,923 | 54.67% | 50.43% | -4.55% |
+
+The same fixed-regime next-BBO replay gave:
+
+| interval UTC | no auxiliary PnL | BOCPD45 PnL | former Hawkes baseline |
+| --- | ---: | ---: | ---: |
+| decline | -81.9624 | -81.5143 | -81.5314 |
+| rise | +66.8579 | +67.5354 | +69.2059 |
+| range | +11.8355 | +12.4241 | +11.9158 |
+| mixed | -40.8997 | -43.3440 | -38.6742 |
+| aggregate | -44.1688 | -44.8988 | -39.0839 |
+
+BOCPD45 produced 30 fills (11 BUY, 19 SELL), 5.3809 JPY fees, and 5,082.83
+JPY turnover. Its aggregate PnL was 0.7300 JPY below no auxiliary and 5.8149
+JPY below the former Hawkes baseline. In mixed, a 385.88 JPY BUY near 305,380
+JPY at 07:48 UTC was not subsequently unwound and increased exposure before
+the decline. This is consistent with the negative Brier skill: direction signs
+are better than chance, but the raw posterior is too confident.
+
+Conclusion: do not promote raw BOCPD45. Any further experiment must learn a
+strictly prequential calibration map after labels mature; a hand-tuned weight
+would hide rather than solve the probability error. Promotion still requires
+positive out-of-sample Brier skill and a non-negative paired fee-net PnL lower
+bound.
+
+
+### Strictly-prequential BOCPD45 calibration
+
+The follow-up uses labels only after they mature. For a forecast made at
+12:00:00, neither the calibrator nor the reported probability can use the
+12:00:45 outcome before the first executable BBO at or after 12:00:45 arrives.
+The event order is:
+
+1. discard a pending label if it spans a 15-minute data gap;
+2. mature the previous 45-second label against executable ask and bid returns;
+3. update the rolling calibrator;
+4. snapshot and queue the next prediction.
+
+For example, if raw BOCPD repeatedly emits $p_{up}=0.82$, but already-matured
+comparable labels realize only about 55% up moves, calibration should map the
+forecast toward 0.55. It must not change the BOCPD change-point posterior or
+retroactively alter the stored 0.82 forecast.
+
+The ablation compared regularized Platt scaling, beta calibration, and rolling
+isotonic regression. All use at most 480 non-overlapping labels (six hours),
+require 32 mature labels, and refit every eight labels. Platt and beta fits are
+shrunk toward the identity map by eight prior-equivalent observations; isotonic
+uses 12 probability bins with identity-centred tail smoothing. These choices
+bound regime memory and replay CPU without an offline artifact.
+
+| interval UTC | raw skill | Platt skill | beta skill | isotonic skill |
+| --- | ---: | ---: | ---: | ---: |
+| decline | -9.56% | +0.06% | -0.34% | +0.27% |
+| rise | -9.52% | -0.61% | -0.94% | -1.10% |
+| range | +1.68% | +2.08% | +2.38% | +2.27% |
+| mixed | -5.00% | +0.65% | +0.54% | -0.10% |
+| weighted, 2,920 labels | -5.35% | **+0.61%** | +0.48% | +0.28% |
+
+Platt was selected because it had the best weighted Brier skill and the lowest
+model complexity. Beta's asymmetric extra parameter did not improve aggregate
+skill, and isotonic was less stable in mixed and rising paths. Platt reduced
+mean absolute probability confidence from roughly 27--33% raw to roughly
+4--15%, which is consistent with the observed overconfidence.
+
+The selected map was then placed in the research-only BOCPD45 Fast-direction
+slot. It does not control the inventory target, and the calibrated probability
+is learned only from same-symbol matured replay/session labels. Fixed-regime,
+next-BBO, 10 bps maker-fee results were:
+
+| interval UTC | hold PnL | no auxiliary PnL | raw BOCPD45 PnL | calibrated Platt PnL | fills B/S | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| decline | -80.0265 | -81.9624 | -81.5143 | -80.6707 | 3/3 | 1.3405% |
+| rise | +68.7376 | +66.8579 | +67.5354 | +70.5087 | 3/9 | 0.3230% |
+| range | +12.0675 | +11.8355 | +12.4241 | +12.4119 | 1/1 | 0.1278% |
+| mixed | -36.8376 | -40.8997 | -43.3440 | -38.7584 | 3/7 | 1.3246% |
+| aggregate | -36.0591 | -44.1688 | -44.8988 | **-36.5085** | 10/20 | -- |
+
+The calibrated replay produced 30 fills and 4.9880 JPY maker fees. It improved
+aggregate PnL by 7.6603 JPY versus no auxiliary, by 8.3903 JPY versus raw
+BOCPD45, and by 2.5754 JPY versus the retired Hawkes baseline. It still trailed
+hold by 0.4494 JPY and the rising interval still had slightly negative
+probability skill. Therefore Platt is the selected research implementation, not
+a live promotion: live YAML, checkpoints, warmup, and service state remain
+unchanged. Promotion still requires a non-negative paired fee-net PnL lower
+bound on additional chronological data.
+
+
+#### Live Platt canary (2026-08-13)
+
+After explicit operator approval, the selected Platt map was promoted as a live
+ETHJPY canary. The YAML block is `marketMaker.bocpd45`: it enables the
+45-second horizon, six-hour calibration window, 32-label readiness floor,
+480-label effective rolling capacity, eight-label refit cadence, 128 BOCPD
+states, and identity prior strength eight. Macro remains disabled and BOCPD45
+does not own the inventory target, quote distance, or quantity; it enters only
+the existing Fast-direction confidence mixture.
+
+The live implementation uses the same event ordering and coefficients as the
+research replay. A pointwise equivalence test drives both implementations with
+2,400 identical executable BBO observations and requires raw posterior,
+confidence, calibrated probability, and direction to agree within (10^{-12}).
+Model checkpoint schema version 3 stores the BOCPD run-length state, rolling
+mature labels, pending unmatured anchor, refit phase, and replay cursor.
+Changing from the old schema intentionally forced one bounded startup rebuild,
+after which restarts can restore the calibration and replay only the capture
+delta.
+
+The 2026-08-13 01:32 JST userspace restart rebuilt from 190,161 same-symbol BBO
+updates. Startup reported `bocpd45Calibration=platt`,
+`bocpd45CalibrationReady=true`, 480 retained calibration samples, 498 mature
+labels, and a ready direction posterior. On the first live decision, raw up
+probability 0.22121 was mapped to 0.40892, demonstrating that Platt was
+actually applied rather than merely decoded from YAML. Both BUY and SELL maker
+orders were submitted, the next status interval reported two active orders,
+account reconciliation remained healthy, and systemd reported zero restarts.
+Live operation emits one concise `BOCPD45 calibration status` record per minute
+after observing the newest executable BBO. It exposes retained calibration
+samples, cumulative mature labels, the pending-label maturity time, and both
+raw and Platt-calibrated probabilities, so label progress remains visible even
+while maker orders are intentionally retained. The larger quote-evaluation
+record keeps only calibration readiness, mature-label count, and the direction
+actually mixed into Fast, avoiding a second copy of the diagnostic payload.
+The prior executable was retained as
+`bin/bbgo.pre-platt-20260813-0131`.
+
+### Next 10-minute predictor research
+
+No published indicator is accepted as an ETHJPY 10-minute predictor merely
+because it works at the next-tick horizon or on another symbol. The strongest
+literature-supported candidates available from the local BBO and aggregate
+trade archive are:
+
+1. normalized level-1 order-flow imbalance over fixed 30-second, 1-, 3-, and
+   5-minute lags, motivated by Cont, Kukanov, and Stoikov's linear relation
+   between short-interval price change and OFI scaled by depth;
+2. a non-Hawkes transient/history-dependent impact residual that separates
+   price-changing from non-price-changing signed trades, following the two-event
+   propagator/HDIM framework of Taranto et al.;
+3. lagged executable-side returns over 1, 3, 5, and 10 minutes, allowed to learn
+   momentum or reversal rather than imposing either sign;
+4. conditioning variables for spread, displayed BBO depth, quote-update rate,
+   continuous realized variance, jump variation, and clock phase. These are
+   state variables, not independent votes that each resize price and quantity.
+
+The target must be horizon- and fee-matched. For horizon H = 10 minutes, define
+executable long and short terminal edges
+
+    e_long(t,H)  = log(bid(t+H) / ask(t)) - fee_round_trip,
+    e_short(t,H) = log(bid(t) / ask(t+H)) - fee_round_trip.
+
+The research classifier predicts three outcomes: profitable long, profitable
+short, or no fee-clearing edge. It is updated only when the 10-minute label has
+matured, using an exponentially weighted, regularized multinomial logistic
+model. This remains same-symbol online learning and needs no pretrained
+artifact. Features enter one probabilistic model; they do not become multiple
+post-hoc gates or quantity multipliers.
+
+Promotion requires chronological prequential evaluation against both the
+majority-class and unconditional-probability baselines. Required statistics are
+Brier and log-loss skill, reliability/calibration bins, balanced accuracy,
+fee-net certainty-equivalent value, and stationary-block-bootstrap confidence
+limits. Raw sign accuracy near 50% is neither sufficient nor automatically a
+failure when the actionable fee-clearing classes are imbalanced; a candidate is
+rejected unless its out-of-sample probability skill and economic lower bound
+are both positive.
+
+Primary references:
+
+- [The Price Impact of Order Book Events](https://arxiv.org/abs/1011.6402)
+- [The Micro-Price: A High Frequency Estimator of Future Prices](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2970694)
+- [Linear models for the impact of order flow on prices I](https://arxiv.org/abs/1602.02735)
+- [Intraday Return Predictability in the Cryptocurrency Markets](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4080253)
+- [The short-term predictability of returns in order book markets](https://doi.org/10.1016/j.ijforecast.2024.02.001)
+
+
+### Overnight execution incident and terminal-utility boundary (2026-08-13)
+
+The live interval from 01:40:44 to 08:14:40 JST contained 91,226 BBO updates,
+2,198 public trades, 37 submitted maker orders, and four confirmed fills. The
+largest adverse event was a 0.00196 ETH BUY at 299,844 JPY. At submission the
+joint model already reported negative marginal certainty-equivalent utility
+for BUY (-0.00528 JPY), negative joint expected PnL (-0.0884 JPY/hour), and a
+negative lower bound (-0.2713 JPY/hour). Nevertheless, a roughly 595 JPY
+posterior target deficit bypassed that result and authorized a roughly 590 JPY
+order. Its five-minute markout was -23.8 bps. This was an inconsistent
+boundary condition, not evidence that the terminal-wealth objective preferred
+the trade.
+
+The corrected exchange-lattice admission rule is
+
+    q_buy <= min(q_requested, q_target_deficit)
+
+when marginal terminal utility is positive or unavailable, while a known
+non-positive BUY utility permits at most one minimum-notional lattice cell:
+
+    q_buy <= min(q_requested, q_target_deficit, q_exchange_min).
+
+This preserves a minimum Fast bid instead of restoring a legacy hard gate, but
+prevents an inventory target from turning one negative-utility decision into a
+multi-cell acquisition. SELL remains allowed to reduce inventory toward the
+posterior target even when its own marginal utility is non-positive; long-only
+inventory cannot be reduced below zero. Utility is recalculated after every
+fill, so repeated minimum-cell acquisitions require independent subsequent
+decisions rather than inheriting the original target deficit.
+
+The exact next-BBO replay over the same interval, initialized with 4,240.0459
+JPY and 0.0086625 ETH, produced four fills (three BUY, one SELL), 100% quote
+uptime, no replay data gaps, and only 100 JPY per negative-utility target BUY.
+Net PnL was -24.2045 JPY versus -23.6573 JPY for hold, an excess of -0.5473
+JPY. The result verifies removal of the size bypass but does not establish
+positive alpha; the remaining small deficit must not be hidden by relaxing OFI
+readiness or by increasing size without additional matured evidence.
+
+Three execution/accounting defects found in the same audit were corrected:
+
+1. Binance execution reports now retain order creation time separately and use
+   transaction time for `UpdateTime`, so SQLite lifecycle duration is no longer
+   forced to zero.
+2. A terminal fill sequence defers an ordinary refresh for two seconds while
+   the balance-aware fill worker recomputes inventory and quotes. This avoids
+   submitting a stale opposite order during the cancel/fill race; the final
+   rebalance still runs after 500 ms.
+3. Recently completed order IDs are retained for ten minutes and duplicate
+   terminal updates are ignored. Pending terminal updates are age-bounded and
+   capacity-bounded, preventing the observed unbounded pending-order growth.
+   After order ownership is resolved, the trade row is also upserted with
+   strategy and fee-adjusted PnL attribution.
+
+OFI/volume-agreement thresholds were intentionally unchanged. Only four of 25
+overnight evaluations had mature agreement evidence, which is insufficient to
+justify a threshold change without overfitting one session.
+
+### Fast horizon/quantity regression correction (2026-08-13)
+
+A fixed next-BBO replay bisect found two independent Fast-model regressions.
+First, quote horizon selection already maximized estimated fee-net two-sided
+crossing edge per hour, but Fast direction still came from the shortest healthy
+10/15/30-minute model. A quote could therefore use the price distribution of
+one horizon and the direction/quantity posterior of another. Second, the BUY
+admission boundary forced every known non-positive marginal-utility target BUY
+to exactly one exchange-minimum cell. That duplicated the existing bearish
+terminal-path cap and suppressed rational acquisition in rising paths.
+
+The corrected selection is causal and same-symbol. For every configured
+horizon H, executable ask-return volatility for BUY and bid-return volatility
+for SELL are estimated on H and shrunk toward the longer BBO prior. The quote
+horizon maximizes the existing Jeffreys-posterior objective
+
+    S_H = min(p_buy(H), p_sell(H)) * max(0, edge_net(H)) / H.
+
+The directional Fast snapshot is then selected at that same H when healthy;
+health-ranked fallback is retained when it is not. A tested prototype that
+subtracted z times the score standard error was rejected because confidence is
+already charged by the downstream whole-position terminal-wealth optimizer and
+the second penalty reduced rise PnL materially. A symmetric unit-position
+terminal-payoff horizon selector was also rejected because it ignored current
+inventory and duplicated the downstream joint optimizer.
+
+For a target-deficit BUY whose marginal certainty-equivalent utility is not yet
+positive, the additional executable cells now vary continuously with the
+selected-window Beta posterior advantage instead of using either an all-or-one
+hard switch. Since the Fast posterior direction is d = 2 P(up) - 1,
+
+    a = max(0, min(1, d)),
+    q_cap = q_min + a * (min(q_requested, q_target_deficit) - q_min).
+
+The independent bearish terminal-path rule remains authoritative: when Fast is
+bearish, the completed executable-bid terminal return is negative, and a
+minimum-cell BUY has non-positive whole-position certainty equivalent, BUY is
+still capped at q_min. Thus weak/neutral evidence keeps one sampling cell only
+when the posterior target deficit is itself exchange-executable; a smaller
+deficit rounds to zero instead of crossing the target with a known
+non-positive-utility order. Strong bullish evidence restores target
+acquisition gradually, and the same risk observation is not multiplied through
+two controllers.
+
+The production-equivalent replay now reads `marketMaker.bocpd45.enabled` and
+its calibration method from YAML automatically. Previously the live strategy
+could use the Platt-calibrated 45-second auxiliary while replay silently omitted
+it unless a research CLI flag was also passed.
+
+Exact next-BBO regression replay used ETHJPY, queue multiplier zero, starting
+base 0.01024405 ETH, and starting pair equity 6830.672313565 JPY:
+
+| interval UTC | corrected PnL JPY | hold PnL JPY | excess JPY | BUY / SELL | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -78.9324 | -80.0265 | +1.0941 | 4 / 5 | 1.3023% |
+| 2026-08-05 15:00--21:00 rise | +68.9426 | +68.7376 | +0.2051 | 4 / 7 | 0.2961% |
+| 2026-08-08 00:00--12:00 range | +12.1949 | +12.0675 | +0.1274 | 2 / 2 | 0.1237% |
+| 2026-08-10 00:00--18:00 mixed | -38.1748 | -36.8376 | -1.3372 | 5 / 7 | 1.3103% |
+| aggregate | -35.9698 | -36.0591 | +0.0893 | 15 / 21 | -- |
+
+The aggregate excess is a point estimate, not statistically significant proof
+of alpha, but it restores the previously lost hold parity without reviving the
+rejected Hawkes input. The same overnight adverse-BUY interval produced no
+roughly 590 JPY fill under the corrected replay: BUY fills were 100, 174.33,
+100, and 114.47 JPY; net PnL was -24.2139 JPY and maximum drawdown 0.3783%.
+Accepted artifacts are `/tmp/gc-adaptive-scaled-{decline,rise,range,mixed}.json`
+and `/tmp/gc-adaptive-scaled-overnight.json`.
+
+### Live baseline before inward-BUY research (2026-08-13)
+
+The production-equivalent next-BBO replay from 05:22:45 to 15:22:45 JST used
+the account balances observed at the interval boundary: 0.0083225 ETH and
+4,341.91944641 JPY, or 6,838.25735516 JPY at the first replay midpoint. With
+the live ETHJPY YAML, zero simulated queue multiplier, and the configured
+10-bps maker fee, the current implementation produced the following baseline:
+
+| metric | result |
+| --- | ---: |
+| strategy PnL | +16.6004 JPY (+0.2428%) |
+| unchanged-position hold PnL | +16.3454 JPY (+0.2390%) |
+| excess over hold | +0.2550 JPY (+0.3729 bps) |
+| maximum drawdown | 0.3206% |
+| fills | 5 BUY / 4 SELL (0.9000 fills/hour) |
+| maker turnover / fees | 1,339.0603 / 1.3391 JPY |
+| mean 1m / 5m / 10m markout | -1.2840 / -1.2237 / +3.5511 bps |
+
+There were no BBO gaps, quote uptime was 100%, and the replay did not stop at
+the five-percent drawdown guard. The result is a diagnostic point estimate,
+not evidence of statistically significant excess return; queue multiplier
+zero also models a touch as more executable than a real resting order with
+unknown queue position.
+
+This commit deliberately preserves the existing BUY boundary for a clean
+comparison. BUY and SELL both enter the unified completed-window crossing and
+whole-position utility optimizer. However, the candidate-distance ladder is
+outward-only: each side ranges from the ordinary Fast quote to the configured
+maximum half-spread. The special bottom-entry mechanisms remain observational:
+`acquisitionQuote.shadowOnly` and `earlyBump.shadowOnly` are both true. Thus the
+model controls whether BUY is present and its risk-sized quantity, but a
+detected drawdown/rebound episode cannot yet spend a statistically priced
+portion of edge to move the bid inward.
+
+In this baseline's 37 quote decisions, 23 retained BUY notional. Their mean
+executable ask-to-bid distance was 27.73 bps and mean completed-window touch
+probability was 16.23%. Thirty decisions applied the target-aware marginal-BUY
+admission and five applied the independent terminal-downside minimum-cell cap.
+Only six decisions survived the full price/quantity terminal-wealth search;
+the remainder primarily preserved the probability-only Fast baseline. The
+next research change must therefore add inward BUY candidates *inside* the
+same joint optimizer and recompute crossing probability, quantity, terminal
+wealth, and order lifetime at the selected price. Enabling the existing
+post-optimizer `earlyBump` price mutation directly would make those quantities
+and risk diagnostics inconsistent with the submitted bid and is not an
+acceptable shortcut.

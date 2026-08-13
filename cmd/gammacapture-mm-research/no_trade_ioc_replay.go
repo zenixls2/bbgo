@@ -29,7 +29,6 @@ type noTradeIOCComparisonInput struct {
 	HoldProtectionOnly          bool
 	LiveNoTradeToggleOnly       bool
 	FastOnlyFixedHalf           bool
-	FastOnlyFixedHalfCompare    bool
 }
 
 type noTradeIOCVariant struct {
@@ -126,9 +125,6 @@ func noTradeIOCVariants(cfg gammacapture.MarketMakerConfig) []noTradeIOCVariant 
 	fastOnlyCfg.InventoryCapitalMinRatio = 0
 	fastOnlyCfg.InventoryCapitalTargetRatio = 0.5
 	fastOnlyCfg.InventoryCapitalMaxRatio = 1
-	noHawkesCfg := fastOnlyCfg
-	noHawkesCfg.HawkesDirection.Enabled = false
-	out = append(out, noTradeIOCVariant{Name: "fast-only-fixed-half-no-hawkes", MacroInventoryEnabled: false, Config: noHawkesCfg})
 	out = append(out, noTradeIOCVariant{
 		Name: "fast-only-fixed-half", MacroInventoryEnabled: false,
 		Config: fastOnlyCfg,
@@ -270,9 +266,7 @@ func runNoTradeIOCComparison(in noTradeIOCComparisonInput) {
 	if in.LiveNoTradeToggleOnly {
 		variants = selectNoTradeIOCVariants(variants, "qv-hold-protected+maker", "legacy-macro+maker")
 	}
-	if in.FastOnlyFixedHalfCompare {
-		variants = selectNoTradeIOCVariants(variants, "fast-only-fixed-half", "fast-only-fixed-half-no-hawkes")
-	} else if in.FastOnlyFixedHalf {
+	if in.FastOnlyFixedHalf {
 		variants = selectNoTradeIOCVariants(variants, "fast-only-fixed-half")
 	}
 	results := make([]noTradeIOCVariantResult, len(variants))

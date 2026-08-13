@@ -151,3 +151,45 @@ func TestNoTradeStateRecoversLegacyZeroFilterVarianceWithoutMovingMean(t *testin
 		t.Fatalf("legacy zero covariance was not restored without movement: %+v state=%+v", got, state)
 	}
 }
+
+func TestDownsideRiskControlDoesNotPersistCurrentInventoryAsAim(t *testing.T) {
+	at := time.Date(2026, 8, 10, 15, 0, 0, 0, time.UTC)
+	in := noTradeTestInput()
+	in.CurrentRiskyWeight = 0.2
+	state := &MacroInventoryState{}
+	d := EvaluateNoTradeInventory(NoTradeInventoryConfig{
+		Enabled: true, DownsideRiskControlEnabled: true,
+		HoldProtectionEnabled: true, HoldProtectionZScore: 1.645,
+	}, in)
+	if !d.HoldProtectionApplied {
+		t.Fatalf("test setup did not protect an uncertain increase: %+v", d)
+	}
+	got, _ := state.ApplyNoTradeState(at, at, in, d)
+	if state.NoTradeFilteredAimRatio == in.CurrentRiskyWeight ||
+		got.AimRatio == in.CurrentRiskyWeight || got.ExecutionTargetRatio != in.CurrentRiskyWeight ||
+		got.Direction != 0 {
+		t.Fatalf("current inventory contaminated the latent target: decision=%+v state=%+v", got, state)
+	}
+}
+
+func TestDownsideRiskControlMigratesAnchoredCheckpointToRawAim(t *testing.T) {
+	at := time.Date(2026, 8, 11, 0, 50, 0, 0, time.UTC)
+	in := noTradeTestInput()
+	in.CurrentRiskyWeight = 0.2
+	state := &MacroInventoryState{
+		NoTradeFilteredAimRatio: in.CurrentRiskyWeight,
+		NoTradeAimVariance:      0.01,
+		NoTradeAimUpdatedAt:     at,
+		NoTradeAimClosedBarAt:   at,
+	}
+	d := EvaluateNoTradeInventory(NoTradeInventoryConfig{
+		Enabled: true, DownsideRiskControlEnabled: true,
+		HoldProtectionEnabled: true, HoldProtectionZScore: 1.645,
+	}, in)
+	got, changed := state.ApplyNoTradeState(at.Add(time.Second), at, in, d)
+	if !changed || !state.NoTradeDownsideRiskControl ||
+		state.NoTradeFilteredAimRatio != d.RawAimRatio || got.AimRatio != d.RawAimRatio ||
+		got.ExecutionTargetRatio != in.CurrentRiskyWeight {
+		t.Fatalf("legacy anchored checkpoint was not migrated to independent raw aim: decision=%+v state=%+v", got, state)
+	}
+}

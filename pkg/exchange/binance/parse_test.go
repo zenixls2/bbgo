@@ -217,6 +217,20 @@ func TestParseOrderUpdate(t *testing.T) {
 	assert.NotNil(t, orderUpdate)
 }
 
+func TestExecutionReportOrderUsesTransactionTimeAsUpdateTime(t *testing.T) {
+	created := types.NewMillisecondTimestampFromInt(1_700_000_000_000)
+	updated := types.NewMillisecondTimestampFromInt(1_700_000_012_345)
+	event := ExecutionReportEvent{
+		Symbol: "ETHJPY", Side: "BUY", OrderType: "LIMIT", TimeInForce: "GTC",
+		CurrentExecutionType: "CANCELED", CurrentOrderStatus: "CANCELED",
+		OrderID: 42, OrderCreationTime: created, TransactionTime: updated,
+	}
+	order, err := event.Order(false, false)
+	assert.NoError(t, err)
+	assert.Equal(t, created.Time(), time.Time(order.CreationTime))
+	assert.Equal(t, updated.Time(), time.Time(order.UpdateTime))
+}
+
 func TestFuturesResponseParsing(t *testing.T) {
 	type testcase struct {
 		input string

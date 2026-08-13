@@ -488,6 +488,28 @@ func (s *TradeService) Insert(trade types.Trade) error {
 			trade)
 		return err
 	}
+	if s.DB.DriverName() == "sqlite3" {
+		_, err := s.DB.NamedExec(`
+			INSERT INTO trades (id, order_id, order_uuid, exchange, price, quantity, quote_quantity, symbol, side, is_buyer, is_maker, traded_at, fee, fee_currency, is_margin, is_futures, is_isolated, strategy, pnl)
+			VALUES (:id, :order_id, :order_uuid, :exchange, :price, :quantity, :quote_quantity, :symbol, :side, :is_buyer, :is_maker, :traded_at, :fee, :fee_currency, :is_margin, :is_futures, :is_isolated, :strategy, :pnl)
+			ON CONFLICT(exchange, symbol, side, id) DO UPDATE SET
+				order_id=excluded.order_id,
+				order_uuid=excluded.order_uuid,
+				price=excluded.price,
+				quantity=excluded.quantity,
+				quote_quantity=excluded.quote_quantity,
+				is_buyer=excluded.is_buyer,
+				is_maker=excluded.is_maker,
+				traded_at=excluded.traded_at,
+				fee=excluded.fee,
+				fee_currency=excluded.fee_currency,
+				is_margin=excluded.is_margin,
+				is_futures=excluded.is_futures,
+				is_isolated=excluded.is_isolated,
+				strategy=COALESCE(NULLIF(excluded.strategy, ''), trades.strategy),
+				pnl=COALESCE(excluded.pnl, trades.pnl)`, trade)
+		return err
+	}
 	sql := dbCache.InsertSqlOf(trade)
 	_, err := s.DB.NamedExec(sql, trade)
 	return err

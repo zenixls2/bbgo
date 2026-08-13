@@ -24,6 +24,60 @@ func TestJointDistanceCandidatePlanOnlyMovesOutward(t *testing.T) {
 	}
 }
 
+func TestJointDistanceCandidatePlansAddsSymmetricPassiveInwardLadders(t *testing.T) {
+	base := MarketMakerQuotePlan{
+		BidPrice: 99.70, AskPrice: 100.30,
+		BidTouchDistanceBps: math.Log(100.10/99.70) * 10_000,
+		AskTouchDistanceBps: math.Log(100.30/99.90) * 10_000,
+		BidDistanceBps:      math.Log(100/99.70) * 10_000,
+		AskDistanceBps:      math.Log(100.30/100) * 10_000,
+		BidHalfSpreadBps:    math.Log(100/99.70) * 10_000,
+		AskHalfSpreadBps:    math.Log(100.30/100) * 10_000,
+		AllowBid:            true, AllowAsk: true,
+	}
+	withoutSignal := jointDistanceCandidatePlans(base, 99.90, 100.10, 100, 80, false, 5)
+	if len(withoutSignal) != 5 {
+		t.Fatalf("missing signal must preserve the exact outward search size: %d", len(withoutSignal))
+	}
+
+	plans := jointDistanceCandidatePlans(base, 99.90, 100.10, 100, 80, true, 5)
+	if len(plans) != 13 {
+		t.Fatalf("expected five outward plus four candidates per inward side, got %d", len(plans))
+	}
+	previousBid := base.BidPrice
+	for index, candidate := range plans[5:9] {
+		if candidate.BidPrice <= previousBid || candidate.BidPrice > 99.90+1e-12 ||
+			candidate.BidPrice >= 100.10 {
+			t.Fatalf("inward candidate %d is not passive and monotone: %+v", index, candidate)
+		}
+		if math.Abs(candidate.AskPrice-base.AskPrice) > 1e-12 ||
+			math.Abs(candidate.AskTouchDistanceBps-base.AskTouchDistanceBps) > 1e-12 {
+			t.Fatalf("BUY hypothesis changed SELL candidate %d: base=%+v candidate=%+v",
+				index, base, candidate)
+		}
+		if candidate.BidTouchDistanceBps >= base.BidTouchDistanceBps {
+			t.Fatalf("inward candidate did not increase BUY touch probability domain: %+v", candidate)
+		}
+		previousBid = candidate.BidPrice
+	}
+	previousAsk := base.AskPrice
+	for index, candidate := range plans[9:] {
+		if candidate.AskPrice >= previousAsk || candidate.AskPrice < 100.10-1e-12 ||
+			candidate.AskPrice <= 99.90 {
+			t.Fatalf("inward SELL candidate %d is not passive and monotone: %+v", index, candidate)
+		}
+		if math.Abs(candidate.BidPrice-base.BidPrice) > 1e-12 ||
+			math.Abs(candidate.BidTouchDistanceBps-base.BidTouchDistanceBps) > 1e-12 {
+			t.Fatalf("SELL hypothesis changed BUY candidate %d: base=%+v candidate=%+v",
+				index, base, candidate)
+		}
+		if candidate.AskTouchDistanceBps >= base.AskTouchDistanceBps {
+			t.Fatalf("inward SELL candidate did not increase SELL touch domain: %+v", candidate)
+		}
+		previousAsk = candidate.AskPrice
+	}
+}
+
 func TestJointPathPositiveConfidence(t *testing.T) {
 	if got := jointPathPositiveConfidence(-1, 1); got != 0 {
 		t.Fatalf("negative path mean must deploy no directional confidence: %v", got)

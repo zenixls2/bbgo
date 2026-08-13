@@ -1,0 +1,434 @@
+package gammacapture
+
+import (
+	"math"
+	"time"
+)
+
+const conditionalExecutionFeatureCount = 4
+
+// ConditionalExecutionConfig enables the side-symmetric conditional Fast
+// payoff model.  It has no fitted coefficients or symbol-specific thresholds:
+// the current state is compared with matured same-symbol BBO paths and shrunk
+// continuously toward the unconditional path distribution.
+type ConditionalExecutionConfig struct {
+	Enabled bool `json:"enabled" yaml:"enabled"`
+}
+
+// conditionalExecutionState contains only information observable at the start
+// of a quote window. BUY uses the executable ask path; SELL uses the executable
+// bid path. The SELL fields are the exact price-reflected counterparts of BUY.
+type conditionalExecutionState struct {
+	Valid bool
+
+	BuyDrawdownBps    float64
+	BuyRebound30Bps   float64
+	BuyQVBps          float64
+	SellRunupBps      float64
+	SellReversal30Bps float64
+	SellQVBps         float64
+	SpreadBps         float64
+}
+
+func (s conditionalExecutionState) vector(buy bool, horizon time.Duration) [conditionalExecutionFeatureCount]float64 {
+	if !s.Valid || horizon <= 0 {
+		return [conditionalExecutionFeatureCount]float64{}
+	}
+	qv, excursion, reversal := s.SellQVBps, s.SellRunupBps, s.SellReversal30Bps
+	if buy {
+		qv, excursion, reversal = s.BuyQVBps, s.BuyDrawdownBps, s.BuyRebound30Bps
+	}
+	horizonSeconds := math.Max(1, horizon.Seconds())
+	shortQV := qv * math.Sqrt(math.Min(1, 30/horizonSeconds))
+	return [conditionalExecutionFeatureCount]float64{
+		math.Tanh(excursion / math.Max(1, qv)),
+		math.Tanh(reversal / math.Max(1, shortQV)),
+		math.Log1p(math.Max(0, qv)),
+		math.Tanh(s.SpreadBps / math.Max(1, qv)),
+	}
+}
+
+func conditionalExecutionKernel(current, historical conditionalExecutionState, buy bool, horizon time.Duration) float64 {
+	if !current.Valid || !historical.Valid {
+		return 0
+	}
+	a, b := current.vector(buy, horizon), historical.vector(buy, horizon)
+	distanceSquared := 0.0
+	for index := range a {
+		difference := a[index] - b[index]
+		distanceSquared += difference * difference
+	}
+	return math.Exp(-0.5 * distanceSquared)
+}
+
+type conditionalExecutionReturn struct {
+	At         time.Time
+	AskSquared float64
+	BidSquared float64
+}
+
+// buildConditionalExecutionStates computes every causal start state in O(N).
+// Monotone deques provide rolling extrema and a bounded return queue provides
+// side-specific quadratic variation. Future prices never enter these fields.
+func buildConditionalExecutionStates(points []MarketMakerHorizonPoint, horizon time.Duration) []conditionalExecutionState {
+	states := make([]conditionalExecutionState, len(points))
+	if len(points) == 0 || horizon <= 0 {
+		return states
+	}
+	var maxAskH, minBidH, minAsk30, maxBid30 []int
+	var returns []conditionalExecutionReturn
+	returnHead := 0
+	buyQV2, sellQV2 := 0.0, 0.0
+	segmentStart := 0
+	leftH, left30 := 0, 0
+	for index, point := range points {
+		if index == 0 || point.GapBefore {
+			segmentStart = index
+			leftH, left30 = index, index
+			maxAskH, minBidH, minAsk30, maxBid30 = nil, nil, nil, nil
+			returns = returns[:0]
+			returnHead = 0
+			buyQV2, sellQV2 = 0, 0
+		} else {
+			previous := points[index-1]
+			if previousAsk, currentAsk := previous.askPrice(), point.askPrice(); previousAsk > 0 && currentAsk > 0 {
+				value := math.Log(currentAsk / previousAsk)
+				buyQV2 += value * value
+				previousBid, currentBid := previous.bidPrice(), point.bidPrice()
+				bidSquared := 0.0
+				if previousBid > 0 && currentBid > 0 {
+					bidReturn := math.Log(currentBid / previousBid)
+					bidSquared = bidReturn * bidReturn
+					sellQV2 += bidSquared
+				}
+				returns = append(returns, conditionalExecutionReturn{
+					At: point.At, AskSquared: value * value, BidSquared: bidSquared,
+				})
+			}
+		}
+
+		cutoffH := point.At.Add(-horizon)
+		for leftH < index && points[leftH].At.Before(cutoffH) {
+			leftH++
+		}
+		cutoff30 := point.At.Add(-30 * time.Second)
+		for left30 < index && points[left30].At.Before(cutoff30) {
+			left30++
+		}
+		for returnHead < len(returns) && returns[returnHead].At.Before(cutoffH) {
+			buyQV2 -= returns[returnHead].AskSquared
+			sellQV2 -= returns[returnHead].BidSquared
+			returnHead++
+		}
+		trimFront := func(values []int, minimum int) []int {
+			for len(values) > 0 && values[0] < minimum {
+				values = values[1:]
+			}
+			return values
+		}
+		maxAskH, minBidH = trimFront(maxAskH, leftH), trimFront(minBidH, leftH)
+		minAsk30, maxBid30 = trimFront(minAsk30, left30), trimFront(maxBid30, left30)
+		ask, bid := point.askPrice(), point.bidPrice()
+		for len(maxAskH) > 0 && points[maxAskH[len(maxAskH)-1]].askPrice() <= ask {
+			maxAskH = maxAskH[:len(maxAskH)-1]
+		}
+		maxAskH = append(maxAskH, index)
+		for len(minBidH) > 0 && points[minBidH[len(minBidH)-1]].bidPrice() >= bid {
+			minBidH = minBidH[:len(minBidH)-1]
+		}
+		minBidH = append(minBidH, index)
+		for len(minAsk30) > 0 && points[minAsk30[len(minAsk30)-1]].askPrice() >= ask {
+			minAsk30 = minAsk30[:len(minAsk30)-1]
+		}
+		minAsk30 = append(minAsk30, index)
+		for len(maxBid30) > 0 && points[maxBid30[len(maxBid30)-1]].bidPrice() <= bid {
+			maxBid30 = maxBid30[:len(maxBid30)-1]
+		}
+		maxBid30 = append(maxBid30, index)
+
+		if point.At.Sub(points[segmentStart].At) < horizon || ask <= 0 || bid <= 0 ||
+			len(maxAskH) == 0 || len(minBidH) == 0 || len(minAsk30) == 0 || len(maxBid30) == 0 {
+			continue
+		}
+		states[index] = conditionalExecutionState{
+			Valid:             true,
+			BuyDrawdownBps:    math.Max(0, math.Log(points[maxAskH[0]].askPrice()/ask)*10_000),
+			BuyRebound30Bps:   math.Max(0, math.Log(ask/points[minAsk30[0]].askPrice())*10_000),
+			BuyQVBps:          math.Sqrt(math.Max(0, buyQV2)) * 10_000,
+			SellRunupBps:      math.Max(0, math.Log(bid/points[minBidH[0]].bidPrice())*10_000),
+			SellReversal30Bps: math.Max(0, math.Log(points[maxBid30[0]].bidPrice()/bid)*10_000),
+			SellQVBps:         math.Sqrt(math.Max(0, sellQV2)) * 10_000,
+			SpreadBps:         math.Max(0, math.Log(ask/bid)*10_000),
+		}
+	}
+	return states
+}
+
+func conditionalExecutionStateAtIndex(points []MarketMakerHorizonPoint, index int, horizon time.Duration) conditionalExecutionState {
+	if index < 0 || index >= len(points) {
+		return conditionalExecutionState{}
+	}
+	// Appending a newly completed exposure is infrequent relative to BBO
+	// ingestion. Reusing the exact linear builder here keeps the incremental and
+	// startup definitions identical; the retained horizon bounds this slice.
+	lookback := horizon
+	if lookback < 30*time.Second {
+		lookback = 30 * time.Second
+	}
+	cutoff := points[index].At.Add(-lookback)
+	start := index
+	for start > 0 && !points[start].GapBefore && !points[start-1].At.Before(cutoff) {
+		start--
+	}
+	// Quadratic variation over [t-H,t] includes the return ending exactly at
+	// t-H. Preserve its immediately preceding observation so the incremental
+	// builder is identical to the startup builder's inclusive cutoff.
+	if start > 0 && !points[start].GapBefore {
+		start--
+	}
+	states := buildConditionalExecutionStates(points[start:index+1], horizon)
+	if len(states) == 0 {
+		return conditionalExecutionState{}
+	}
+	return states[len(states)-1]
+}
+
+func (m *MarketMakerHorizonModel) conditionalExecutionState(horizon time.Duration) conditionalExecutionState {
+	if m == nil || len(m.points) == 0 {
+		return conditionalExecutionState{}
+	}
+	return conditionalExecutionStateAtIndex(m.points, len(m.points)-1, horizon)
+}
+
+// ConditionalExecutionSideDecision exposes the nested passage decomposition
+// used to audit an inward quote against the ordinary Fast quote.
+type ConditionalExecutionSideDecision struct {
+	Evaluated                   bool
+	EffectiveSamples            float64
+	CandidateTouchProbability   float64
+	BaseTouchProbability        float64
+	IncrementalTouchProbability float64
+	IncrementalMarkoutMeanBps   float64
+	ConcessionBps               float64
+	ExpectedPairedDeltaBps      float64
+	PairedStdErrorBps           float64
+	PairedPositiveConfidence    float64
+}
+
+type weightedScalarMoments struct {
+	weight, weightSquared float64
+	sum, squared          float64
+}
+
+func (m *weightedScalarMoments) add(weight, value float64) {
+	if weight <= 0 {
+		return
+	}
+	m.weight += weight
+	m.weightSquared += weight * weight
+	m.sum += weight * value
+	m.squared += weight * value * value
+}
+
+func (m weightedScalarMoments) result() (mean, variance, effective float64) {
+	if m.weight <= 0 {
+		return 0, 0, 0
+	}
+	mean = m.sum / m.weight
+	effective = m.weight
+	if m.weightSquared > 0 {
+		effective = math.Min(effective, m.weight*m.weight/m.weightSquared)
+	}
+	variance = math.Max(0, m.squared/m.weight-mean*mean)
+	if effective > 1 {
+		variance *= effective / (effective - 1)
+	}
+	return
+}
+
+func (m *MarketMakerHorizonModel) conditionalExecutionSideDecision(
+	now time.Time,
+	config MarketMakerConfig,
+	horizon time.Duration,
+	current conditionalExecutionState,
+	buy bool,
+	baseDistanceBps, candidateDistanceBps float64,
+) ConditionalExecutionSideDecision {
+	d := ConditionalExecutionSideDecision{}
+	if m == nil || !current.Valid || now.IsZero() || horizon <= 0 ||
+		baseDistanceBps <= 0 || candidateDistanceBps <= 0 ||
+		candidateDistanceBps >= baseDistanceBps-1e-12 {
+		return d
+	}
+	exposures := m.crossingExposures(horizon)
+	cutoff := now.Add(-time.Duration(config.HorizonLookback))
+	globalCount := 0
+	for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
+		if exposures[index].EndAt.After(now) {
+			break
+		}
+		globalCount++
+		if exposures[index].NextMinute <= index {
+			break
+		}
+		index = exposures[index].NextMinute
+	}
+	if globalCount == 0 {
+		return d
+	}
+	priorPerPath := 1 / math.Sqrt(float64(globalCount))
+	entryCostBps := config.MakerFeeBps + config.AdverseSelectionBps
+	concession := baseDistanceBps - candidateDistanceBps
+	var paired, incrementalMarkout weightedScalarMoments
+	weightedCandidate, weightedBase, weightedIncremental, totalWeight := 0.0, 0.0, 0.0, 0.0
+	var lastExposure time.Time
+	for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
+		exposure := exposures[index]
+		if exposure.EndAt.After(now) {
+			break
+		}
+		weight := 1.0
+		if !lastExposure.IsZero() {
+			weight = math.Min(1, exposure.At.Sub(lastExposure).Seconds()/horizon.Seconds())
+		}
+		weight *= (priorPerPath + conditionalExecutionKernel(current, exposure.ConditionalState, buy, horizon)) /
+			(1 + priorPerPath)
+		if weight > 0 {
+			excursion := exposure.SellExcursionBps
+			if buy {
+				excursion = exposure.BuyExcursionBps
+			}
+			candidateTouched := excursion >= candidateDistanceBps
+			baseTouched := excursion >= baseDistanceBps
+			value := 0.0
+			if baseTouched {
+				value = -concession
+			} else if candidateTouched {
+				if buy {
+					quote := exposure.StartAsk * math.Exp(-candidateDistanceBps/10_000)
+					value = math.Log(exposure.TerminalBid/quote)*10_000 - entryCostBps
+				} else {
+					quote := exposure.StartBid * math.Exp(candidateDistanceBps/10_000)
+					value = math.Log(quote/exposure.TerminalAsk)*10_000 - entryCostBps
+				}
+				incrementalMarkout.add(weight, value)
+				weightedIncremental += weight
+			}
+			if candidateTouched {
+				weightedCandidate += weight
+			}
+			if baseTouched {
+				weightedBase += weight
+			}
+			totalWeight += weight
+			paired.add(weight, value)
+		}
+		lastExposure = exposure.At
+		if exposure.NextMinute <= index {
+			break
+		}
+		index = exposure.NextMinute
+	}
+	mean, variance, effective := paired.result()
+	if effective <= 1 || totalWeight <= 0 {
+		return d
+	}
+	markoutMean, _, _ := incrementalMarkout.result()
+	d.Evaluated = true
+	d.EffectiveSamples = effective
+	d.CandidateTouchProbability = weightedCandidate / totalWeight
+	d.BaseTouchProbability = weightedBase / totalWeight
+	d.IncrementalTouchProbability = weightedIncremental / totalWeight
+	d.IncrementalMarkoutMeanBps = markoutMean
+	d.ConcessionBps = concession
+	d.ExpectedPairedDeltaBps = mean
+	d.PairedStdErrorBps = math.Sqrt(variance / effective)
+	d.PairedPositiveConfidence = jointPathPositiveConfidence(mean, d.PairedStdErrorBps)
+	return d
+}
+
+// conditionalCrossingDecision uses one common state kernel for the paired
+// BUY/SELL indicators, preserving a realizable joint Bernoulli distribution.
+// The geometric mean makes either executable side relevant without letting a
+// one-sided similarity score independently distort the same joint sample.
+func (m *MarketMakerHorizonModel) conditionalCrossingDecision(
+	now time.Time,
+	config MarketMakerConfig,
+	horizon time.Duration,
+	buyDistanceBps, sellDistanceBps, grossQuoteEdgeBps float64,
+	current conditionalExecutionState,
+) MarketMakerHorizonDecision {
+	d := m.CrossingDecisionAtSideDistances(
+		now, config, horizon, buyDistanceBps, sellDistanceBps, grossQuoteEdgeBps)
+	if !current.Valid || horizon <= 0 {
+		return d
+	}
+	exposures := m.crossingExposures(horizon)
+	cutoff := now.Add(-time.Duration(config.HorizonLookback))
+	globalCount := 0
+	for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
+		if exposures[index].EndAt.After(now) {
+			break
+		}
+		globalCount++
+		if exposures[index].NextMinute <= index {
+			break
+		}
+		index = exposures[index].NextMinute
+	}
+	if globalCount == 0 {
+		return d
+	}
+	prior := 1 / math.Sqrt(float64(globalCount))
+	weightedBuy, weightedSell, weightedBoth, effective := 0.0, 0.0, 0.0, 0.0
+	var lastExposure time.Time
+	for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
+		exposure := exposures[index]
+		if exposure.EndAt.After(now) {
+			break
+		}
+		weight := 1.0
+		if !lastExposure.IsZero() {
+			weight = math.Min(1, exposure.At.Sub(lastExposure).Seconds()/horizon.Seconds())
+		}
+		buyKernel := conditionalExecutionKernel(current, exposure.ConditionalState, true, horizon)
+		sellKernel := conditionalExecutionKernel(current, exposure.ConditionalState, false, horizon)
+		weight *= (prior + math.Sqrt(buyKernel*sellKernel)) / (1 + prior)
+		buyTouched := exposure.BuyExcursionBps >= buyDistanceBps
+		sellTouched := exposure.SellExcursionBps >= sellDistanceBps
+		effective += weight
+		if buyTouched {
+			weightedBuy += weight
+		}
+		if sellTouched {
+			weightedSell += weight
+		}
+		if buyTouched && sellTouched {
+			weightedBoth += weight
+		}
+		lastExposure = exposure.At
+		if exposure.NextMinute <= index {
+			break
+		}
+		index = exposure.NextMinute
+	}
+	if effective <= 0 {
+		return d
+	}
+	d.EffectiveSamples = effective
+	d.BuyTouchProbability, d.BuyTouchStdError = jeffreysBernoulliPosterior(weightedBuy, effective)
+	d.SellTouchProbability, d.SellTouchStdError = jeffreysBernoulliPosterior(weightedSell, effective)
+	d.BothTouchProbability, d.BothTouchStdError = jeffreysBernoulliPosterior(weightedBoth, effective)
+	lowerJoint := math.Max(0, d.BuyTouchProbability+d.SellTouchProbability-1)
+	upperJoint := math.Min(d.BuyTouchProbability, d.SellTouchProbability)
+	d.BothTouchProbability = math.Max(lowerJoint, math.Min(upperJoint, d.BothTouchProbability))
+	d.TouchCovariance = d.BothTouchProbability - d.BuyTouchProbability*d.SellTouchProbability
+	edge := math.Max(0, d.NetRoundTripEdgeBps)
+	if hours := horizon.Hours(); hours > 0 {
+		d.ScoreBpsPerHour = math.Min(d.BuyTouchProbability, d.SellTouchProbability) / hours * edge
+		d.ScoreStdErrorBpsHour = math.Max(d.BuyTouchStdError, d.SellTouchStdError) / hours * edge
+	}
+	d.EstimatorSource = "bbo-side-conditional"
+	d.Reason = "conditional same-symbol fee-adjusted two-sided edge per hour"
+	return d
+}

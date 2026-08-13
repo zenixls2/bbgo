@@ -111,6 +111,29 @@ func (m *MarketMakerHorizonModel) JointPathPayoffStatistics(
 	horizon time.Duration,
 	buyDistanceBps, sellDistanceBps float64,
 ) JointPathPayoffStats {
+	return m.jointPathPayoffStatistics(now, config, horizon, buyDistanceBps, sellDistanceBps, nil)
+}
+
+func (m *MarketMakerHorizonModel) conditionalJointPathPayoffStatistics(
+	now time.Time,
+	config MarketMakerConfig,
+	horizon time.Duration,
+	buyDistanceBps, sellDistanceBps float64,
+	current conditionalExecutionState,
+) JointPathPayoffStats {
+	if !current.Valid {
+		return m.JointPathPayoffStatistics(now, config, horizon, buyDistanceBps, sellDistanceBps)
+	}
+	return m.jointPathPayoffStatistics(now, config, horizon, buyDistanceBps, sellDistanceBps, &current)
+}
+
+func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
+	now time.Time,
+	config MarketMakerConfig,
+	horizon time.Duration,
+	buyDistanceBps, sellDistanceBps float64,
+	current *conditionalExecutionState,
+) JointPathPayoffStats {
 	if m == nil || now.IsZero() || horizon <= 0 ||
 		buyDistanceBps <= 0 || sellDistanceBps <= 0 {
 		return JointPathPayoffStats{}
@@ -129,6 +152,23 @@ func (m *MarketMakerHorizonModel) JointPathPayoffStatistics(
 	var lastExposure time.Time
 	entryCostBps := config.MakerFeeBps + config.AdverseSelectionBps
 	cycleCostBps := 2*entryCostBps + config.MinimumNetEdgeBps
+	globalCount := 0
+	if current != nil {
+		for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
+			if exposures[index].EndAt.After(now) {
+				break
+			}
+			globalCount++
+			if exposures[index].NextMinute <= index {
+				break
+			}
+			index = exposures[index].NextMinute
+		}
+	}
+	priorPerPath := 0.0
+	if globalCount > 0 {
+		priorPerPath = 1 / math.Sqrt(float64(globalCount))
+	}
 	for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
 		exposure := exposures[index]
 		if exposure.EndAt.After(now) {
@@ -189,8 +229,13 @@ func (m *MarketMakerHorizonModel) JointPathPayoffStatistics(
 		case sellTouched:
 			buyDomSell, sellDomSell = sellSingleBps, sellSingleBps
 		}
-		buyDominant.add(weight, buyDomBuy, buyDomSell, inventoryReturnBps)
-		sellDominant.add(weight, sellDomBuy, sellDomSell, inventoryReturnBps)
+		buyWeight, sellWeight := weight, weight
+		if current != nil {
+			buyWeight *= (priorPerPath + conditionalExecutionKernel(*current, exposure.ConditionalState, true, horizon)) / (1 + priorPerPath)
+			sellWeight *= (priorPerPath + conditionalExecutionKernel(*current, exposure.ConditionalState, false, horizon)) / (1 + priorPerPath)
+		}
+		buyDominant.add(buyWeight, buyDomBuy, buyDomSell, inventoryReturnBps)
+		sellDominant.add(sellWeight, sellDomBuy, sellDomSell, inventoryReturnBps)
 		lastExposure = exposure.At
 		if exposure.NextMinute <= index {
 			break

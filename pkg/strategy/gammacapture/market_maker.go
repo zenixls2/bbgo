@@ -15,9 +15,9 @@ type ProbabilityCenteredQuantityConfig struct {
 
 // JointDistanceQuantityConfig enables the final one-order-per-side optimizer.
 // CandidateCount is a numerical resolution, not a risk weight: the optimizer
-// evaluates an outward price ladder between the unified Fast quote and the
-// configured maximum half-spread, then selects by a confidence-adjusted
-// expected fee-net cycle P&L rate subject to the inventory chance constraint.
+// evaluates the ordinary outward price ladder and symmetric passive inward
+// BUY/SELL ladders. All candidates are selected by the same conditional posterior
+// terminal-wealth objective and inventory chance constraint.
 type JointDistanceQuantityConfig struct {
 	Enabled        bool `json:"enabled" yaml:"enabled"`
 	ShadowOnly     bool `json:"shadowOnly" yaml:"shadowOnly"`
@@ -81,6 +81,7 @@ type MarketMakerConfig struct {
 	MacroInventory              MacroInventoryConfig              `json:"macroInventory" yaml:"macroInventory"`
 	ProbabilityCenteredQuantity ProbabilityCenteredQuantityConfig `json:"probabilityCenteredQuantity" yaml:"probabilityCenteredQuantity"`
 	JointDistanceQuantity       JointDistanceQuantityConfig       `json:"jointDistanceQuantity" yaml:"jointDistanceQuantity"`
+	ConditionalExecution        ConditionalExecutionConfig        `json:"conditionalExecution" yaml:"conditionalExecution"`
 	PostFillUtility             PostFillUtilityConfig             `json:"postFillUtility" yaml:"postFillUtility"`
 	InventorySkewBps            float64                           `json:"inventorySkewBps" yaml:"inventorySkewBps"`
 	QuoteNotional               float64                           `json:"quoteNotionalJPY" yaml:"quoteNotionalJPY"`
@@ -624,9 +625,68 @@ type MarketMakerHorizonDecision struct {
 	NetRoundTripEdgeBps  float64
 	ScoreBpsPerHour      float64
 	ScoreStdErrorBpsHour float64
-	DistanceOptimized    bool
-	UpdatedAt            time.Time
-	Reason               string
+	// SelectionScoreBpsPerHour preserves the crossing score above and adds the
+	// positive option value of the next executable marginal BUY, expressed in
+	// the same bps/hour unit. The strategy can always decline a negative-utility
+	// BUY, so its value is max(0, Delta CE), not a forced negative payoff. The
+	// extra term is evaluated only while current inventory is below its target.
+	SelectionScoreBpsPerHour          float64
+	MarginalBuyEvaluated              bool
+	MarginalBuyNotionalJPY            float64
+	MarginalBuyCertaintyEquivalentJPY float64
+	MarginalBuyUtilityBpsPerHour      float64
+	DistanceOptimized                 bool
+	UpdatedAt                         time.Time
+	Reason                            string
+}
+
+// FastHorizonMarginalBuyInput is the causal account state needed to return
+// marginal acquisition to the Fast horizon objective.  MarginalBuyNotionalJPY
+// is one executable venue cell, not the entire target deficit: horizon choice
+// asks whether the *next* BUY improves terminal wealth before the downstream
+// unified quantity model decides how many cells to expose.
+type FastHorizonMarginalBuyInput struct {
+	CurrentInventoryNotionalJPY float64
+	TargetInventoryNotionalJPY  float64
+	PairEquityJPY               float64
+	MarginalBuyNotionalJPY      float64
+	AvailableBuyCapitalJPY      float64
+	RiskAversion                float64
+	ConfidenceZScore            float64
+}
+
+func scoreFastHorizonWithMarginalBuy(
+	decision MarketMakerHorizonDecision,
+	stats JointPathPayoffStats,
+	in FastHorizonMarginalBuyInput,
+) MarketMakerHorizonDecision {
+	decision.SelectionScoreBpsPerHour = decision.ScoreBpsPerHour
+	deficit := in.TargetInventoryNotionalJPY - in.CurrentInventoryNotionalJPY
+	unit := in.MarginalBuyNotionalJPY
+	if decision.Horizon <= 0 || in.PairEquityJPY <= 0 || unit <= 0 ||
+		deficit+1e-9 < unit || in.AvailableBuyCapitalJPY+1e-9 < unit ||
+		stats.EffectiveSamples <= 1 {
+		return decision
+	}
+	z := in.ConfidenceZScore
+	if z <= 0 {
+		z = 1.645
+	}
+	payoff := stats.EvaluateWholePosition(
+		in.CurrentInventoryNotionalJPY, unit, 0,
+		in.PairEquityJPY, in.RiskAversion, z)
+	hours := decision.Horizon.Hours()
+	if hours <= 0 {
+		return decision
+	}
+	utilityBpsPerHour := math.Max(0, payoff.CertaintyEquivalent) /
+		in.PairEquityJPY * 10_000 / hours
+	decision.MarginalBuyEvaluated = true
+	decision.MarginalBuyNotionalJPY = unit
+	decision.MarginalBuyCertaintyEquivalentJPY = payoff.CertaintyEquivalent
+	decision.MarginalBuyUtilityBpsPerHour = utilityBpsPerHour
+	decision.SelectionScoreBpsPerHour += utilityBpsPerHour
+	return decision
 }
 
 // HasSufficientCrossings reports whether this decision contains enough
@@ -640,7 +700,8 @@ func (d MarketMakerHorizonDecision) HasSufficientCrossings(minSamples int) bool 
 		minSamples = 1
 	}
 	validReason := d.Reason == "max fee-adjusted two-sided edge per hour" ||
-		d.Reason == "online dual-timescale fee-adjusted two-sided edge per hour"
+		d.Reason == "online dual-timescale fee-adjusted two-sided edge per hour" ||
+		d.Reason == "conditional same-symbol fee-adjusted two-sided edge per hour"
 	samples := float64(d.UpCrosses + d.DownCrosses)
 	if d.EffectiveSamples > 0 {
 		samples = d.EffectiveSamples
@@ -1498,6 +1559,30 @@ func (m *MarketMakerHorizonModel) UpdateForBookAdaptiveVolatility(
 	c MarketMakerConfig,
 	bestBid, bestAsk float64,
 ) MarketMakerHorizonDecision {
+	return m.updateForBookAdaptiveVolatility(now, c, bestBid, bestAsk, nil)
+}
+
+// UpdateForBookAdaptiveVolatilityWithMarginalBuy selects the horizon using
+// both the original two-sided crossing edge and the conservative positive
+// option value of one executable BUY. Because CE is normalized by pair equity and
+// horizon length, both terms are bps/hour and require no hand-tuned mixing
+// weight. Price and final quantity remain owned by the downstream unified
+// Fast optimizer.
+func (m *MarketMakerHorizonModel) UpdateForBookAdaptiveVolatilityWithMarginalBuy(
+	now time.Time,
+	c MarketMakerConfig,
+	bestBid, bestAsk float64,
+	in FastHorizonMarginalBuyInput,
+) MarketMakerHorizonDecision {
+	return m.updateForBookAdaptiveVolatility(now, c, bestBid, bestAsk, &in)
+}
+
+func (m *MarketMakerHorizonModel) updateForBookAdaptiveVolatility(
+	now time.Time,
+	c MarketMakerConfig,
+	bestBid, bestAsk float64,
+	marginalBuy *FastHorizonMarginalBuyInput,
+) MarketMakerHorizonDecision {
 	c.setDefaults()
 	if !m.lastUpdate.IsZero() && now.Sub(m.lastUpdate) < time.Duration(c.HorizonUpdateInterval) && m.decision.Horizon > 0 {
 		return m.decision
@@ -1516,8 +1601,15 @@ func (m *MarketMakerHorizonModel) UpdateForBookAdaptiveVolatility(
 	for _, horizon := range c.TradingHorizons() {
 		decision := m.DecisionForHorizon(
 			now, c, volatilityFor(horizon), bestBid, bestAsk, horizon)
+		decision.SelectionScoreBpsPerHour = decision.ScoreBpsPerHour
+		if marginalBuy != nil && decision.HasSufficientCrossings(c.HorizonMinSamples) {
+			stats := m.JointPathPayoffStatistics(
+				now, c, horizon,
+				decision.BuyTouchDistanceBps, decision.SellTouchDistanceBps)
+			decision = scoreFastHorizonWithMarginalBuy(decision, stats, *marginalBuy)
+		}
 		if decision.HasSufficientCrossings(c.HorizonMinSamples) &&
-			(best.Horizon == 0 || decision.ScoreBpsPerHour > best.ScoreBpsPerHour) {
+			(best.Horizon == 0 || decision.SelectionScoreBpsPerHour > best.SelectionScoreBpsPerHour) {
 			best = decision
 		}
 	}
@@ -1529,6 +1621,12 @@ func (m *MarketMakerHorizonModel) UpdateForBookAdaptiveVolatility(
 			bestBid, bestAsk, halfSpread)
 		best = m.CrossingDecisionAtSideDistances(
 			now, c, horizon, buyDistance, sellDistance, grossEdge)
+		best.SelectionScoreBpsPerHour = best.ScoreBpsPerHour
+		if marginalBuy != nil && best.HasSufficientCrossings(c.HorizonMinSamples) {
+			stats := m.JointPathPayoffStatistics(
+				now, c, horizon, best.BuyTouchDistanceBps, best.SellTouchDistanceBps)
+			best = scoreFastHorizonWithMarginalBuy(best, stats, *marginalBuy)
+		}
 	}
 	m.decision = best
 	return best

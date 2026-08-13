@@ -8,9 +8,10 @@ import (
 )
 
 // JointDistanceQuantityInput contains only causal state available at quote
-// time. The distance ladder moves outward from the unified Fast quote; it can
-// therefore spend less fill probability for more fee-net edge, but can never
-// turn a passive quote into a marketable one.
+// time. The ordinary distance ladder moves outward from the unified Fast quote.
+// When conditional execution is enabled, symmetric one-dimensional passive
+// inward ladders are evaluated by the same crossing, terminal-wealth, quantity,
+// and confidence model rather than by post-optimizer price skews.
 type JointDistanceQuantityInput struct {
 	Now              time.Time
 	Horizon          time.Duration
@@ -76,6 +77,14 @@ type JointDistanceQuantityDecision struct {
 	SellAdmissionReason             string
 	AdmissionJointCEJPY             float64
 	AdmissionJointComplementary     bool
+	InwardBuyEligible               bool
+	InwardSellEligible              bool
+	InwardBuySelected               bool
+	InwardSellSelected              bool
+	SelectedInwardBuyDeltaBps       float64
+	SelectedInwardSellDeltaBps      float64
+	ConditionalBuy                  ConditionalExecutionSideDecision
+	ConditionalSell                 ConditionalExecutionSideDecision
 }
 
 func positiveExecutableUnit(values ...float64) float64 {
@@ -235,6 +244,59 @@ func jointDistanceCandidatePlan(
 	candidate.AskHalfSpreadBps = candidate.AskDistanceBps
 	candidate.HalfSpreadBps = math.Max(candidate.BidDistanceBps, candidate.AskDistanceBps)
 	return candidate
+}
+
+// jointDistanceCandidatePlans preserves the established outward ladder and,
+// when conditional state is available, adds one-dimensional inward BUY and
+// SELL ladders. Keeping this O(K), rather than forming an O(K^2) Cartesian
+// product, bounds live CPU and avoids creating unsupported joint combinations.
+func jointDistanceCandidatePlans(
+	base MarketMakerQuotePlan,
+	bestBid, bestAsk, mid, maximumHalfSpreadBps float64,
+	allowInward bool,
+	count int,
+) []MarketMakerQuotePlan {
+	if count < 2 {
+		count = 2
+	}
+	plans := make([]MarketMakerQuotePlan, 0, 3*count-2)
+	for index := 0; index < count; index++ {
+		fraction := float64(index) / float64(count-1)
+		plans = append(plans, jointDistanceCandidatePlan(
+			base, bestBid, bestAsk, mid, maximumHalfSpreadBps, fraction))
+	}
+	if !allowInward || bestBid <= 0 || bestAsk <= bestBid || mid <= 0 {
+		return plans
+	}
+	if base.AllowBid && base.BidPrice > 0 && bestBid > base.BidPrice*(1+1e-12) {
+		logRange := math.Log(bestBid / base.BidPrice)
+		for index := 1; index < count; index++ {
+			fraction := float64(index) / float64(count-1)
+			candidate := base
+			candidate.BidPrice = base.BidPrice * math.Exp(fraction*logRange)
+			candidate.BidTouchDistanceBps, candidate.AskTouchDistanceBps, _ =
+				MakerTouchDistances(bestBid, bestAsk, candidate.BidPrice, candidate.AskPrice)
+			candidate.BidDistanceBps = math.Max(0, math.Log(mid/candidate.BidPrice)*10_000)
+			candidate.BidHalfSpreadBps = candidate.BidDistanceBps
+			candidate.HalfSpreadBps = math.Max(candidate.BidHalfSpreadBps, candidate.AskHalfSpreadBps)
+			plans = append(plans, candidate)
+		}
+	}
+	if base.AllowAsk && base.AskPrice > bestAsk*(1+1e-12) {
+		logRange := math.Log(base.AskPrice / bestAsk)
+		for index := 1; index < count; index++ {
+			fraction := float64(index) / float64(count-1)
+			candidate := base
+			candidate.AskPrice = base.AskPrice * math.Exp(-fraction*logRange)
+			candidate.BidTouchDistanceBps, candidate.AskTouchDistanceBps, _ =
+				MakerTouchDistances(bestBid, bestAsk, candidate.BidPrice, candidate.AskPrice)
+			candidate.AskDistanceBps = math.Max(0, math.Log(candidate.AskPrice/mid)*10_000)
+			candidate.AskHalfSpreadBps = candidate.AskDistanceBps
+			candidate.HalfSpreadBps = math.Max(candidate.BidHalfSpreadBps, candidate.AskHalfSpreadBps)
+			plans = append(plans, candidate)
+		}
+	}
+	return plans
 }
 
 func fastPathDownsideDecision(
@@ -592,7 +654,14 @@ func OptimizeJointDistanceQuantity(
 	if count < 2 {
 		count = 2
 	}
-	d.CandidateCount = count
+	conditionalState := model.conditionalExecutionState(in.Horizon)
+	conditionalEnabled := config.ConditionalExecution.Enabled && conditionalState.Valid
+	plans := jointDistanceCandidatePlans(
+		in.BasePlan, in.BestBid, in.BestAsk, in.MidPrice,
+		config.MaximumHalfSpreadBps, conditionalEnabled, count)
+	d.CandidateCount = len(plans)
+	d.InwardBuyEligible = conditionalEnabled && in.BasePlan.AllowBid && in.BestBid > in.BasePlan.BidPrice*(1+1e-12)
+	d.InwardSellEligible = conditionalEnabled && in.BasePlan.AllowAsk && in.BasePlan.AskPrice > in.BestAsk*(1+1e-12)
 	z := in.ConfidenceZScore
 	if z <= 0 {
 		z = config.InventoryRiskZScore
@@ -622,14 +691,36 @@ func OptimizeJointDistanceQuantity(
 	sellUnit := positiveExecutableUnit(in.Projection.MinSellNotionalJPY)
 	crossingReady, positiveEdge, pathReady, projectionReady := 0, 0, 0, 0
 	positivePathUtility, confidenceScaleReady := 0, 0
-	for index := 0; index < count; index++ {
-		fraction := float64(index) / float64(count-1)
-		plan := jointDistanceCandidatePlan(
-			in.BasePlan, in.BestBid, in.BestAsk, in.MidPrice, config.MaximumHalfSpreadBps, fraction)
+	for index, plan := range plans {
 		buyDistance, sellDistance, grossEdge := MakerTouchDistances(
 			in.BestBid, in.BestAsk, plan.BidPrice, plan.AskPrice)
+		inwardBuy := plan.BidPrice > in.BasePlan.BidPrice*(1+1e-12)
+		inwardSell := plan.AskPrice < in.BasePlan.AskPrice*(1-1e-12)
+		conditionalBuy, conditionalSell := ConditionalExecutionSideDecision{}, ConditionalExecutionSideDecision{}
+		if inwardBuy {
+			conditionalBuy = model.conditionalExecutionSideDecision(
+				in.Now, config, in.Horizon, conditionalState, true,
+				in.BasePlan.BidTouchDistanceBps, buyDistance)
+			if !conditionalBuy.Evaluated ||
+				conditionalBuy.ExpectedPairedDeltaBps-z*conditionalBuy.PairedStdErrorBps <= 0 {
+				continue
+			}
+		}
+		if inwardSell {
+			conditionalSell = model.conditionalExecutionSideDecision(
+				in.Now, config, in.Horizon, conditionalState, false,
+				in.BasePlan.AskTouchDistanceBps, sellDistance)
+			if !conditionalSell.Evaluated ||
+				conditionalSell.ExpectedPairedDeltaBps-z*conditionalSell.PairedStdErrorBps <= 0 {
+				continue
+			}
+		}
 		crossing := model.CrossingDecisionAtSideDistances(
 			in.Now, config, in.Horizon, buyDistance, sellDistance, grossEdge)
+		if inwardBuy || inwardSell {
+			crossing = model.conditionalCrossingDecision(
+				in.Now, config, in.Horizon, buyDistance, sellDistance, grossEdge, conditionalState)
+		}
 		if !crossing.HasSufficientCrossings(config.HorizonMinSamples) {
 			continue
 		}
@@ -640,6 +731,10 @@ func OptimizeJointDistanceQuantity(
 		positiveEdge++
 		pathStats := model.JointPathPayoffStatistics(
 			in.Now, config, in.Horizon, buyDistance, sellDistance)
+		if inwardBuy || inwardSell {
+			pathStats = model.conditionalJointPathPayoffStatistics(
+				in.Now, config, in.Horizon, buyDistance, sellDistance, conditionalState)
+		}
 		// One independent path cannot identify dispersion. Beyond that minimum,
 		// sample scarcity belongs in the standard error and confidence bound,
 		// rather than a duplicate hard gate tied to crossing sample health.
@@ -653,7 +748,7 @@ func OptimizeJointDistanceQuantity(
 		// payoff includes both untouched paths and adverse continuation after a
 		// touch, so this is a conditional execution-quality test rather than a
 		// nominal spread threshold.
-		if in.BasePlan.AllowBid && buyUnit > 0 &&
+		if !inwardBuy && !inwardSell && in.BasePlan.AllowBid && buyUnit > 0 &&
 			in.Projection.MaxBuyNotionalJPY+1e-9 >= buyUnit {
 			buyUtility := pathStats.EvaluateWholePosition(
 				in.Projection.CurrentInventoryNotionalJPY,
@@ -665,7 +760,7 @@ func OptimizeJointDistanceQuantity(
 				bestFallbackBuyPlan = plan
 			}
 		}
-		if in.BasePlan.AllowAsk && sellUnit > 0 &&
+		if !inwardBuy && !inwardSell && in.BasePlan.AllowAsk && sellUnit > 0 &&
 			in.Projection.MaxSellNotionalJPY+1e-9 >= sellUnit {
 			sellUtility := pathStats.EvaluateWholePosition(
 				in.Projection.CurrentInventoryNotionalJPY,
@@ -746,6 +841,16 @@ func OptimizeJointDistanceQuantity(
 				d.Crossing = crossing
 				d.SelectedCandidate = index
 				d.SelectedQuantityCandidate = quantityIndex
+				d.InwardBuySelected = inwardBuy
+				d.InwardSellSelected = inwardSell
+				if d.InwardBuySelected {
+					d.SelectedInwardBuyDeltaBps = math.Log(plan.BidPrice/in.BasePlan.BidPrice) * 10_000
+					d.ConditionalBuy = conditionalBuy
+				}
+				if d.InwardSellSelected {
+					d.SelectedInwardSellDeltaBps = math.Log(in.BasePlan.AskPrice/plan.AskPrice) * 10_000
+					d.ConditionalSell = conditionalSell
+				}
 				d.QuantityScale = scale
 				d.ExpectedCycleJPY = math.Min(
 					crossing.BuyTouchProbability*projection.BuyNotionalJPY,

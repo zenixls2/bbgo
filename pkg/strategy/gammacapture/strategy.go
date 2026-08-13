@@ -1339,8 +1339,20 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 		bbgo.Sync(ctx, s)
 		s.makerLastCheckpointSync = now
 	}
-	selectedHorizonDecision := s.makerHorizonModel.UpdateForBookAdaptiveVolatility(
-		now, quoteConfig, ticker.Buy.Float64(), ticker.Sell.Float64())
+	preSelectionPairEquityJPY := s.pairEquityQuote(mid)
+	preSelectionExecutableNotionalJPY := makerMinimumExecutableNotional(
+		s.Market, ticker.Buy, ticker.Sell)
+	selectedHorizonDecision := s.makerHorizonModel.UpdateForBookAdaptiveVolatilityWithMarginalBuy(
+		now, quoteConfig, ticker.Buy.Float64(), ticker.Sell.Float64(),
+		FastHorizonMarginalBuyInput{
+			CurrentInventoryNotionalJPY: inventoryBase * mid,
+			TargetInventoryNotionalJPY:  quoteConfig.InventoryCapitalTargetRatio * preSelectionPairEquityJPY,
+			PairEquityJPY:               preSelectionPairEquityJPY,
+			MarginalBuyNotionalJPY:      preSelectionExecutableNotionalJPY,
+			AvailableBuyCapitalJPY:      quoteableQuote.Float64(),
+			RiskAversion:                quoteConfig.MacroInventory.RiskAversion,
+			ConfidenceZScore:            quoteConfig.InventoryRiskZScore,
+		})
 	selectedHorizon := time.Duration(selectedHorizonDecision.HorizonSeconds) * time.Second
 	if selectedHorizon <= 0 {
 		selectedHorizon = time.Duration(quoteConfig.MinTradingWindow)
@@ -2585,6 +2597,11 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"horizonSellTouchPosterior":                 horizonDecision.SellTouchProbability,
 			"horizonScoreStdErrorBpsPerHour":            horizonDecision.ScoreStdErrorBpsHour,
 			"horizonScoreBpsPerHour":                    horizonDecision.ScoreBpsPerHour,
+			"horizonSelectionScoreBpsPerHour":           selectedHorizonDecision.SelectionScoreBpsPerHour,
+			"horizonMarginalBuyEvaluated":               selectedHorizonDecision.MarginalBuyEvaluated,
+			"horizonMarginalBuyNotionalJPY":             selectedHorizonDecision.MarginalBuyNotionalJPY,
+			"horizonMarginalBuyCEJPY":                   selectedHorizonDecision.MarginalBuyCertaintyEquivalentJPY,
+			"horizonMarginalBuyUtilityBpsPerHour":       selectedHorizonDecision.MarginalBuyUtilityBpsPerHour,
 			"horizonUpPerHour":                          horizonDecision.UpCrossesPerHour,
 			"horizonDownPerHour":                        horizonDecision.DownCrossesPerHour,
 			"horizonEstimatorSource":                    horizonDecision.EstimatorSource,
@@ -2814,6 +2831,17 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"jointQuoteCandidateCount":                  jointQuoteDecision.CandidateCount,
 			"jointQuoteSelectedCandidate":               jointQuoteDecision.SelectedCandidate,
 			"jointQuoteSelectedQuantityCandidate":       jointQuoteDecision.SelectedQuantityCandidate,
+			"jointQuoteConditionalEnabled":              quoteConfig.ConditionalExecution.Enabled,
+			"jointQuoteInwardBuyEligible":               jointQuoteDecision.InwardBuyEligible,
+			"jointQuoteInwardSellEligible":              jointQuoteDecision.InwardSellEligible,
+			"jointQuoteInwardBuySelected":               jointQuoteDecision.InwardBuySelected,
+			"jointQuoteInwardSellSelected":              jointQuoteDecision.InwardSellSelected,
+			"jointQuoteSelectedInwardBuyDeltaBps":       jointQuoteDecision.SelectedInwardBuyDeltaBps,
+			"jointQuoteSelectedInwardSellDeltaBps":      jointQuoteDecision.SelectedInwardSellDeltaBps,
+			"jointQuoteConditionalBuyDeltaMeanBps":      jointQuoteDecision.ConditionalBuy.ExpectedPairedDeltaBps,
+			"jointQuoteConditionalSellDeltaMeanBps":     jointQuoteDecision.ConditionalSell.ExpectedPairedDeltaBps,
+			"jointQuoteConditionalBuySamples":           jointQuoteDecision.ConditionalBuy.EffectiveSamples,
+			"jointQuoteConditionalSellSamples":          jointQuoteDecision.ConditionalSell.EffectiveSamples,
 			"jointQuoteQuantityScale":                   jointQuoteDecision.QuantityScale,
 			"jointQuoteExpectedCycleJPY":                jointQuoteDecision.ExpectedCycleJPY,
 			"jointQuoteExpectedPnLJPYHour":              jointQuoteDecision.ExpectedPnLJPYHour,

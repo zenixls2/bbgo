@@ -19,6 +19,7 @@ type marketMakerHorizonExposure struct {
 	TerminalAsk      float64
 	BuyExcursionBps  float64
 	SellExcursionBps float64
+	ConditionalState conditionalExecutionState
 	NextMinute       int
 }
 
@@ -86,6 +87,7 @@ func (m *MarketMakerHorizonModel) crossingExposures(horizon time.Duration) []mar
 	cache.MaxBidDeque = cache.MaxBidDeque[:0]
 	cache.MinAskDeque = cache.MinAskDeque[:0]
 	cache.BuiltThrough = time.Time{}
+	conditionalStates := buildConditionalExecutionStates(m.points, horizon)
 	right := 1
 	pushWindow := func(index int) {
 		bid, ask := m.points[index].bidPrice(), m.points[index].askPrice()
@@ -145,6 +147,7 @@ func (m *MarketMakerHorizonModel) crossingExposures(horizon time.Duration) []mar
 			TerminalAsk:      terminalAsk,
 			BuyExcursionBps:  math.Log(startAsk/minAsk) * 10_000,
 			SellExcursionBps: math.Log(maxBid/startBid) * 10_000,
+			ConditionalState: conditionalStates[index],
 		})
 	}
 
@@ -213,6 +216,7 @@ func horizonExposureAtIndex(points []MarketMakerHorizonPoint, index int, horizon
 		TerminalAsk:      terminalAsk,
 		BuyExcursionBps:  math.Log(startAsk/minAsk) * 10_000,
 		SellExcursionBps: math.Log(maxBid/startBid) * 10_000,
+		ConditionalState: conditionalExecutionStateAtIndex(points, index, horizon),
 	}, true
 }
 

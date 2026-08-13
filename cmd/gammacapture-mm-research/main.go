@@ -159,6 +159,7 @@ func main() {
 	overrideMacroCarryBudget := flag.Float64("override-macro-carry-risk-budget-ratio", -1, "research-only Macro carry risk budget ratio")
 	overrideMacroBarInterval := flag.Duration("override-macro-bar-interval", -1, "research-only Macro bar interval")
 	disableJointDistanceQuantity := flag.Bool("disable-joint-distance-quantity", false, "research-only disable joint distance/quantity optimizer")
+	disableConditionalExecution := flag.Bool("disable-conditional-execution", false, "research-only use unconditional crossing/path statistics and outward quotes only")
 	activateJointDistanceQuantity := flag.Bool("activate-joint-distance-quantity", false, "research-only activate joint distance/quantity optimizer even when production is shadow-only")
 	overrideJointDistanceCandidates := flag.Int("override-joint-distance-candidates", -1, "research-only joint distance ladder candidate count")
 	replayFrom := flag.String("replay-from", "", "exact Macro replay start (RFC3339)")
@@ -189,6 +190,7 @@ func main() {
 		MacroCarryRiskBudget:          *overrideMacroCarryBudget,
 		MacroBarInterval:              *overrideMacroBarInterval,
 		DisableJointDistanceQuantity:  *disableJointDistanceQuantity,
+		DisableConditionalExecution:   *disableConditionalExecution,
 		ActivateJointDistanceQuantity: *activateJointDistanceQuantity,
 		JointDistanceCandidateCount:   *overrideJointDistanceCandidates,
 		EnableFastDrift:               *enableFastDrift,

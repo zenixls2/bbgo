@@ -43,6 +43,9 @@ func TestLiveETHJPYConfigDecodesInventoryControllers(t *testing.T) {
 		!strategy.MarketMaker.JointDistanceQuantity.Enabled {
 		t.Fatal("live ETHJPY config must give Fast joint price/quantity ownership")
 	}
+	if !strategy.MarketMaker.ConditionalExecution.Enabled {
+		t.Fatal("live ETHJPY config must enable symmetric conditional Fast execution")
+	}
 	if !strategy.MarketMaker.PosteriorInventoryTarget {
 		t.Fatal("live ETHJPY config must enable posterior inventory targeting")
 	}

@@ -48,6 +48,7 @@ type productionConfigOverrides struct {
 	MacroCarryRiskBudget          float64
 	MacroBarInterval              time.Duration
 	DisableJointDistanceQuantity  bool
+	DisableConditionalExecution   bool
 	ActivateJointDistanceQuantity bool
 	JointDistanceCandidateCount   int
 	EnableFastDrift               bool
@@ -93,6 +94,9 @@ func (o productionConfigOverrides) apply(c gammacapture.MarketMakerConfig) gamma
 	}
 	if o.DisableJointDistanceQuantity {
 		c.JointDistanceQuantity.Enabled = false
+	}
+	if o.DisableConditionalExecution {
+		c.ConditionalExecution.Enabled = false
 	}
 	if o.ActivateJointDistanceQuantity {
 		c.JointDistanceQuantity.Enabled = true
@@ -305,6 +309,12 @@ type productionReplayMacroIOC struct {
 type productionReplayJointDecision struct {
 	At                           time.Time     `json:"at"`
 	Horizon                      time.Duration `json:"horizon"`
+	HorizonCrossingScoreBpsHour  float64       `json:"horizonCrossingScoreBpsHour"`
+	HorizonSelectionScoreBpsHour float64       `json:"horizonSelectionScoreBpsHour"`
+	HorizonMarginalBuyEvaluated  bool          `json:"horizonMarginalBuyEvaluated"`
+	HorizonMarginalBuyNotional   float64       `json:"horizonMarginalBuyNotionalJPY"`
+	HorizonMarginalBuyCE         float64       `json:"horizonMarginalBuyCEJPY"`
+	HorizonMarginalBuyUtility    float64       `json:"horizonMarginalBuyUtilityBpsHour"`
 	Reason                       string        `json:"reason"`
 	AuthoritativeRejection       bool          `json:"authoritativeRejection"`
 	SideSafeFallback             bool          `json:"sideSafeFallback"`
@@ -361,6 +371,14 @@ type productionReplayJointDecision struct {
 	SellAdmissionReason          string        `json:"sellAdmissionReason,omitempty"`
 	AdmissionJointCEJPY          float64       `json:"admissionJointCEJPY"`
 	AdmissionJointComplementary  bool          `json:"admissionJointComplementary"`
+	InwardBuyEligible            bool          `json:"inwardBuyEligible"`
+	InwardSellEligible           bool          `json:"inwardSellEligible"`
+	InwardBuySelected            bool          `json:"inwardBuySelected"`
+	InwardSellSelected           bool          `json:"inwardSellSelected"`
+	SelectedInwardBuyDeltaBps    float64       `json:"selectedInwardBuyDeltaBps"`
+	SelectedInwardSellDeltaBps   float64       `json:"selectedInwardSellDeltaBps"`
+	ConditionalBuyDeltaMeanBps   float64       `json:"conditionalBuyDeltaMeanBps"`
+	ConditionalSellDeltaMeanBps  float64       `json:"conditionalSellDeltaMeanBps"`
 }
 
 var activeProductionReplayPosteriorBaseTarget bool
@@ -682,8 +700,18 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 	}
 	s.lastDecisionSecond = decisionSecond
 	slow := s.slowModel.Snapshot(book.time)
-	selectedDecision := s.horizonModel.UpdateForBookAdaptiveVolatility(
-		book.time, s.cfg, book.bid, book.ask)
+	preSelectionPairEquity := s.quote + s.inventory*mid
+	selectedDecision := s.horizonModel.UpdateForBookAdaptiveVolatilityWithMarginalBuy(
+		book.time, s.cfg, book.bid, book.ask,
+		gammacapture.FastHorizonMarginalBuyInput{
+			CurrentInventoryNotionalJPY: s.inventory * mid,
+			TargetInventoryNotionalJPY:  s.cfg.InventoryCapitalTargetRatio * preSelectionPairEquity,
+			PairEquityJPY:               preSelectionPairEquity,
+			MarginalBuyNotionalJPY:      100,
+			AvailableBuyCapitalJPY:      s.quote,
+			RiskAversion:                s.cfg.MacroInventory.RiskAversion,
+			ConfidenceZScore:            s.cfg.InventoryRiskZScore,
+		})
 	selectedHorizon := time.Duration(selectedDecision.HorizonSeconds) * time.Second
 	if selectedHorizon <= 0 {
 		selectedHorizon = time.Duration(s.cfg.MinTradingWindow)
@@ -1243,7 +1271,14 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 			s.jointQuoteReasons[joint.Reason]++
 			s.jointQuoteDecisions = append(s.jointQuoteDecisions,
 				productionReplayJointDecision{
-					At: book.time, Horizon: horizon, Reason: joint.Reason,
+					At: book.time, Horizon: horizon,
+					HorizonCrossingScoreBpsHour:  selectedDecision.ScoreBpsPerHour,
+					HorizonSelectionScoreBpsHour: selectedDecision.SelectionScoreBpsPerHour,
+					HorizonMarginalBuyEvaluated:  selectedDecision.MarginalBuyEvaluated,
+					HorizonMarginalBuyNotional:   selectedDecision.MarginalBuyNotionalJPY,
+					HorizonMarginalBuyCE:         selectedDecision.MarginalBuyCertaintyEquivalentJPY,
+					HorizonMarginalBuyUtility:    selectedDecision.MarginalBuyUtilityBpsPerHour,
+					Reason:                       joint.Reason,
 					AuthoritativeRejection:       joint.AuthoritativeRejection,
 					SideSafeFallback:             joint.SideSafeFallback,
 					FallbackBuySupported:         joint.FallbackBuySupported,
@@ -1299,6 +1334,14 @@ func (s *productionReplayState) onBook(book bboSnapshot, gap bool) {
 					SellAdmissionReason:          joint.SellAdmissionReason,
 					AdmissionJointCEJPY:          joint.AdmissionJointCEJPY,
 					AdmissionJointComplementary:  joint.AdmissionJointComplementary,
+					InwardBuyEligible:            joint.InwardBuyEligible,
+					InwardSellEligible:           joint.InwardSellEligible,
+					InwardBuySelected:            joint.InwardBuySelected,
+					InwardSellSelected:           joint.InwardSellSelected,
+					SelectedInwardBuyDeltaBps:    joint.SelectedInwardBuyDeltaBps,
+					SelectedInwardSellDeltaBps:   joint.SelectedInwardSellDeltaBps,
+					ConditionalBuyDeltaMeanBps:   joint.ConditionalBuy.ExpectedPairedDeltaBps,
+					ConditionalSellDeltaMeanBps:  joint.ConditionalSell.ExpectedPairedDeltaBps,
 				})
 			if joint.PathEffectiveSamples > 0 {
 				s.jointCandidateCount++

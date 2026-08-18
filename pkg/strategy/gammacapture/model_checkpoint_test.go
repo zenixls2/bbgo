@@ -29,6 +29,44 @@ func newCheckpointTestStrategy(root string) *Strategy {
 	}
 }
 
+func TestModelCheckpointHashCoversFastDecisionConfiguration(t *testing.T) {
+	strategy := newCheckpointTestStrategy(t.TempDir())
+	base, err := strategy.modelCheckpointHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*MarketMakerConfig)
+	}{
+		{"fast risk aversion", func(c *MarketMakerConfig) { c.FastRiskAversion = 2 }},
+		{"dynamic inventory aim", func(c *MarketMakerConfig) { c.DynamicInventoryAim.Enabled = true }},
+		{"fast target execution", func(c *MarketMakerConfig) { c.FastTargetExecution.Enabled = true }},
+		{"fast target switching", func(c *MarketMakerConfig) { c.FastTargetSwitching.Enabled = true }},
+		{"posterior inventory target", func(c *MarketMakerConfig) { c.PosteriorInventoryTarget = true }},
+		{"probability centered quantity", func(c *MarketMakerConfig) { c.ProbabilityCenteredQuantity.Enabled = true }},
+		{"joint distance quantity", func(c *MarketMakerConfig) { c.JointDistanceQuantity.Enabled = true }},
+		{"conditional execution", func(c *MarketMakerConfig) { c.ConditionalExecution.Enabled = true }},
+		{"post fill utility", func(c *MarketMakerConfig) { c.PostFillUtility.Enabled = true }},
+		{"maker fee", func(c *MarketMakerConfig) { c.MakerFeeBps += 1 }},
+		{"inventory risk", func(c *MarketMakerConfig) { c.InventoryRiskZScore += 0.1 }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := newCheckpointTestStrategy(t.TempDir())
+			tc.mutate(&candidate.MarketMaker)
+			got, err := candidate.modelCheckpointHash()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == base {
+				t.Fatalf("decision configuration change did not change checkpoint hash: %s", got)
+			}
+		})
+	}
+}
+
 func TestModelCheckpointRoundTripAndZeroDeltaWarmup(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)

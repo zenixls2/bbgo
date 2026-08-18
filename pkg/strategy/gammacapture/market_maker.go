@@ -109,6 +109,11 @@ type MarketMakerConfig struct {
 	// remains the absolute floor for small accounts or unavailable balances.
 	InventoryRiskBudgetRatio float64 `json:"inventoryRiskBudgetRatio" yaml:"inventoryRiskBudgetRatio"`
 	InventoryRiskZScore      float64 `json:"inventoryRiskZScore" yaml:"inventoryRiskZScore"`
+	// FastRiskAversion belongs to the executable Fast terminal-wealth model.
+	// It is deliberately independent from MacroInventory.RiskAversion so that
+	// disabling or retuning the long-horizon controller cannot silently change
+	// Fast quote sizing, target switching, or IOC decisions.
+	FastRiskAversion         float64 `json:"fastRiskAversion" yaml:"fastRiskAversion"`
 	PosteriorInventoryTarget bool    `json:"posteriorInventoryTarget" yaml:"posteriorInventoryTarget"`
 	// DynamicInventoryAim is the single target/speed controller.  It may
 	// influence the Fast inventory target only; price, arrival, and order
@@ -191,6 +196,47 @@ type MarketMakerConfig struct {
 	InventoryReset               InventoryResetConfig   `json:"inventoryReset" yaml:"inventoryReset"`
 	AcquisitionReset             AcquisitionResetConfig `json:"acquisitionReset" yaml:"acquisitionReset"`
 	EarlyBump                    EarlyBumpConfig        `json:"earlyBump" yaml:"earlyBump"`
+}
+
+// fastRiskAversionOrDefault resolves a risk-aversion value for the executable
+// Fast quote model.  Fast callers normally pass the value selected by the
+// live strategy; the config fallback exists for focused research helpers that
+// call an optimizer directly.  It must never fall back to MacroInventory,
+// because Macro is an optional long-horizon controller and changing it must
+// not silently retune Fast pricing or quantity.
+func fastRiskAversionOrDefault(config MarketMakerConfig, riskAversion float64) float64 {
+	if riskAversion > 0 && !math.IsNaN(riskAversion) && !math.IsInf(riskAversion, 0) {
+		return riskAversion
+	}
+	if config.FastRiskAversion > 0 && !math.IsNaN(config.FastRiskAversion) && !math.IsInf(config.FastRiskAversion, 0) {
+		return config.FastRiskAversion
+	}
+	return 1
+}
+
+// preserveActiveTwoSidedQuotesAfterFastRejection is a continuity floor for an
+// already resting bilateral maker pair.  A terminal-path rejection should not
+// create an empty book merely because a new candidate was rejected, but the
+// floor is deliberately conditional: any event that can make the old pair
+// unsafe (crossing, expiry, adverse/material movement, inventory headroom,
+// repricing, lifecycle, or fill-rebalance work) still cancels it.
+func preserveActiveTwoSidedQuotesAfterFastRejection(
+	config JointDistanceQuantityConfig,
+	activeBid, activeAsk bool,
+	fillRebalancePending bool,
+	quoteCrossed, adverseMove, materialMove, materialImbalance bool,
+	windowExpired, inventoryHeadroomExceeded, fastEdgeLeaseExpired bool,
+	statisticalRealignment, oneSidedTargetRealignment bool,
+	macroTargetRealignment, fastTargetRealignment, reservationRiskRealignment bool,
+	earlyBumpRefresh, lifecycleReplace bool,
+) bool {
+	return config.PreserveTwoSidedQuotes && activeBid && activeAsk &&
+		!fillRebalancePending && !quoteCrossed && !adverseMove &&
+		!materialMove && !materialImbalance && !windowExpired &&
+		!inventoryHeadroomExceeded && !fastEdgeLeaseExpired &&
+		!statisticalRealignment && !oneSidedTargetRealignment &&
+		!macroTargetRealignment && !fastTargetRealignment &&
+		!reservationRiskRealignment && !earlyBumpRefresh && !lifecycleReplace
 }
 
 // InventoryResetConfig controls the mathematically justified transition from
@@ -323,6 +369,9 @@ func (c *MarketMakerConfig) setDefaults() {
 	}
 	if c.InventoryRiskZScore <= 0 {
 		c.InventoryRiskZScore = 1.645
+	}
+	if c.FastRiskAversion <= 0 {
+		c.FastRiskAversion = 1
 	}
 	if c.JointDistanceQuantity.CandidateCount <= 0 {
 		c.JointDistanceQuantity.CandidateCount = 5

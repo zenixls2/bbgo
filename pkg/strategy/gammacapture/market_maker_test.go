@@ -36,6 +36,54 @@ func TestMarketMakerConfigUsesSessionFees(t *testing.T) {
 	}
 }
 
+func TestPreserveActiveTwoSidedQuotesAfterFastRejection(t *testing.T) {
+	cfg := JointDistanceQuantityConfig{PreserveTwoSidedQuotes: true}
+	safe := preserveActiveTwoSidedQuotesAfterFastRejection(
+		cfg, true, true, false,
+		false, false, false, false,
+		false, false, false,
+		false, false, false, false, false,
+		false, false,
+	)
+	if !safe {
+		t.Fatal("a valid resting bilateral pair should receive the continuity floor")
+	}
+	cases := []struct {
+		name   string
+		mutate func(*[]bool)
+	}{
+		{"one-sided", func(v *[]bool) { (*v)[0] = false }},
+		{"fill-refresh", func(v *[]bool) { (*v)[2] = true }},
+		{"crossed", func(v *[]bool) { (*v)[3] = true }},
+		{"expired", func(v *[]bool) { (*v)[7] = true }},
+		{"inventory-headroom", func(v *[]bool) { (*v)[8] = true }},
+		{"early-bump-refresh", func(v *[]bool) { (*v)[15] = true }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			values := []bool{true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false}
+			tc.mutate(&values)
+			got := preserveActiveTwoSidedQuotesAfterFastRejection(
+				cfg, values[0], values[1], values[2],
+				values[3], values[4], values[5], values[6],
+				values[7], values[8], values[9],
+				values[10], values[11], values[12], values[13], values[14],
+				values[15], values[16],
+			)
+			if got {
+				t.Fatalf("unsafe state %q was preserved", tc.name)
+			}
+		})
+	}
+	if preserveActiveTwoSidedQuotesAfterFastRejection(
+		JointDistanceQuantityConfig{}, true, true, false,
+		false, false, false, false, false, false, false, false, false,
+		false, false, false, false, false,
+	) {
+		t.Fatal("disabled continuity floor must not preserve quotes")
+	}
+}
+
 func TestMarketMakerQuoteSurvivesNarrowBook(t *testing.T) {
 	c := MarketMakerConfig{MakerFeeBps: 10, AdverseSelectionBps: 2, MinimumNetEdgeBps: 4}
 	p := c.Quote(MarketMakerQuoteInput{MidPrice: 100, BestBid: 99.99, BestAsk: 100.01, CanBuy: true, CanSell: true})

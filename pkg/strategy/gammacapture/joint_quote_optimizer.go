@@ -183,7 +183,7 @@ func TargetRestoringSideRealignment(
 		return false, 0, 0
 	}
 	if riskAversion <= 0 {
-		riskAversion = config.MacroInventory.RiskAversion
+		riskAversion = fastRiskAversionOrDefault(config, riskAversion)
 	}
 	if confidenceZScore <= 0 {
 		confidenceZScore = config.InventoryRiskZScore
@@ -692,7 +692,7 @@ func fastPathDownsideDecision(
 	moments := stats.BuyDominant
 	riskAversion := in.RiskAversion
 	if riskAversion <= 0 {
-		riskAversion = config.MacroInventory.RiskAversion
+		riskAversion = fastRiskAversionOrDefault(config, riskAversion)
 	}
 	z := in.ConfidenceZScore
 	if z <= 0 {
@@ -746,7 +746,7 @@ func applyFastPathAdmissions(
 		in.Now, config, in.Horizon, buyDistance, sellDistance)
 	riskAversion := in.RiskAversion
 	if riskAversion <= 0 {
-		riskAversion = config.MacroInventory.RiskAversion
+		riskAversion = fastRiskAversionOrDefault(config, riskAversion)
 	}
 	z := in.ConfidenceZScore
 	if z <= 0 {
@@ -1028,7 +1028,7 @@ func jointHorizonRawUtility(
 	}
 	riskAversion := in.RiskAversion
 	if riskAversion <= 0 {
-		riskAversion = config.MacroInventory.RiskAversion
+		riskAversion = fastRiskAversionOrDefault(config, riskAversion)
 	}
 	payoff := stats.EvaluateTargetRelativePosition(
 		in.Projection.CurrentInventoryNotionalJPY,
@@ -1889,7 +1889,7 @@ func sideSafeFallbackAfterJointRejection(
 		in.Now, config, in.Horizon, buyDistance, sellDistance)
 	riskAversion := in.RiskAversion
 	if riskAversion <= 0 {
-		riskAversion = config.MacroInventory.RiskAversion
+		riskAversion = fastRiskAversionOrDefault(config, riskAversion)
 	}
 	mean, regret, net := 0.0, 0.0, 0.0
 	continuation := TargetProgressContinuationValue(
@@ -2232,7 +2232,7 @@ func targetRestoringFastContinuation(
 			}
 			riskAversion := in.RiskAversion
 			if riskAversion <= 0 {
-				riskAversion = config.MacroInventory.RiskAversion
+				riskAversion = fastRiskAversionOrDefault(config, riskAversion)
 			}
 			crossing := model.CrossingDecisionAtSideDistances(
 				in.Now, config, in.Horizon,
@@ -2315,7 +2315,7 @@ func targetRestoringFastContinuation(
 	}
 	riskAversion := in.RiskAversion
 	if riskAversion <= 0 {
-		riskAversion = config.MacroInventory.RiskAversion
+		riskAversion = fastRiskAversionOrDefault(config, riskAversion)
 	}
 	stats := model.JointPathPayoffStatistics(
 		in.Now, config, in.Horizon, buyDistance, sellDistance)
@@ -2420,7 +2420,7 @@ func OptimizeJointDistanceQuantity(
 	}
 	riskAversion := in.RiskAversion
 	if riskAversion <= 0 {
-		riskAversion = config.MacroInventory.RiskAversion
+		riskAversion = fastRiskAversionOrDefault(config, riskAversion)
 	}
 	quantityScales := jointQuantityScales(in.Projection, count)
 	if len(quantityScales) == 0 {

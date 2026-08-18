@@ -165,48 +165,23 @@ func checkpointWindowKey(window time.Duration) string {
 }
 
 func (s *Strategy) modelCheckpointHash() (string, error) {
-	marketMaker := s.MarketMaker
-	marketMaker.setDefaults()
-	macro := marketMaker.MacroInventory
-	macro.setDefaults()
+	// Fingerprint the complete effective policy configuration.  The previous
+	// hand-maintained field list omitted newly added Fast target/quantity,
+	// terminal-wealth, fee, and inventory-risk controls, allowing a checkpoint
+	// trained under a materially different policy to be restored silently.
+	// Config contains policy/data paths only; credentials and exchange session
+	// state are deliberately not part of the strategy config or this hash.
+	effectiveConfig := s.Config
+	effectiveConfig.setDefaults()
+	effectiveMarketMaker, _ := marketMakerConfigWithSessionFees(effectiveConfig.MarketMaker, s.session)
+	effectiveMarketMaker.setDefaults()
+	effectiveConfig.MarketMaker = effectiveMarketMaker
 	payload := struct {
-		Symbol                    string
-		Barrier                   BarrierConfig
-		Intensity                 IntensityConfig
-		MinimumHalfSpreadBps      float64
-		MaximumHalfSpreadBps      float64
-		MinTradingWindow          time.Duration
-		MaxTradingWindow          time.Duration
-		HorizonLookback           time.Duration
-		FastWindows               []time.Duration
-		FastEvidenceWindow        time.Duration
-		FastEvidenceMinTrades     int
-		FastEvidenceMinBBOUpdates int
-		FastDriftEnabled          bool
-		VolumeProfile             VolumeProfileConfig
-		AsymmetricOscillationRisk AsymmetricOscillationRiskConfig
-		BOCPD45                   BOCPD45Config
-		MacroBarInterval          time.Duration
-		MacroLookback             time.Duration
-		MacroRiskHorizons         []time.Duration
+		FingerprintVersion int
+		Config             Config
 	}{
-		Symbol: s.Symbol, Barrier: s.Barrier, Intensity: s.Intensity,
-		MinimumHalfSpreadBps:      marketMaker.MinimumHalfSpreadBps,
-		MaximumHalfSpreadBps:      marketMaker.MaximumHalfSpreadBps,
-		MinTradingWindow:          time.Duration(marketMaker.MinTradingWindow),
-		MaxTradingWindow:          time.Duration(marketMaker.MaxTradingWindow),
-		HorizonLookback:           time.Duration(marketMaker.HorizonLookback),
-		FastWindows:               marketMaker.FastModelWindows(),
-		FastEvidenceWindow:        time.Duration(marketMaker.FastEvidenceWindow),
-		FastEvidenceMinTrades:     marketMaker.FastEvidenceMinTrades,
-		FastEvidenceMinBBOUpdates: marketMaker.FastEvidenceMinBBOUpdates,
-		FastDriftEnabled:          marketMaker.FastDrift.Enabled,
-		VolumeProfile:             marketMaker.VolumeProfile,
-		AsymmetricOscillationRisk: marketMaker.AsymmetricOscillationRisk,
-		BOCPD45:                   marketMaker.BOCPD45,
-		MacroBarInterval:          time.Duration(macro.BarInterval),
-		MacroLookback:             time.Duration(macro.Lookback),
-		MacroRiskHorizons:         macro.horizons(),
+		FingerprintVersion: 2,
+		Config:             effectiveConfig,
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {

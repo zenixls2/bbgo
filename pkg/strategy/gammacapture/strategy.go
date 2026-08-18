@@ -1340,6 +1340,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	quoteableQuote := quoteBalances.QuoteableQuote
 	mid := (ticker.Buy.Float64() + ticker.Sell.Float64()) / 2
 	quoteConfig, feeSource := marketMakerConfigWithSessionFees(s.MarketMaker, s.session)
+	fastRiskAversion := fastRiskAversionOrDefault(quoteConfig, quoteConfig.FastRiskAversion)
 	if observeEvidence {
 		s.makerHorizonModel.ObserveBookWithSizes(
 			now,
@@ -1409,7 +1410,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			AvailableBuyCapitalJPY:      quoteableQuote.Float64(),
 			MarginalSellNotionalJPY:     preSelectionExecutableNotionalJPY,
 			AvailableSellInventoryJPY:   base.Float64() * mid,
-			RiskAversion:                quoteConfig.MacroInventory.RiskAversion,
+			RiskAversion:                fastRiskAversion,
 			ConfidenceZScore:            quoteConfig.InventoryRiskZScore,
 		})
 	selectedHorizon := time.Duration(selectedHorizonDecision.HorizonSeconds) * time.Second
@@ -1422,7 +1423,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	if quoteConfig.AsymmetricOscillationRisk.Enabled &&
 		!quoteConfig.AsymmetricOscillationRisk.ShadowOnly &&
 		asymmetricRiskDecision.Enabled && asymmetricRiskDecision.RiskMultiplier > 0 {
-		quoteConfig.MacroInventory.RiskAversion *= asymmetricRiskDecision.RiskMultiplier
+		fastRiskAversion *= asymmetricRiskDecision.RiskMultiplier
 	}
 	adaptiveFast := s.adaptiveFastSnapshotForWindow(now, selectedHorizon)
 	selectedFastWindow := adaptiveFast.Window
@@ -1910,7 +1911,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			// equity and incorrectly reverse the sign of a target-restoring fill.
 			ExpectedFillNotionalJPY: executableOrderNotionalJPY,
 			VolatilityBpsPerSqrtSec: effectiveVolatilityBps,
-			RiskAversion:            quoteConfig.MacroInventory.RiskAversion,
+			RiskAversion:            fastRiskAversion,
 		})
 		if postFillUtilityDecision.Applied {
 			plan = postFillUtilityDecision.Plan
@@ -1924,7 +1925,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 		plan, fastReservationUtility = SelectFastReservationPlan(
 			&s.makerHorizonModel, quoteConfig, now, fastBuyHoldingRiskHorizon,
 			plan, fastReservation, mid, ticker.Buy.Float64(), ticker.Sell.Float64(),
-			executableOrderNotionalJPY, pairEquityJPY, quoteConfig.MacroInventory.RiskAversion)
+			executableOrderNotionalJPY, pairEquityJPY, fastRiskAversion)
 	}
 	appliedFastReservationBps := 0.0
 	if fastReservationUtility.Applied {
@@ -2032,7 +2033,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 					ForecastHorizon:         horizon,
 					ExecutionHorizon:        horizon,
 					AdjustmentPeriod:        time.Duration(quoteConfig.HorizonUpdateInterval),
-					RiskAversion:            math.Max(quoteConfig.MacroInventory.RiskAversion, 1e-6),
+					RiskAversion:            math.Max(fastRiskAversion, 1e-6),
 					OneWayExecutionCostBps:  quoteConfig.MakerFeeBps + quoteConfig.AdverseSelectionBps,
 					EvidencePriorSamples:    quoteConfig.DynamicInventoryAim.EvidencePriorSamples,
 				},
@@ -2075,7 +2076,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 				MidPrice:             mid, PairEquityJPY: pairEquityJPY,
 				InventoryReturnMeanBps:      posteriorInventoryTarget.InventoryReturnMean,
 				InventoryReturnPredictiveSD: posteriorInventoryTarget.InventoryPredictiveSD,
-				RiskAversion:                quoteConfig.MacroInventory.RiskAversion,
+				RiskAversion:                fastRiskAversion,
 				OneWayExecutionCostBps:      quoteConfig.MakerFeeBps + quoteConfig.AdverseSelectionBps,
 			})
 		if !quoteConfig.FastTargetSwitching.ShadowOnly {
@@ -2190,7 +2191,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 					FastDirection:                     jointFastDirection,
 					ConfidenceZScore:                  quoteConfig.InventoryRiskZScore,
 					PairEquityJPY:                     pairEquityJPY,
-					RiskAversion:                      quoteConfig.MacroInventory.RiskAversion,
+					RiskAversion:                      fastRiskAversion,
 					AvailableBuyCapitalJPY:            quoteableQuote.Float64(),
 					AvailableSellInventoryNotionalJPY: base.Float64() * mid,
 					CompletionSide:                    completionSide,
@@ -2454,7 +2455,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 				PersistentUpsideEValue:        upside.DownEValue,
 				PersistentUpsideForecastBps:   upside.BidForecastBps,
 				PairEquityJPY:                 pairEquityJPY,
-				RiskAversion:                  quoteConfig.MacroInventory.RiskAversion,
+				RiskAversion:                  fastRiskAversion,
 				ConfidenceZScore:              quoteConfig.InventoryRiskZScore,
 				MakerFeeBps:                   quoteConfig.MakerFeeBps, TakerFeeBps: quoteConfig.TakerFeeBps,
 				MinimumQuantityBase: s.Market.MinQuantity.Float64(),
@@ -2744,7 +2745,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 						plan.BidPrice, plan.AskPrice, activeReferenceBid, activeReferenceAsk,
 						buyBoundary, inventoryBase*mid, projectionTargetBase*mid,
 						orderNotionalJPY, pairEquityJPY,
-						quoteConfig.MacroInventory.RiskAversion, quoteConfig.InventoryRiskZScore)
+						fastRiskAversion, quoteConfig.InventoryRiskZScore)
 			}
 			oneSidedTargetRealignment = oneSidedTargetRealignment || oneSidedTargetRiskRealignment
 			statisticalRealignment = oneSidedTargetRealignment
@@ -3673,10 +3674,53 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 		}
 	}
 	if fastValueRejected {
-		// A no-order action is different from an exchange-infeasible replacement:
-		// keeping the old maker orders would execute the opportunity that the
-		// Fast value model just rejected. Cancel only; do not manufacture a
-		// replacement or invoke the ordinary ten-second retry loop.
+		// A no-order action is different from an exchange-infeasible replacement.
+		// Preserve an already-resting bilateral pair only when every independent
+		// safety/refresh condition says that the old quotes are still valid. This
+		// avoids an empty-book interval caused solely by rejecting a new candidate,
+		// while crossed, expired, adverse, inventory, lifecycle, and fill-refresh
+		// states still fail closed below.
+		if preserveActiveTwoSidedQuotesAfterFastRejection(
+			quoteConfig.JointDistanceQuantity,
+			activeBid, activeAsk, fillRefreshPending,
+			quoteCrossed, adverseMove, materialMove, materialImbalance,
+			windowExpired, inventoryHeadroomExceeded, fastEdgeLeaseExpired,
+			statisticalRealignment, oneSidedTargetRealignment,
+			macroTargetRealignment, fastTargetRealignment, reservationRiskRealignment,
+			earlyBumpDecision.Refresh, lifecycleReplace,
+		) {
+			modelUpdateInterval := time.Duration(quoteConfig.HorizonUpdateInterval)
+			if modelUpdateInterval <= 0 {
+				modelUpdateInterval = windowDuration
+			}
+			if modelUpdateInterval <= 0 {
+				modelUpdateInterval = time.Minute
+			}
+			s.lastMakerQuoteAt = now
+			s.lastMakerMid = mid
+			s.lastMakerBestBid = ticker.Buy.Float64()
+			s.lastMakerBestAsk = ticker.Sell.Float64()
+			s.lastMakerImbalance = imbalance
+			s.lastMakerBid = fixedpoint.NewFromFloat(activeBidPrice)
+			s.lastMakerAsk = fixedpoint.NewFromFloat(activeAskPrice)
+			s.makerTradingWindowStartedAt = now
+			s.makerTradingWindowEndsAt = now.Add(modelUpdateInterval)
+			s.makerReplacementRetryAfter = now.Add(modelUpdateInterval)
+			s.makerNoOrderReferenceBid = 0
+			s.makerNoOrderReferenceAsk = 0
+			s.State.LastDecision = "Fast rejection: retained safe bilateral maker quotes"
+			log.WithFields(logrus.Fields{
+				"symbol": s.Symbol, "reason": jointQuoteDecision.Reason,
+				"activeBid": activeBidPrice, "activeAsk": activeAskPrice,
+				"window": modelUpdateInterval,
+			}).Info("market-maker Fast rejection retained safe bilateral quotes")
+			return
+		}
+		// No safe continuity floor is available. A no-order action is different
+		// from an exchange-infeasible replacement: keeping the old maker orders
+		// would execute the opportunity that the Fast value model just rejected.
+		// Cancel only; do not manufacture a replacement or invoke the ordinary
+		// ten-second retry loop.
 		if len(activeMakerOrders) > 0 {
 			if err := s.gracefulCancelMakerOrders(
 				ctx, "Fast fee-value rejection", activeMakerOrders...); err != nil {

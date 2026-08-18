@@ -142,6 +142,10 @@ exchangeStrategies:
         inventoryRiskBudgetJPY: 10
         inventoryRiskBudgetRatio: 0.0025
         inventoryRiskZScore: 1.282
+        # Fast terminal-wealth risk aversion is independent from the optional
+        # Macro inventory controller.  Changing Macro risk does not retune
+        # Fast quantity, target switching, or IOC decisions.
+        fastRiskAversion: 1.0
         # Center Fast quantity and terminal inventory risk on one same-horizon
         # executable-BBO posterior. Neutral evidence retains the 50% strategic
         # target; supported upside/downside moves the bounded aim toward the

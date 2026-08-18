@@ -19,6 +19,7 @@ type rangeRegimeStudyInput struct {
 	From, To         time.Time
 	Window, Step     time.Duration
 	MaximumWindows   int
+	EconomicPivotBps float64
 }
 
 type rangeRegimePoint struct {
@@ -37,17 +38,73 @@ type rangeRegimeWindow struct {
 	EfficiencyRatio  float64   `json:"efficiencyRatio"`
 	CenterCrossings  int       `json:"centerCrossings"`
 	ReturnReversals  int       `json:"returnReversals"`
+	UpEconomicLegs   int       `json:"upEconomicLegs"`
+	DownEconomicLegs int       `json:"downEconomicLegs"`
+	CompletedCycles  int       `json:"completedEconomicCycles"`
 	OscillationScore float64   `json:"oscillationScore"`
 }
 
 type rangeRegimeReport struct {
-	Symbol         string              `json:"symbol"`
-	From           time.Time           `json:"from"`
-	To             time.Time           `json:"to"`
-	SampleInterval time.Duration       `json:"sampleInterval"`
-	Window         time.Duration       `json:"window"`
-	Step           time.Duration       `json:"step"`
-	Selected       []rangeRegimeWindow `json:"selected"`
+	Symbol           string              `json:"symbol"`
+	From             time.Time           `json:"from"`
+	To               time.Time           `json:"to"`
+	SampleInterval   time.Duration       `json:"sampleInterval"`
+	Window           time.Duration       `json:"window"`
+	Step             time.Duration       `json:"step"`
+	EconomicPivotBps float64             `json:"economicPivotBps"`
+	Selected         []rangeRegimeWindow `json:"selected"`
+}
+
+func economicDirectionalChangeLegs(points []rangeRegimePoint, thresholdBps float64) (up, down int) {
+	if len(points) < 2 || thresholdBps <= 0 {
+		return 0, 0
+	}
+	threshold := thresholdBps / 10_000
+	high, low := math.Log(points[0].Mid), math.Log(points[0].Mid)
+	direction := 0
+	for _, point := range points[1:] {
+		if point.Mid <= 0 {
+			continue
+		}
+		value := math.Log(point.Mid)
+		switch direction {
+		case 1:
+			if value > high {
+				high = value
+			}
+			if high-value >= threshold {
+				down++
+				direction = -1
+				low = value
+			}
+		case -1:
+			if value < low {
+				low = value
+			}
+			if value-low >= threshold {
+				up++
+				direction = 1
+				high = value
+			}
+		default:
+			if value > high {
+				high = value
+			}
+			if value < low {
+				low = value
+			}
+			if value-low >= threshold {
+				up++
+				direction = 1
+				high = value
+			} else if high-value >= threshold {
+				down++
+				direction = -1
+				low = value
+			}
+		}
+	}
+	return up, down
 }
 
 func indexedBookFiles(dataPath, symbol string) ([]string, error) {
@@ -134,7 +191,7 @@ func readIndexedRangePoints(dataPath, symbol string, from, to time.Time, sampleI
 	return points, nil
 }
 
-func measureRangeRegime(points []rangeRegimePoint, from, to time.Time) (rangeRegimeWindow, bool) {
+func measureRangeRegime(points []rangeRegimePoint, from, to time.Time, economicPivotBps float64) (rangeRegimeWindow, bool) {
 	start := sort.Search(len(points), func(i int) bool { return !points[i].At.Before(from) })
 	end := sort.Search(len(points), func(i int) bool { return !points[i].At.Before(to) })
 	if end-start < 3 {
@@ -201,10 +258,15 @@ func measureRangeRegime(points []rangeRegimePoint, from, to time.Time) (rangeReg
 		RangeBps: rangeBps, EfficiencyRatio: efficiency,
 		CenterCrossings: crossings, ReturnReversals: reversals,
 	}
+	window.UpEconomicLegs, window.DownEconomicLegs =
+		economicDirectionalChangeLegs(segment, economicPivotBps)
+	window.CompletedCycles = min(window.UpEconomicLegs, window.DownEconomicLegs)
 	window.OscillationScore = math.Max(0, pathBps-math.Abs(window.NetReturnBps)) *
-		(1 + 0.10*float64(crossings) + 0.05*float64(reversals))
+		(1 + 0.10*float64(crossings) + 0.05*float64(reversals)) *
+		(1 + float64(window.CompletedCycles))
 	valid := math.Abs(window.NetReturnBps) <= 0.25*rangeBps &&
-		pathBps >= 1.5*rangeBps && crossings >= 2 && reversals >= 2
+		pathBps >= 1.5*rangeBps && crossings >= 2 && reversals >= 2 &&
+		window.UpEconomicLegs >= 2 && window.DownEconomicLegs >= 2
 	return window, valid
 }
 
@@ -233,14 +295,14 @@ func selectNonOverlappingRangeWindows(candidates []rangeRegimeWindow, maximum in
 }
 
 func runRangeRegimeStudy(in rangeRegimeStudyInput) {
-	const sampleInterval = 15 * time.Minute
+	const sampleInterval = time.Minute
 	points, err := readIndexedRangePoints(in.DataPath, in.Symbol, in.From, in.To, sampleInterval)
 	if err != nil {
 		fatalf("read indexed range points: %v", err)
 	}
 	var candidates []rangeRegimeWindow
 	for start := in.From.Truncate(in.Step); !start.Add(in.Window).After(in.To); start = start.Add(in.Step) {
-		window, ok := measureRangeRegime(points, start, start.Add(in.Window))
+		window, ok := measureRangeRegime(points, start, start.Add(in.Window), in.EconomicPivotBps)
 		if ok {
 			candidates = append(candidates, window)
 		}
@@ -248,7 +310,8 @@ func runRangeRegimeStudy(in rangeRegimeStudyInput) {
 	report := rangeRegimeReport{
 		Symbol: in.Symbol, From: in.From, To: in.To,
 		SampleInterval: sampleInterval, Window: in.Window, Step: in.Step,
-		Selected: selectNonOverlappingRangeWindows(candidates, in.MaximumWindows),
+		EconomicPivotBps: in.EconomicPivotBps,
+		Selected:         selectNonOverlappingRangeWindows(candidates, in.MaximumWindows),
 	}
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")

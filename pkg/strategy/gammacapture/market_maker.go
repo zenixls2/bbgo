@@ -22,6 +22,48 @@ type JointDistanceQuantityConfig struct {
 	Enabled        bool `json:"enabled" yaml:"enabled"`
 	ShadowOnly     bool `json:"shadowOnly" yaml:"shadowOnly"`
 	CandidateCount int  `json:"candidateCount" yaml:"candidateCount"`
+	// PreserveTwoSidedQuotes requests an executable minimum bid and ask when the
+	// terminal-path optimizer rejects the ordinary pair. It is only a conditional
+	// continuity floor, not a guarantee or a positive-PnL override: the BBO
+	// crossing edge, balances, hard inventory headroom, and exchange minimums
+	// must still pass. The corrective side may be larger than one venue cell only
+	// through the cost-adjusted target-restoring Bellman quantity.
+	PreserveTwoSidedQuotes bool `json:"preserveTwoSidedQuotes" yaml:"preserveTwoSidedQuotes"`
+	// TwoStageContinuation values the option created by a first maker fill.
+	// The opening order must still touch within the selected Fast horizon H;
+	// only the opposite completion order receives a fresh H after that touch.
+	// Completed empirical BBO paths, rather than a Poisson arrival model, price
+	// this continuation. The switch is explicit so research replay can compare
+	// the old and new estimands on identical market data.
+	TwoStageContinuation bool `json:"twoStageContinuation" yaml:"twoStageContinuation"`
+	// CrossHorizonContinuation separates entry timing from cycle completion.
+	// The opening quote must still touch inside its selected Fast horizon, while
+	// an unmatched fill may use the longest configured Fast horizon to complete
+	// the opposite leg. This is derived from the live model's own horizon set,
+	// rather than introducing a symbol-fitted holding period.
+	CrossHorizonContinuation bool `json:"crossHorizonContinuation" yaml:"crossHorizonContinuation"`
+	// RobustAdmission requires both a complementary cycle and each standalone
+	// fallback to survive the configured posterior lower confidence bound. It
+	// prevents a low-confidence point estimate from authorizing a leg whose
+	// modeled completion may fail on the realized path.
+	RobustAdmission bool `json:"robustAdmission" yaml:"robustAdmission"`
+	// PathUtilityHorizonSelection makes the Fast window selector maximize the
+	// best inventory-aware action in {NO_ORDER, BUY, SELL, BOTH} under the same
+	// confidence-adjusted terminal-wealth objective used by final price and
+	// quantity selection. This removes both the two-objective mismatch and the
+	// previous BUY-only horizon option asymmetry.
+	PathUtilityHorizonSelection bool `json:"pathUtilityHorizonSelection" yaml:"pathUtilityHorizonSelection"`
+	// JointHorizonSelection makes the final optimizer choose the statistical
+	// horizon together with executable distance and quantity.  Each feasible
+	// action is compared on posterior terminal-wealth utility per unit time;
+	// sparse horizons are continuously shrunk toward the zero-utility no-order
+	// action instead of being admitted or rejected by a health label.
+	JointHorizonSelection bool `json:"jointHorizonSelection" yaml:"jointHorizonSelection"`
+	// PairedDistanceImprovement prevents an outward ladder level from winning
+	// only because it was the largest of many noisy point estimates. The level
+	// must improve balanced Fast-cycle payoff over the ordinary quote on the
+	// same completed paths, under a simultaneous confidence bound.
+	PairedDistanceImprovement bool `json:"pairedDistanceImprovement" yaml:"pairedDistanceImprovement"`
 }
 
 // PostFillUtilityConfig controls causal opposite-side repricing immediately
@@ -65,12 +107,23 @@ type MarketMakerConfig struct {
 	// InventoryRiskBudgetRatio scales the adverse-move risk budget with the
 	// current quote-equivalent equity of the symbol. InventoryRiskBudgetJPY
 	// remains the absolute floor for small accounts or unavailable balances.
-	InventoryRiskBudgetRatio float64         `json:"inventoryRiskBudgetRatio" yaml:"inventoryRiskBudgetRatio"`
-	InventoryRiskZScore      float64         `json:"inventoryRiskZScore" yaml:"inventoryRiskZScore"`
-	PosteriorInventoryTarget bool            `json:"posteriorInventoryTarget" yaml:"posteriorInventoryTarget"`
-	FastDrift                FastDriftConfig `json:"fastDrift" yaml:"fastDrift"`
-	BOCPD45                  BOCPD45Config   `json:"bocpd45" yaml:"bocpd45"`
-	InventoryTargetRatio     float64         `json:"inventoryTargetRatio" yaml:"inventoryTargetRatio"`
+	InventoryRiskBudgetRatio float64 `json:"inventoryRiskBudgetRatio" yaml:"inventoryRiskBudgetRatio"`
+	InventoryRiskZScore      float64 `json:"inventoryRiskZScore" yaml:"inventoryRiskZScore"`
+	PosteriorInventoryTarget bool    `json:"posteriorInventoryTarget" yaml:"posteriorInventoryTarget"`
+	// DynamicInventoryAim is the single target/speed controller.  It may
+	// influence the Fast inventory target only; price, arrival, and order
+	// lifecycle gates remain owned by their existing models.
+	DynamicInventoryAim       DynamicInventoryAimConfig       `json:"dynamicInventoryAim" yaml:"dynamicInventoryAim"`
+	FastTargetExecution       FastTargetExecutionConfig       `json:"fastTargetExecution" yaml:"fastTargetExecution"`
+	FastTargetSwitching       FastTargetSwitchingConfig       `json:"fastTargetSwitching" yaml:"fastTargetSwitching"`
+	FastDrift                 FastDriftConfig                 `json:"fastDrift" yaml:"fastDrift"`
+	AsymmetricOscillationRisk AsymmetricOscillationRiskConfig `json:"asymmetricOscillationRisk" yaml:"asymmetricOscillationRisk"`
+	BOCPD45                   BOCPD45Config                   `json:"bocpd45" yaml:"bocpd45"`
+	// VolumeProfile is used only as a causal conditioning feature of the
+	// unified Fast terminal-payoff model. It is intentionally not an
+	// independent quote, quantity, or hard-gate controller.
+	VolumeProfile        VolumeProfileConfig `json:"volumeProfile" yaml:"volumeProfile"`
+	InventoryTargetRatio float64             `json:"inventoryTargetRatio" yaml:"inventoryTargetRatio"`
 	// InventoryCapitalMinRatio, InventoryCapitalTargetRatio, and
 	// InventoryCapitalMaxRatio express a target-centered inventory band as
 	// fractions of pair equity. The legacy InventoryTargetRatio remains the
@@ -83,8 +136,12 @@ type MarketMakerConfig struct {
 	JointDistanceQuantity       JointDistanceQuantityConfig       `json:"jointDistanceQuantity" yaml:"jointDistanceQuantity"`
 	ConditionalExecution        ConditionalExecutionConfig        `json:"conditionalExecution" yaml:"conditionalExecution"`
 	PostFillUtility             PostFillUtilityConfig             `json:"postFillUtility" yaml:"postFillUtility"`
-	InventorySkewBps            float64                           `json:"inventorySkewBps" yaml:"inventorySkewBps"`
-	QuoteNotional               float64                           `json:"quoteNotionalJPY" yaml:"quoteNotionalJPY"`
+	// QuoteLifecycleAction is a Bellman KEEP/REPLACE/CANCEL review at the
+	// modeled window boundary. It is disabled by default until a paired-cycle
+	// replay has sufficient action diversity and confidence.
+	QuoteLifecycleAction QuoteLifecycleActionConfig `json:"quoteLifecycleAction" yaml:"quoteLifecycleAction"`
+	InventorySkewBps     float64                    `json:"inventorySkewBps" yaml:"inventorySkewBps"`
+	QuoteNotional        float64                    `json:"quoteNotionalJPY" yaml:"quoteNotionalJPY"`
 	// MinimumQuoteNotional and MaximumQuoteNotional are retained for backwards
 	// compatible config decoding. They are no longer policy bounds: quote size
 	// is determined by the observed volatility, fill load, risk budget, and
@@ -322,11 +379,12 @@ func (c *MarketMakerConfig) setDefaults() {
 		c.HorizonLookback = types.Duration(6 * time.Hour)
 	}
 	if c.HorizonUpdateInterval <= 0 {
-		c.HorizonUpdateInterval = types.Duration(time.Minute)
+		c.HorizonUpdateInterval = types.Duration(5 * time.Minute)
 	}
 	if c.HorizonMinSamples <= 0 {
 		c.HorizonMinSamples = 6
 	}
+	c.DynamicInventoryAim.setDefaults(c.HorizonMinSamples)
 	if c.PostFillUtility.MinimumSamples <= 0 {
 		c.PostFillUtility.MinimumSamples = c.HorizonMinSamples
 	}
@@ -545,11 +603,25 @@ func (c MarketMakerConfig) SideQuoteDistanceBias(buyFillRate, sellFillRate float
 const marketMakerHorizonGapThreshold = 2 * time.Minute
 
 type MarketMakerHorizonPoint struct {
-	At        time.Time
-	Bid       float64
-	Ask       float64
-	Mid       float64
-	GapBefore bool
+	At               time.Time
+	Bid              float64
+	Ask              float64
+	Mid              float64
+	BBOWeightedPrice float64
+	BookImbalance    float64
+	BookDepthReady   bool
+	GapBefore        bool
+	volumeProfiles   [maxVolumeProfileSnapshots]volumeProfileSnapshot
+	volumeProfileN   uint8
+}
+
+func (p MarketMakerHorizonPoint) volumeProfileState(horizon time.Duration) VolumeProfileState {
+	for index := 0; index < int(p.volumeProfileN) && index < len(p.volumeProfiles); index++ {
+		if p.volumeProfiles[index].Horizon == horizon {
+			return p.volumeProfiles[index].State
+		}
+	}
+	return VolumeProfileState{}
 }
 
 func (p MarketMakerHorizonPoint) bidPrice() float64 {
@@ -574,6 +646,34 @@ func (p MarketMakerHorizonPoint) midPrice() float64 {
 		return (p.Bid + p.Ask) / 2
 	}
 	return 0
+}
+
+func (p MarketMakerHorizonPoint) bboWeightedPrice() float64 {
+	if p.BBOWeightedPrice > 0 {
+		return p.BBOWeightedPrice
+	}
+	return p.midPrice()
+}
+
+// bboDepthWeightedPrice is the top-of-book microprice. Opposite-side depth
+// weights each executable price: more bid depth moves the estimate toward the
+// ask and more ask depth moves it toward the bid. Equal or unavailable depth
+// falls back to the ordinary BBO midpoint for legacy/trade-only callers.
+func bboDepthWeightedPrice(bid, bidSize, ask, askSize float64) float64 {
+	if bid <= 0 || ask < bid {
+		return 0
+	}
+	if bidSize > 0 && askSize > 0 && bidSize+askSize > 0 {
+		return (ask*bidSize + bid*askSize) / (bidSize + askSize)
+	}
+	return (bid + ask) / 2
+}
+
+func bboDepthImbalance(bidSize, askSize float64) (float64, bool) {
+	if bidSize <= 0 || askSize <= 0 || bidSize+askSize <= 0 {
+		return 0, false
+	}
+	return clampBookImbalance((bidSize - askSize) / (bidSize + askSize)), true
 }
 
 // MarketMakerSideVolatilityEstimate reports executable-price volatility in
@@ -633,8 +733,16 @@ type MarketMakerHorizonDecision struct {
 	SelectionScoreBpsPerHour          float64
 	MarginalBuyEvaluated              bool
 	MarginalBuyNotionalJPY            float64
+	MarginalBuyTargetNotionalJPY      float64
+	MarginalBuyTargetUpProbability    float64
 	MarginalBuyCertaintyEquivalentJPY float64
 	MarginalBuyUtilityBpsPerHour      float64
+	PathUtilityEvaluated              bool
+	PathUtilityAction                 FastHorizonAction
+	PathUtilityBuyNotionalJPY         float64
+	PathUtilitySellNotionalJPY        float64
+	PathUtilityCertaintyEquivalentJPY float64
+	PathUtilityBpsPerHour             float64
 	DistanceOptimized                 bool
 	UpdatedAt                         time.Time
 	Reason                            string
@@ -648,11 +756,33 @@ type MarketMakerHorizonDecision struct {
 type FastHorizonMarginalBuyInput struct {
 	CurrentInventoryNotionalJPY float64
 	TargetInventoryNotionalJPY  float64
+	HardMinInventoryNotionalJPY float64
+	HardMaxInventoryNotionalJPY float64
+	PosteriorInventoryTarget    bool
 	PairEquityJPY               float64
 	MarginalBuyNotionalJPY      float64
 	AvailableBuyCapitalJPY      float64
+	MarginalSellNotionalJPY     float64
+	AvailableSellInventoryJPY   float64
 	RiskAversion                float64
 	ConfidenceZScore            float64
+}
+
+func scoreFastHorizonWithPathUtility(
+	decision MarketMakerHorizonDecision,
+	stats JointPathPayoffStats,
+	in FastHorizonMarginalBuyInput,
+) MarketMakerHorizonDecision {
+	value := evaluateSymmetricFastHorizonAction(decision, stats, in)
+	decision.SelectionScoreBpsPerHour = value.ScoreBpsPerHour
+	decision.PathUtilityEvaluated = value.Evaluated
+	decision.PathUtilityAction = value.Action
+	decision.PathUtilityBuyNotionalJPY = value.BuyNotionalJPY
+	decision.PathUtilitySellNotionalJPY = value.SellNotionalJPY
+	decision.PathUtilityCertaintyEquivalentJPY = value.CertaintyEquivalentJPY
+	decision.PathUtilityBpsPerHour = value.ScoreBpsPerHour
+	decision.MarginalBuyTargetNotionalJPY = value.TargetInventoryNotionalJPY
+	return decision
 }
 
 func scoreFastHorizonWithMarginalBuy(
@@ -661,7 +791,20 @@ func scoreFastHorizonWithMarginalBuy(
 	in FastHorizonMarginalBuyInput,
 ) MarketMakerHorizonDecision {
 	decision.SelectionScoreBpsPerHour = decision.ScoreBpsPerHour
-	deficit := in.TargetInventoryNotionalJPY - in.CurrentInventoryNotionalJPY
+	target := in.TargetInventoryNotionalJPY
+	if in.PosteriorInventoryTarget {
+		posterior := PosteriorInventoryRiskTarget(
+			in.TargetInventoryNotionalJPY,
+			in.HardMinInventoryNotionalJPY,
+			in.HardMaxInventoryNotionalJPY,
+			stats)
+		if posterior.Enabled {
+			target = posterior.TargetBase
+			decision.MarginalBuyTargetUpProbability = posterior.UpProbability
+		}
+	}
+	decision.MarginalBuyTargetNotionalJPY = target
+	deficit := target - in.CurrentInventoryNotionalJPY
 	unit := in.MarginalBuyNotionalJPY
 	if decision.Horizon <= 0 || in.PairEquityJPY <= 0 || unit <= 0 ||
 		deficit+1e-9 < unit || in.AvailableBuyCapitalJPY+1e-9 < unit ||
@@ -672,8 +815,9 @@ func scoreFastHorizonWithMarginalBuy(
 	if z <= 0 {
 		z = 1.645
 	}
-	payoff := stats.EvaluateWholePosition(
-		in.CurrentInventoryNotionalJPY, unit, 0,
+	payoff := stats.EvaluateTargetRelativePosition(
+		in.CurrentInventoryNotionalJPY, target,
+		unit, 0,
 		in.PairEquityJPY, in.RiskAversion, z)
 	hours := decision.Horizon.Hours()
 	if hours <= 0 {
@@ -733,14 +877,36 @@ func (d MarketMakerHorizonDecision) SellTouchRatePerHour() float64 {
 // reference for the next trading window; callers must not cancel an existing
 // quote merely because this decision changed.
 type MarketMakerHorizonModel struct {
-	points                 []MarketMakerHorizonPoint
-	lastSecond             time.Time
-	lastTrimSecond         time.Time
-	lastUpdate             time.Time
-	decision               MarketMakerHorizonDecision
-	sideHARVarianceRisk    map[time.Duration]*OnlineSideHARVarianceRisk
-	crossingExposureCaches map[time.Duration]*marketMakerHorizonExposureCache
-	fastDrift              map[time.Duration]*fastDriftRegression
+	points                   []MarketMakerHorizonPoint
+	lastSecond               time.Time
+	lastTrimSecond           time.Time
+	lastUpdate               time.Time
+	decision                 MarketMakerHorizonDecision
+	sideHARVarianceRisk      map[time.Duration]*OnlineSideHARVarianceRisk
+	crossingExposureCaches   map[time.Duration]*marketMakerHorizonExposureCache
+	bboRangeIndex            *marketMakerBBORangeIndex
+	fastDrift                map[time.Duration]*fastDriftRegression
+	fastDriftBBOStateTags    map[time.Duration]fastDriftBBOStateTagCache
+	asymmetricRiskFeatures   map[time.Duration]asymmetricOscillationRiskFeatureCache
+	volumeProfiles           map[time.Duration]*RollingVolumeProfile
+	volumeProfileWindows     []time.Duration
+	volumeProfileConfig      VolumeProfileConfig
+	downsideEProcess         *DrawdownEProcess
+	downsideDecision         DrawdownEProcessDecision
+	downsidePublished        DrawdownEProcessDecision
+	downsidePublishedAt      time.Time
+	downsidePublishedHorizon time.Duration
+	upsideEProcess           *DrawdownEProcess
+	upsideDecision           DrawdownEProcessDecision
+	upsidePublished          DrawdownEProcessDecision
+	upsidePublishedAt        time.Time
+	upsidePublishedHorizon   time.Duration
+}
+
+type asymmetricOscillationRiskFeatureCache struct {
+	Bucket   time.Time
+	Features AsymmetricOscillationRiskFeatures
+	Valid    bool
 }
 
 // EmpiricalSideVolatilityEstimate returns executable-price realized
@@ -840,12 +1006,21 @@ func (m *MarketMakerHorizonModel) Observe(at time.Time, mid float64, c MarketMak
 // path; Observe remains only for trade-only archives that do not contain a
 // spread and therefore cannot identify side-specific execution prices.
 func (m *MarketMakerHorizonModel) ObserveBook(at time.Time, bid, ask float64, c MarketMakerConfig) {
+	m.ObserveBookWithSizes(at, bid, 0, ask, 0, c)
+}
+
+// ObserveBookWithSizes records prices and visible top-of-book depth so future
+// horizon averages can use the BBO-weighted price rather than an event-counted
+// midpoint. The observation remains one point per second.
+func (m *MarketMakerHorizonModel) ObserveBookWithSizes(
+	at time.Time, bid, bidSize, ask, askSize float64, c MarketMakerConfig,
+) {
 	// Binance book-ticker is change-driven: a short silence means the last BBO
 	// remained valid, not that the price path is unknown. Reserve gap markers
 	// for connection-scale outages; aggregate-trade warmup keeps its stricter
 	// explicit five-second capture-gap rule.
 	gapBefore := !m.lastSecond.IsZero() && at.Truncate(time.Second).Sub(m.lastSecond) >= marketMakerHorizonGapThreshold
-	m.ObserveBookWithGap(at, bid, ask, c, gapBefore)
+	m.ObserveBookWithSizesAndGap(at, bid, bidSize, ask, askSize, c, gapBefore)
 }
 
 // ObserveWithGap appends a trade-derived synthetic BBO and is retained for
@@ -859,8 +1034,22 @@ func (m *MarketMakerHorizonModel) ObserveWithGap(at time.Time, mid float64, c Ma
 // must not treat an outage as a continuous path; the marker is also respected
 // by the realized-volatility estimator.
 func (m *MarketMakerHorizonModel) ObserveBookWithGap(at time.Time, bid, ask float64, c MarketMakerConfig, gapBefore bool) {
+	m.ObserveBookWithSizesAndGap(at, bid, 0, ask, 0, c, gapBefore)
+}
+
+// ObserveBookWithSizesAndGap is the authoritative executable-BBO observation
+// path. It retains the depth-weighted BBO price used by completed-window target
+// estimation while bid and ask remain separate for execution payoffs.
+func (m *MarketMakerHorizonModel) ObserveBookWithSizesAndGap(
+	at time.Time, bid, bidSize, ask, askSize float64,
+	c MarketMakerConfig, gapBefore bool,
+) {
 	if at.IsZero() || bid <= 0 || ask <= 0 || ask < bid {
 		return
+	}
+	if gapBefore {
+		m.fastDriftBBOStateTags = nil
+		m.asymmetricRiskFeatures = nil
 	}
 	// Normal live/replay configs are normalized before the stream starts.
 	// Retain zero-value compatibility for unit tests and legacy callers, but
@@ -868,17 +1057,36 @@ func (m *MarketMakerHorizonModel) ObserveBookWithGap(at time.Time, bid, ask floa
 	if c.HorizonLookback <= 0 || c.MaxTradingWindow <= 0 {
 		c.setDefaults()
 	}
+	m.configureVolumeProfiles(c)
+	if gapBefore {
+		m.resetVolumeProfiles()
+	}
+	m.observeExecutableDownside(at, bid, ask, c, gapBefore)
 	m.observeSideHARVarianceRisk(at, bid, ask, c, gapBefore)
 	mid := (bid + ask) / 2
+	weightedPrice := bboDepthWeightedPrice(bid, bidSize, ask, askSize)
+	imbalance, depthReady := bboDepthImbalance(bidSize, askSize)
 	second := at.Truncate(time.Second)
+	volumeProfiles, volumeProfileN := m.volumeProfileSnapshots(weightedPrice)
 	if !m.lastSecond.IsZero() && second.Equal(m.lastSecond) {
 		if n := len(m.points); n > 0 {
-			m.points[n-1] = MarketMakerHorizonPoint{At: second, Bid: bid, Ask: ask, Mid: mid, GapBefore: m.points[n-1].GapBefore || gapBefore}
+			m.points[n-1] = MarketMakerHorizonPoint{
+				At: second, Bid: bid, Ask: ask, Mid: mid,
+				BBOWeightedPrice: weightedPrice,
+				BookImbalance:    imbalance, BookDepthReady: depthReady,
+				GapBefore:      m.points[n-1].GapBefore || gapBefore,
+				volumeProfiles: volumeProfiles, volumeProfileN: volumeProfileN,
+			}
 		}
 		return
 	}
 	m.lastSecond = second
-	m.points = append(m.points, MarketMakerHorizonPoint{At: second, Bid: bid, Ask: ask, Mid: mid, GapBefore: gapBefore})
+	m.points = append(m.points, MarketMakerHorizonPoint{
+		At: second, Bid: bid, Ask: ask, Mid: mid,
+		BBOWeightedPrice: weightedPrice,
+		BookImbalance:    imbalance, BookDepthReady: depthReady,
+		GapBefore: gapBefore, volumeProfiles: volumeProfiles, volumeProfileN: volumeProfileN,
+	})
 	cutoff := second.Add(-time.Duration(c.HorizonLookback) - time.Duration(c.MaxTradingWindow) - time.Minute)
 	first := sort.Search(len(m.points), func(i int) bool { return !m.points[i].At.Before(cutoff) })
 	// Retain a bounded history, but do not copy the entire horizon slice on
@@ -888,6 +1096,111 @@ func (m *MarketMakerHorizonModel) ObserveBookWithGap(at time.Time, bid, ask floa
 	if first > 0 && (first >= 1024 || m.lastTrimSecond.IsZero() || second.Sub(m.lastTrimSecond) >= time.Minute) {
 		m.points = append([]MarketMakerHorizonPoint(nil), m.points[first:]...)
 		m.lastTrimSecond = second
+	}
+}
+
+func (m *MarketMakerHorizonModel) observeExecutableDownside(
+	at time.Time, bid, ask float64, c MarketMakerConfig, gapBefore bool,
+) {
+	if m == nil {
+		return
+	}
+	if m.downsideEProcess == nil {
+		m.downsideEProcess = NewDrawdownEProcess(DrawdownEProcessConfig{
+			Windows: c.FastModelWindows(), ConfidenceZ: c.InventoryRiskZScore,
+		})
+	}
+	if m.upsideEProcess == nil {
+		m.upsideEProcess = NewDrawdownEProcess(DrawdownEProcessConfig{
+			Windows: c.FastModelWindows(), ConfidenceZ: c.InventoryRiskZScore,
+		})
+	}
+	if gapBefore {
+		m.downsideEProcess.Reset()
+		m.upsideEProcess.Reset()
+	}
+	next := m.downsideEProcess.ObserveMinute(at, bid, ask)
+	if next.Reason != "same-minute executable update retained" {
+		m.downsideDecision = next
+	}
+	// Reciprocal executable prices preserve ordering (1/ask < 1/bid) and
+	// transform an ask-side rise into a drawdown.  This reuses the identical
+	// QV/jump/multiscale test while keeping BUY volatility on executable asks.
+	upside := m.upsideEProcess.ObserveMinute(at, 1/ask, 1/bid)
+	if upside.Reason != "same-minute executable update retained" {
+		m.upsideDecision = upside
+	}
+}
+
+// ExecutableDownsideDecision returns the latest time-uniform bid/ask agreement
+// state and a SELL-side forecast expressed on the selected Fast horizon.
+func (m *MarketMakerHorizonModel) ExecutableDownsideDecision(horizon time.Duration) DrawdownEProcessDecision {
+	if m == nil {
+		return DrawdownEProcessDecision{Reason: "executable downside model unavailable"}
+	}
+	d := m.downsidePublished
+	// The e-process state is published only on the fixed model clock. Its
+	// forecast is linear in future quadratic variation and therefore in the
+	// requested horizon, so rescaling the frozen forecast is exact and does not
+	// leak intra-bucket observations into the executable decision.
+	if d.Active && horizon > 0 && m.downsidePublishedHorizon > 0 {
+		d.BidForecastBps *= float64(horizon) / float64(m.downsidePublishedHorizon)
+	}
+	return d
+}
+
+// ExecutableUpsideDecision returns the fixed-clock BUY opportunity snapshot.
+// It is produced from reciprocal BBO, so BidForecastBps represents the
+// same-horizon rise of the original executable ask.
+func (m *MarketMakerHorizonModel) ExecutableUpsideDecision(horizon time.Duration) DrawdownEProcessDecision {
+	if m == nil {
+		return DrawdownEProcessDecision{Reason: "executable upside model unavailable"}
+	}
+	u := m.upsidePublished
+	if u.Active && horizon > 0 && m.upsidePublishedHorizon > 0 {
+		u.BidForecastBps *= float64(horizon) / float64(m.upsidePublishedHorizon)
+	}
+	return u
+}
+
+func (m *MarketMakerHorizonModel) publishExecutableDownside(at time.Time, horizon time.Duration) {
+	if m == nil {
+		return
+	}
+	d := m.downsideDecision
+	if m.downsideEProcess != nil && d.Active {
+		d.BidForecastBps = m.downsideEProcess.DownsideForecastBps(horizon)
+	}
+	m.downsidePublished = d
+	m.downsidePublishedAt = at
+	m.downsidePublishedHorizon = horizon
+	u := m.upsideDecision
+	if m.upsideEProcess != nil && u.Active {
+		u.BidForecastBps = m.upsideEProcess.DownsideForecastBps(horizon)
+	}
+	m.upsidePublished = u
+	m.upsidePublishedAt = at
+	m.upsidePublishedHorizon = horizon
+}
+
+// rebuildExecutableDownside restores sequential downside state from the
+// bounded checkpoint BBO history.  It does not require an offline artifact.
+func (m *MarketMakerHorizonModel) rebuildExecutableDownside(c MarketMakerConfig) {
+	if m == nil {
+		return
+	}
+	m.downsideEProcess = nil
+	m.downsideDecision = DrawdownEProcessDecision{}
+	m.downsidePublished = DrawdownEProcessDecision{}
+	m.downsidePublishedAt = time.Time{}
+	m.downsidePublishedHorizon = 0
+	m.upsideEProcess = nil
+	m.upsideDecision = DrawdownEProcessDecision{}
+	m.upsidePublished = DrawdownEProcessDecision{}
+	m.upsidePublishedAt = time.Time{}
+	m.upsidePublishedHorizon = 0
+	for _, point := range m.points {
+		m.observeExecutableDownside(point.At, point.bidPrice(), point.askPrice(), c, point.GapBefore)
 	}
 }
 
@@ -1527,10 +1840,11 @@ func (m *MarketMakerHorizonModel) UpdateForBook(
 	volatilityBpsPerSqrtSec, bestBid, bestAsk float64,
 ) MarketMakerHorizonDecision {
 	c.setDefaults()
-	if !m.lastUpdate.IsZero() && now.Sub(m.lastUpdate) < time.Duration(c.HorizonUpdateInterval) && m.decision.Horizon > 0 {
+	updateBucket := now.UTC().Truncate(time.Duration(c.HorizonUpdateInterval))
+	if m.lastUpdate.Equal(updateBucket) && m.decision.Horizon > 0 {
 		return m.decision
 	}
-	m.lastUpdate = now
+	m.lastUpdate = updateBucket
 	best := MarketMakerHorizonDecision{Reason: "insufficient completed horizon samples", UpdatedAt: now}
 	for _, horizon := range c.TradingHorizons() {
 		decision := m.DecisionForHorizon(now, c, volatilityBpsPerSqrtSec, bestBid, bestAsk, horizon)
@@ -1546,6 +1860,7 @@ func (m *MarketMakerHorizonModel) UpdateForBook(
 		best = m.CrossingDecisionAtSideDistances(now, c, horizon, buyDistance, sellDistance, grossEdge)
 	}
 	m.decision = best
+	m.publishExecutableDownside(updateBucket, best.Horizon)
 	return best
 }
 
@@ -1584,10 +1899,11 @@ func (m *MarketMakerHorizonModel) updateForBookAdaptiveVolatility(
 	marginalBuy *FastHorizonMarginalBuyInput,
 ) MarketMakerHorizonDecision {
 	c.setDefaults()
-	if !m.lastUpdate.IsZero() && now.Sub(m.lastUpdate) < time.Duration(c.HorizonUpdateInterval) && m.decision.Horizon > 0 {
+	updateBucket := now.UTC().Truncate(time.Duration(c.HorizonUpdateInterval))
+	if m.lastUpdate.Equal(updateBucket) && m.decision.Horizon > 0 {
 		return m.decision
 	}
-	m.lastUpdate = now
+	m.lastUpdate = updateBucket
 	prior := m.EmpiricalSideVolatilityEstimate(now, time.Duration(c.HorizonLookback))
 	volatilityFor := func(horizon time.Duration) float64 {
 		live := m.EmpiricalSideVolatilityEstimate(now, horizon)
@@ -1606,7 +1922,11 @@ func (m *MarketMakerHorizonModel) updateForBookAdaptiveVolatility(
 			stats := m.JointPathPayoffStatistics(
 				now, c, horizon,
 				decision.BuyTouchDistanceBps, decision.SellTouchDistanceBps)
-			decision = scoreFastHorizonWithMarginalBuy(decision, stats, *marginalBuy)
+			if c.JointDistanceQuantity.PathUtilityHorizonSelection {
+				decision = scoreFastHorizonWithPathUtility(decision, stats, *marginalBuy)
+			} else {
+				decision = scoreFastHorizonWithMarginalBuy(decision, stats, *marginalBuy)
+			}
 		}
 		if decision.HasSufficientCrossings(c.HorizonMinSamples) &&
 			(best.Horizon == 0 || decision.SelectionScoreBpsPerHour > best.SelectionScoreBpsPerHour) {
@@ -1625,17 +1945,21 @@ func (m *MarketMakerHorizonModel) updateForBookAdaptiveVolatility(
 		if marginalBuy != nil && best.HasSufficientCrossings(c.HorizonMinSamples) {
 			stats := m.JointPathPayoffStatistics(
 				now, c, horizon, best.BuyTouchDistanceBps, best.SellTouchDistanceBps)
-			best = scoreFastHorizonWithMarginalBuy(best, stats, *marginalBuy)
+			if c.JointDistanceQuantity.PathUtilityHorizonSelection {
+				best = scoreFastHorizonWithPathUtility(best, stats, *marginalBuy)
+			} else {
+				best = scoreFastHorizonWithMarginalBuy(best, stats, *marginalBuy)
+			}
 		}
 	}
 	m.decision = best
+	m.publishExecutableDownside(updateBucket, best.Horizon)
 	return best
 }
 
 // DecisionForHorizon selects the statistically best executable distance for a
-// fixed resting horizon. This is also used after the first-passage lifetime is
-// rounded to another horizon, so the dynamic keep-time calculation cannot
-// silently replace the optimized distance with the old volatility-only quote.
+// fixed resting horizon. Quote lifetime remains that exact reference horizon;
+// the first-passage characteristic time is diagnostic only.
 func (m *MarketMakerHorizonModel) DecisionForHorizon(
 	now time.Time,
 	c MarketMakerConfig,
@@ -1660,9 +1984,11 @@ func meanDuration(values []time.Duration) time.Duration {
 }
 
 // RefreshIntervals estimates a quote's first-passage time from the observed
-// volatility. The lower bound prevents cancel churn; the upper bound keeps a
-// stale quote from resting indefinitely. Volatility is expressed in bps per
-// square-root second, matching GammaCaptureVolatility*10_000.
+// volatility. The lower bound prevents ordinary cancel churn; the upper bound
+// keeps a stale quote from resting indefinitely. A separate configured
+// transport floor is used only by confidence-supported one-sided target
+// realignment. Volatility is expressed in bps per square-root second, matching
+// GammaCaptureVolatility*10_000.
 func (c MarketMakerConfig) RefreshIntervals(halfSpreadBps, volatilityBpsPerSqrtSec float64) (time.Duration, time.Duration) {
 	c.setDefaults()
 	minRefresh := time.Duration(c.MinRefreshInterval)
@@ -1672,8 +1998,8 @@ func (c MarketMakerConfig) RefreshIntervals(halfSpreadBps, volatilityBpsPerSqrtS
 	}
 	if halfSpreadBps > 0 && volatilityBpsPerSqrtSec > 0 {
 		expectedSeconds := math.Pow(halfSpreadBps/volatilityBpsPerSqrtSec, 2)
-		// Reprice no more often than roughly one quarter of the expected
-		// crossing time, and force a refresh no later than that time.
+		// Reprice ordinary quotes no more often than roughly one quarter of the
+		// expected crossing time, and force a refresh no later than that time.
 		adaptiveMin := time.Duration(expectedSeconds * 0.25 * float64(time.Second))
 		adaptiveMax := time.Duration(expectedSeconds * float64(time.Second))
 		if adaptiveMin > minRefresh {
@@ -1723,12 +2049,10 @@ func (c MarketMakerConfig) OrderKeepDistanceBps(selectedDistanceBps float64) flo
 	return c.MinimumHalfSpreadBps
 }
 
-// DynamicOrderKeepDecision uses the previous symmetric first-passage formula
-// E[tau_{+/-d}] = (d/sigma)^2, then rounds upward to the first configured
-// trading horizon that is at least both that characteristic time and the
-// statistically selected horizon. Rounding upward (rather than to nearest)
-// gives a resting order enough time to realize the crossing model. The
-// configured maximum trading window remains the hard exposure cap.
+// DynamicOrderKeepDecision gives an order exactly the horizon whose empirical
+// crossing probability priced it.  The characteristic first-passage time is
+// retained only as a diagnostic: changing a 10-minute Bernoulli experiment
+// into a 15/30-minute lease would mix different probability models.
 func (c MarketMakerConfig) DynamicOrderKeepDecision(selectedHorizon time.Duration, quoteDistanceBps, volatilityBpsPerSqrtSec float64) MarketMakerOrderKeepDecision {
 	c.setDefaults()
 	if selectedHorizon <= 0 {
@@ -1739,28 +2063,12 @@ func (c MarketMakerConfig) DynamicOrderKeepDecision(selectedHorizon time.Duratio
 		QuoteDistanceBps: quoteDistanceBps, VolatilityBpsPerSqrtSec: volatilityBpsPerSqrtSec,
 		Reason: "selected statistical horizon",
 	}
-	desired := selectedHorizon
 	if quoteDistanceBps > 0 && volatilityBpsPerSqrtSec > 0 {
 		seconds := math.Pow(quoteDistanceBps/volatilityBpsPerSqrtSec, 2)
 		if !math.IsNaN(seconds) && !math.IsInf(seconds, 0) && seconds > 0 {
 			firstPassage := time.Duration(seconds * float64(time.Second))
 			decision.CharacteristicFirstPassageTime = firstPassage
-			if firstPassage > desired {
-				desired = firstPassage
-				decision.Reason = "first-passage time rounded up to measured horizon"
-			}
 		}
-	}
-	horizons := c.TradingHorizons()
-	decision.Duration = horizons[len(horizons)-1]
-	for _, horizon := range horizons {
-		if horizon >= desired {
-			decision.Duration = horizon
-			break
-		}
-	}
-	if decision.Duration < desired {
-		decision.Reason = "first-passage time exceeds configured exposure cap"
 	}
 	return decision
 }

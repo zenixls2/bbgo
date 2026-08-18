@@ -73,9 +73,16 @@ does not supply useful downside power in this archive.
 
 ## Decision and interaction with HAR/Kalman
 
-The e-process is research-only and is not connected to Macro inventory or live
-orders.  Lowering its threshold after inspecting 2026-08-03 would be target-day
-overfitting.
+The original direction-classifier proposal remains rejected: the threshold is
+not lowered and the e-process does not create an inventory target or gate
+ordinary maker orders. It is now used narrowly as a noise/jump-robust active-
+execution waiting-cost input only after the unchanged time-uniform alarm and
+only when the Fast posterior has already produced the same-side target gap.
+SELL uses executable bid/ask directly. BUY uses reciprocal executable BBO so
+the original ask path remains the forecast side, then additionally requires no
+active downside alarm and positive portfolio certainty equivalent. This
+preserves the negative standalone-classification result without introducing a
+second inventory controller.
 
 HAR and Kalman solve different problems:
 

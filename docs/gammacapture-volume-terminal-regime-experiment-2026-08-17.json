@@ -1,0 +1,57 @@
+{
+  "experiment": "volume-profile-post-fill-terminal-regime-comparison",
+  "symbol": "ETHJPY",
+  "date": "2026-08-17",
+  "causal": true,
+  "nextBBOExecution": true,
+  "queueMultiplier": 0,
+  "fillCoverage": 0.8,
+  "startingEquityJPY": 6808,
+  "startingBase": 0.01024405,
+  "variants": {
+    "control": "current production replay policy",
+    "terminalOnly": "side-specific executable-BBO post-fill terminal target",
+    "volumeProfileTerminal": "terminalOnly plus strictly-prequential calibrated Volume Profile residual"
+  },
+  "results": [
+    {
+      "regime": "decline",
+      "from": "2026-08-03T00:00:00Z",
+      "to": "2026-08-03T08:00:00Z",
+      "control": {"netPnLJPY": -75.8559569787, "holdPnLJPY": -80.0265186000, "fills": 1, "maxDrawdownPct": 1.2546031933},
+      "terminalOnly": {"netPnLJPY": -77.5580602453, "holdPnLJPY": -80.0265186000, "fills": 3, "maxDrawdownPct": 1.2875586458, "targetOverrides": 14210},
+      "volumeProfileTerminal": {"netPnLJPY": -115.3760337302, "holdPnLJPY": -80.0265186000, "fills": 4, "maxDrawdownPct": 1.9696088896, "targetOverrides": 14645}
+    },
+    {
+      "regime": "rise",
+      "from": "2026-08-05T15:00:00Z",
+      "to": "2026-08-05T21:00:00Z",
+      "control": {"netPnLJPY": 68.6162715854, "holdPnLJPY": 68.7375755000, "fills": 1, "maxDrawdownPct": 0.2963327856},
+      "terminalOnly": {"netPnLJPY": 72.2845597854, "holdPnLJPY": 68.7375755000, "fills": 3, "maxDrawdownPct": 0.3191157663, "targetOverrides": 12951},
+      "volumeProfileTerminal": {"netPnLJPY": 91.7495156732, "holdPnLJPY": 68.7375755000, "fills": 4, "maxDrawdownPct": 0.4414065529, "targetOverrides": 11161}
+    },
+    {
+      "regime": "range",
+      "from": "2026-08-08T00:00:00Z",
+      "to": "2026-08-08T12:00:00Z",
+      "control": {"netPnLJPY": 12.0674909000, "holdPnLJPY": 12.0674909000, "fills": 0, "maxDrawdownPct": 0.1212645953},
+      "terminalOnly": {"netPnLJPY": 12.0674909000, "holdPnLJPY": 12.0674909000, "fills": 0, "maxDrawdownPct": 0.1212645953, "targetOverrides": 80},
+      "volumeProfileTerminal": {"netPnLJPY": 12.0674909000, "holdPnLJPY": 12.0674909000, "fills": 0, "maxDrawdownPct": 0.1212645953, "targetOverrides": 80}
+    },
+    {
+      "regime": "mixed",
+      "from": "2026-08-10T00:00:00Z",
+      "to": "2026-08-10T18:00:00Z",
+      "control": {"netPnLJPY": -39.2692554931, "holdPnLJPY": -36.8376038000, "fills": 2, "maxDrawdownPct": 1.3297765340},
+      "terminalOnly": {"netPnLJPY": -39.2692554931, "holdPnLJPY": -36.8376038000, "fills": 2, "maxDrawdownPct": 1.3297765340, "targetOverrides": 2885},
+      "volumeProfileTerminal": {"netPnLJPY": -39.2692554931, "holdPnLJPY": -36.8376038000, "fills": 2, "maxDrawdownPct": 1.3297765340, "targetOverrides": 2885}
+    }
+  ],
+  "aggregate": {
+    "control": {"netPnLJPY": -34.4414499865, "excessVsHoldJPY": 1.6176060135, "fills": 4},
+    "terminalOnly": {"netPnLJPY": -32.4752650530, "excessVsHoldJPY": 3.5837909470, "fills": 8},
+    "volumeProfileTerminal": {"netPnLJPY": -50.8282826501, "excessVsHoldJPY": -14.7692266501, "fills": 10}
+  },
+  "decision": "REJECT_UNSTABLE",
+  "warning": "Canonical regimes were previously inspected and are diagnostic only, not blind promotion evidence."
+}

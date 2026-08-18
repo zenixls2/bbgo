@@ -1,0 +1,103 @@
+{
+  "name": "rejected-alpha-event-clock-reaudit",
+  "symbol": "ETHJPY",
+  "from": "2026-08-03T00:00:00Z",
+  "to": "2026-08-17T00:00:00Z",
+  "decisionClock": "selected Fast horizon expiry or first observable crossing; replacement starts at the next observable BBO",
+  "trainingClock": "causally matured one-minute paths with 1m/H overlap weight where applicable",
+  "independentUnit": "UTC day",
+  "candidateTests": 2,
+  "productionChanged": false,
+  "results": [
+    {
+      "candidate": "direct-four-way-competing-posterior",
+      "horizon": "15m",
+      "eligible": 1852,
+      "days": 14,
+      "equalDayMeanBps": -0.0167212542451371,
+      "equalDayStandardErrorBps": 0.010954898718242385,
+      "simultaneousLowerBps": -0.038192461187176174,
+      "positiveDays": 0,
+      "decision": "REJECT_UNSTABLE"
+    },
+    {
+      "candidate": "direct-four-way-competing-posterior",
+      "horizon": "30m",
+      "eligible": 1370,
+      "days": 14,
+      "equalDayMeanBps": -0.03592323026645195,
+      "equalDayStandardErrorBps": 0.027185826639149303,
+      "simultaneousLowerBps": -0.08920647136913416,
+      "positiveDays": 0,
+      "decision": "REJECT_UNSTABLE"
+    },
+    {
+      "candidate": "one-sided-payoff-pseudocount-shrinkage",
+      "horizon": "15m",
+      "eligible": 850,
+      "days": 14,
+      "equalDayMeanBps": -1.0005743595689567,
+      "equalDayStandardErrorBps": 0.5396090883198909,
+      "simultaneousLowerBps": -2.058188738406436,
+      "positiveDays": 5,
+      "decision": "REJECT_UNSTABLE"
+    },
+    {
+      "candidate": "one-sided-payoff-pseudocount-shrinkage",
+      "horizon": "30m",
+      "eligible": 823,
+      "days": 14,
+      "equalDayMeanBps": -0.4963413214837081,
+      "equalDayStandardErrorBps": 0.5409041072250544,
+      "simultaneousLowerBps": -1.5564938907346064,
+      "positiveDays": 5,
+      "decision": "REJECT_UNSTABLE"
+    },
+    {
+      "candidate": "side-specific-depth-imbalance-payoff",
+      "horizon": "15m",
+      "eligible": 1852,
+      "days": 14,
+      "equalDayMeanBps": -0.00933604807665302,
+      "equalDayStandardErrorBps": 0.007235836065948898,
+      "simultaneousLowerBps": -0.023518026163948852,
+      "positiveDays": 3,
+      "actionDisagreements": 0,
+      "decision": "WITHDRAW_PREVIOUS_COMPONENT_PASS"
+    },
+    {
+      "candidate": "side-specific-depth-imbalance-payoff",
+      "horizon": "30m",
+      "eligible": 1370,
+      "days": 14,
+      "equalDayMeanBps": 0.003493296201425054,
+      "equalDayStandardErrorBps": 0.005380714617142842,
+      "simultaneousLowerBps": -0.007052710659263143,
+      "positiveDays": 9,
+      "actionDisagreements": 0,
+      "decision": "REJECT_UNSTABLE"
+    },
+    {
+      "candidate": "terminal-tail-residual-target-old-contract",
+      "horizon": "15m",
+      "eligible": 149,
+      "days": 14,
+      "equalDayMeanBps": -0.24318552716024855,
+      "equalDayStandardErrorBps": 0.25388691542785957,
+      "simultaneousLowerBps": -0.7407947375448198,
+      "positiveDays": 4,
+      "decision": "REJECT_OLD_CONTRACT"
+    },
+    {
+      "candidate": "terminal-tail-residual-target-old-contract",
+      "horizon": "30m",
+      "eligible": 93,
+      "days": 14,
+      "equalDayMeanBps": -1.1127671226022515,
+      "equalDayStandardErrorBps": 0.5278939651337504,
+      "simultaneousLowerBps": -2.1474202819204455,
+      "positiveDays": 5,
+      "decision": "REJECT_OLD_CONTRACT"
+    }
+  ]
+}

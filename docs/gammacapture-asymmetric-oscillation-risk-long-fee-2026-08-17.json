@@ -1,0 +1,36 @@
+{
+  "name": "ethjpy-asymmetric-oscillation-risk-long-fee-net",
+  "symbol": "ETHJPY",
+  "from": "2026-07-23T13:30:00Z",
+  "to": "2026-08-17T08:30:00Z",
+  "fee_convention": "0.1% entry plus 0.1% exit; exact multiplicative executable cycle from current ask to future bid",
+  "maker_fee_bps_each_side": 10,
+  "effective_samples": 2379,
+  "all": {
+    "mean_hold_bps": -0.14579889864602477,
+    "mean_fee_net_cycle_bps": -20.225143376015396,
+    "cycle_positive_pct": 8.532997057587222,
+    "mean_min_hold_bps": -5.810838822956175,
+    "mean_min_fee_net_cycle_bps": -25.890183300325557,
+    "cycle_downside_semivariance_bps2": 706.7412241636484
+  },
+  "up_oscillation": {
+    "samples": 768,
+    "mean_multiplier": 0.8605546138692718,
+    "mean_fee_net_cycle_bps": -20.259337140481502,
+    "cycle_positive_pct": 7.03125,
+    "cycle_downside_semivariance_bps2": 658.1046354863179
+  },
+  "down_oscillation": {
+    "samples": 747,
+    "mean_multiplier": 1.167077481127235,
+    "mean_fee_net_cycle_bps": -21.365402959651696,
+    "cycle_positive_pct": 8.032128514056225,
+    "cycle_downside_semivariance_bps2": 800.9795927843727
+  },
+  "paired_six_hour_fee_cycle_down_minus_up_bps": -0.12041011648359834,
+  "paired_six_hour_fee_cycle_se_bps": 0.9130208565496702,
+  "paired_six_hour_fee_cycle_ci95_bps": [-1.909930995320952, 1.669110762353755],
+  "decision": "hold-dominant; no trade promotion",
+  "reason": "The risk alpha separates downside tail risk, but the 15-minute executable cycle remains fee-negative in the overwhelming majority of observations. A strategy-level action replay is required before any trade can be justified."
+}

@@ -35,6 +35,50 @@ func TestConditionalExecutionStateIsCausalAndSideSpecific(t *testing.T) {
 	}
 }
 
+func TestConditionalExecutionKernelUsesVolumeProfileOnlyWhenBothStatesAreReady(t *testing.T) {
+	base := conditionalExecutionState{Valid: true, BuyQVBps: 5, SellQVBps: 5, SpreadBps: 4}
+	if got := conditionalExecutionKernel(base, base, true, time.Minute); got != 1 {
+		t.Fatalf("identical legacy states must have unit kernel, got %v", got)
+	}
+	profileA := VolumeProfileState{
+		Valid: true, POCDistanceBps: -8, LocalDensityRatio: .8,
+		LocalFlowImbalance: .7, CentroidDistanceBps: -4,
+		ProfileScaleBps: 10, CorridorPosition: -.5, KernelWeight: 1,
+	}
+	profileB := profileA
+	profileB.POCDistanceBps = 8
+	withProfileA, withProfileB := base, base
+	withProfileA.VolumeProfile, withProfileB.VolumeProfile = profileA, profileB
+	if got := conditionalExecutionKernel(withProfileA, withProfileB, true, time.Minute); !(got > 0 && got < 1) {
+		t.Fatalf("ready profile states must alter the conditional kernel, got %v", got)
+	}
+	profileB.Valid = false
+	withProfileB.VolumeProfile = profileB
+	if got, want := conditionalExecutionKernel(withProfileA, withProfileB, true, time.Minute), conditionalExecutionKernel(base, base, true, time.Minute); math.Abs(got-want) > 1e-12 {
+		t.Fatalf("unready profile must preserve legacy kernel: got=%v want=%v", got, want)
+	}
+}
+
+func TestMarketMakerHorizonModelCarriesCausalVolumeProfileSnapshots(t *testing.T) {
+	start := time.Unix(3_000, 0)
+	cfg := MarketMakerConfig{
+		HorizonLookback:  types.Duration(time.Minute),
+		MaxTradingWindow: types.Duration(time.Minute),
+		FastWindows:      []types.Duration{types.Duration(10 * time.Second)},
+		VolumeProfile:    VolumeProfileConfig{Enabled: true, MinEffectiveTrades: 4},
+	}
+	var model MarketMakerHorizonModel
+	for second := 0; second < 20; second++ {
+		at := start.Add(time.Duration(second) * time.Second)
+		model.ObserveBookWithGap(at, 100, 100.01, cfg, false)
+		model.ObservePublicTrade(at.Add(100*time.Millisecond), 100.005, 1, second%2 == 0, cfg)
+	}
+	state := model.conditionalExecutionState(10 * time.Second)
+	if !state.Valid || !state.VolumeProfile.Valid || state.VolumeProfile.EffectiveTrades < 4 {
+		t.Fatalf("causal profile snapshot not carried into horizon state: %+v", state)
+	}
+}
+
 func TestConditionalExposureCacheStartupMatchesIncremental(t *testing.T) {
 	start := time.Unix(2_000, 0)
 	cfg := MarketMakerConfig{
@@ -97,8 +141,8 @@ func TestConditionalExecutionPairedValueIsBuySellSymmetric(t *testing.T) {
 			} else {
 				exposure.SellExcursionBps = 15
 				quote := exposure.StartBid * math.Exp(10.0/10_000)
-				exposure.TerminalAsk = quote * math.Exp(-30.0/10_000)
-				exposure.TerminalBid = exposure.TerminalAsk * math.Exp(-1.0/10_000)
+				exposure.TerminalBid = quote * math.Exp(-30.0/10_000)
+				exposure.TerminalAsk = exposure.TerminalBid * math.Exp(1.0/10_000)
 			}
 			exposures[index] = exposure
 		}
@@ -122,5 +166,22 @@ func TestConditionalExecutionPairedValueIsBuySellSymmetric(t *testing.T) {
 	}
 	if math.Abs(buy.ExpectedPairedDeltaBps-sell.ExpectedPairedDeltaBps) > 1e-9 {
 		t.Fatalf("reflected BUY/SELL payoffs differ: buy=%+v sell=%+v", buy, sell)
+	}
+}
+
+func TestInwardDistanceImprovementRequiresPositiveSimultaneousLowerBound(t *testing.T) {
+	d := ConditionalExecutionSideDecision{
+		Evaluated: true, EffectiveSamples: 8,
+		ExpectedPairedDeltaBps: 3, PairedStdErrorBps: 1,
+	}
+	if !inwardDistanceImprovementSupported(d, 2.5) {
+		t.Fatal("positive simultaneous lower bound was rejected")
+	}
+	if inwardDistanceImprovementSupported(d, 3) {
+		t.Fatal("zero simultaneous lower bound must fail closed")
+	}
+	d.EffectiveSamples = 1
+	if inwardDistanceImprovementSupported(d, 0) {
+		t.Fatal("one effective path cannot identify inward-distance dispersion")
 	}
 }

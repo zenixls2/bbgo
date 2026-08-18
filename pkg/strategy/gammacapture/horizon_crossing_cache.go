@@ -11,16 +11,20 @@ import (
 // barriers with these exact executable-BBO excursions; it does not rebuild
 // the future max/min path.
 type marketMakerHorizonExposure struct {
-	At               time.Time
-	EndAt            time.Time
-	StartBid         float64
-	StartAsk         float64
-	TerminalBid      float64
-	TerminalAsk      float64
-	BuyExcursionBps  float64
-	SellExcursionBps float64
-	ConditionalState conditionalExecutionState
-	NextMinute       int
+	At                     time.Time
+	EndAt                  time.Time
+	StartBid               float64
+	StartAsk               float64
+	StartBBOWeightedPrice  float64
+	WindowBBOWeightedPrice float64
+	StartBookImbalance     float64
+	StartBookDepthReady    bool
+	TerminalBid            float64
+	TerminalAsk            float64
+	BuyExcursionBps        float64
+	SellExcursionBps       float64
+	ConditionalState       conditionalExecutionState
+	NextMinute             int
 }
 
 type marketMakerHorizonExposureCache struct {
@@ -82,6 +86,20 @@ func (m *MarketMakerHorizonModel) crossingExposures(horizon time.Duration) []mar
 			cache.BadPrefix[index+1]++
 		}
 	}
+	// Integral prefix for the piecewise-constant BBO-weighted price. Binance
+	// book-ticker is change-driven, so event-count averaging would overweight
+	// busy intervals. Prefix integration makes every initial completed-window
+	// mean O(1) after this O(N) build.
+	weightedAreaPrefix := make([]float64, pointCount)
+	for index := 1; index < pointCount; index++ {
+		seconds := m.points[index].At.Sub(m.points[index-1].At).Seconds()
+		if seconds > 0 {
+			weightedAreaPrefix[index] = weightedAreaPrefix[index-1] +
+				m.points[index-1].bboWeightedPrice()*seconds
+		} else {
+			weightedAreaPrefix[index] = weightedAreaPrefix[index-1]
+		}
+	}
 
 	cache.Exposures = cache.Exposures[:0]
 	cache.MaxBidDeque = cache.MaxBidDeque[:0]
@@ -138,16 +156,28 @@ func (m *MarketMakerHorizonModel) crossingExposures(horizon time.Duration) []mar
 		minAsk := m.points[cache.MinAskDeque[0]].askPrice()
 		terminalBid := m.points[right-1].bidPrice()
 		terminalAsk := m.points[right-1].askPrice()
+		startWeightedPrice := start.bboWeightedPrice()
+		terminalWeightedPrice := m.points[right-1].bboWeightedPrice()
+		weightedArea := weightedAreaPrefix[right-1] - weightedAreaPrefix[index] +
+			terminalWeightedPrice*endAt.Sub(m.points[right-1].At).Seconds()
+		windowWeightedPrice := weightedArea / horizon.Seconds()
+		if startWeightedPrice <= 0 || windowWeightedPrice <= 0 {
+			continue
+		}
 		cache.Exposures = append(cache.Exposures, marketMakerHorizonExposure{
-			At:               start.At,
-			EndAt:            endAt,
-			StartBid:         startBid,
-			StartAsk:         startAsk,
-			TerminalBid:      terminalBid,
-			TerminalAsk:      terminalAsk,
-			BuyExcursionBps:  math.Log(startAsk/minAsk) * 10_000,
-			SellExcursionBps: math.Log(maxBid/startBid) * 10_000,
-			ConditionalState: conditionalStates[index],
+			At:                     start.At,
+			EndAt:                  endAt,
+			StartBid:               startBid,
+			StartAsk:               startAsk,
+			StartBBOWeightedPrice:  startWeightedPrice,
+			WindowBBOWeightedPrice: windowWeightedPrice,
+			StartBookImbalance:     start.BookImbalance,
+			StartBookDepthReady:    start.BookDepthReady,
+			TerminalBid:            terminalBid,
+			TerminalAsk:            terminalAsk,
+			BuyExcursionBps:        math.Log(startAsk/minAsk) * 10_000,
+			SellExcursionBps:       math.Log(maxBid/startBid) * 10_000,
+			ConditionalState:       conditionalStates[index],
 		})
 	}
 
@@ -169,15 +199,115 @@ func (m *MarketMakerHorizonModel) appendCompletedHorizonExposures(
 			return m.points[index].At.After(cache.BuiltThrough)
 		})
 	}
-	for index := first; index < len(m.points); index++ {
+	end := sort.Search(len(m.points), func(index int) bool {
+		return m.points[index].At.Add(horizon).After(lastPointAt)
+	})
+	if first >= end {
+		return
+	}
+
+	// Build every newly matured start as one sliding-window batch. The prior
+	// implementation called horizonExposureAtIndex for each new second, scanning
+	// the complete H-second future path and rebuilding its H-second conditional
+	// state each time: O(newStarts*H). Monotone extrema, an integral prefix and
+	// one conditional-state pass make this exact batch O(newStarts+H).
+	stateLookback := horizon
+	if stateLookback < 30*time.Second {
+		stateLookback = 30 * time.Second
+	}
+	stateCutoff := m.points[first].At.Add(-stateLookback)
+	stateStart := sort.Search(len(m.points), func(index int) bool {
+		return !m.points[index].At.Before(stateCutoff)
+	})
+	if stateStart > 0 && !m.points[stateStart].GapBefore {
+		stateStart--
+	}
+	conditionalStates := buildConditionalExecutionStates(m.points[stateStart:end], horizon)
+
+	localCount := len(m.points) - first
+	badPrefix := make([]int, localCount+1)
+	weightedAreaPrefix := make([]float64, localCount)
+	for local := 0; local < localCount; local++ {
+		global := first + local
+		point := m.points[global]
+		badPrefix[local+1] = badPrefix[local]
+		bid, ask := point.bidPrice(), point.askPrice()
+		if point.GapBefore || bid <= 0 || ask < bid || point.bboWeightedPrice() <= 0 {
+			badPrefix[local+1]++
+		}
+		if local > 0 {
+			seconds := point.At.Sub(m.points[global-1].At).Seconds()
+			weightedAreaPrefix[local] = weightedAreaPrefix[local-1]
+			if seconds > 0 {
+				weightedAreaPrefix[local] += m.points[global-1].bboWeightedPrice() * seconds
+			}
+		}
+	}
+
+	maxBidDeque := make([]int, 0, int(horizon.Seconds())+1)
+	minAskDeque := make([]int, 0, int(horizon.Seconds())+1)
+	right := first + 1
+	pushWindow := func(index int) {
+		bid, ask := m.points[index].bidPrice(), m.points[index].askPrice()
+		for len(maxBidDeque) > 0 && m.points[maxBidDeque[len(maxBidDeque)-1]].bidPrice() <= bid {
+			maxBidDeque = maxBidDeque[:len(maxBidDeque)-1]
+		}
+		maxBidDeque = append(maxBidDeque, index)
+		for len(minAskDeque) > 0 && m.points[minAskDeque[len(minAskDeque)-1]].askPrice() >= ask {
+			minAskDeque = minAskDeque[:len(minAskDeque)-1]
+		}
+		minAskDeque = append(minAskDeque, index)
+	}
+
+	for index := first; index < end; index++ {
 		start := m.points[index]
-		if start.At.Add(horizon).After(lastPointAt) {
-			break
-		}
+		endAt := start.At.Add(horizon)
 		cache.BuiltThrough = start.At
-		if exposure, ok := horizonExposureAtIndex(m.points, index, horizon); ok {
-			cache.Exposures = append(cache.Exposures, exposure)
+		if right < index+1 {
+			right = index + 1
 		}
+		for right < len(m.points) && m.points[right].At.Before(endAt) {
+			pushWindow(right)
+			right++
+		}
+		for len(maxBidDeque) > 0 && maxBidDeque[0] <= index {
+			maxBidDeque = maxBidDeque[1:]
+		}
+		for len(minAskDeque) > 0 && minAskDeque[0] <= index {
+			minAskDeque = minAskDeque[1:]
+		}
+		startBid, startAsk := start.bidPrice(), start.askPrice()
+		leftLocal, rightLocal := index+1-first, right-first
+		if start.GapBefore || startBid <= 0 || startAsk < startBid || right <= index+1 ||
+			badPrefix[rightLocal]-badPrefix[leftLocal] > 0 ||
+			len(maxBidDeque) == 0 || len(minAskDeque) == 0 {
+			continue
+		}
+		terminal := m.points[right-1]
+		terminalBid, terminalAsk := terminal.bidPrice(), terminal.askPrice()
+		startWeightedPrice := start.bboWeightedPrice()
+		terminalWeightedPrice := terminal.bboWeightedPrice()
+		weightedArea := weightedAreaPrefix[right-1-first] - weightedAreaPrefix[index-first] +
+			terminalWeightedPrice*endAt.Sub(terminal.At).Seconds()
+		windowWeightedPrice := weightedArea / horizon.Seconds()
+		if terminalBid <= 0 || terminalAsk < terminalBid || startWeightedPrice <= 0 || windowWeightedPrice <= 0 {
+			continue
+		}
+		cache.Exposures = append(cache.Exposures, marketMakerHorizonExposure{
+			At:                     start.At,
+			EndAt:                  endAt,
+			StartBid:               startBid,
+			StartAsk:               startAsk,
+			StartBBOWeightedPrice:  startWeightedPrice,
+			WindowBBOWeightedPrice: windowWeightedPrice,
+			StartBookImbalance:     start.BookImbalance,
+			StartBookDepthReady:    start.BookDepthReady,
+			TerminalBid:            terminalBid,
+			TerminalAsk:            terminalAsk,
+			BuyExcursionBps:        math.Log(startAsk/m.points[minAskDeque[0]].askPrice()) * 10_000,
+			SellExcursionBps:       math.Log(m.points[maxBidDeque[0]].bidPrice()/startBid) * 10_000,
+			ConditionalState:       conditionalStates[index-stateStart],
+		})
 	}
 }
 
@@ -192,13 +322,19 @@ func horizonExposureAtIndex(points []MarketMakerHorizonPoint, index int, horizon
 		return marketMakerHorizonExposure{}, false
 	}
 	endAt := start.At.Add(horizon)
+	startWeightedPrice := start.bboWeightedPrice()
 	maxBid, minAsk, terminalBid, terminalAsk, futurePoints := 0.0, math.Inf(1), 0.0, 0.0, 0
+	weightedArea := 0.0
+	weightedAt, weightedPrice := start.At, startWeightedPrice
 	for future := index + 1; future < len(points) && points[future].At.Before(endAt); future++ {
 		point := points[future]
 		bid, ask := point.bidPrice(), point.askPrice()
-		if point.GapBefore || bid <= 0 || ask < bid {
+		pointWeightedPrice := point.bboWeightedPrice()
+		if point.GapBefore || bid <= 0 || ask < bid || pointWeightedPrice <= 0 {
 			return marketMakerHorizonExposure{}, false
 		}
+		weightedArea += weightedPrice * point.At.Sub(weightedAt).Seconds()
+		weightedAt, weightedPrice = point.At, pointWeightedPrice
 		futurePoints++
 		maxBid = math.Max(maxBid, bid)
 		minAsk = math.Min(minAsk, ask)
@@ -207,16 +343,25 @@ func horizonExposureAtIndex(points []MarketMakerHorizonPoint, index int, horizon
 	if futurePoints == 0 || maxBid <= 0 || math.IsInf(minAsk, 1) {
 		return marketMakerHorizonExposure{}, false
 	}
+	weightedArea += weightedPrice * endAt.Sub(weightedAt).Seconds()
+	windowWeightedPrice := weightedArea / horizon.Seconds()
+	if startWeightedPrice <= 0 || windowWeightedPrice <= 0 {
+		return marketMakerHorizonExposure{}, false
+	}
 	return marketMakerHorizonExposure{
-		At:               start.At,
-		EndAt:            endAt,
-		StartBid:         startBid,
-		StartAsk:         startAsk,
-		TerminalBid:      terminalBid,
-		TerminalAsk:      terminalAsk,
-		BuyExcursionBps:  math.Log(startAsk/minAsk) * 10_000,
-		SellExcursionBps: math.Log(maxBid/startBid) * 10_000,
-		ConditionalState: conditionalExecutionStateAtIndex(points, index, horizon),
+		At:                     start.At,
+		EndAt:                  endAt,
+		StartBid:               startBid,
+		StartAsk:               startAsk,
+		StartBBOWeightedPrice:  startWeightedPrice,
+		WindowBBOWeightedPrice: windowWeightedPrice,
+		StartBookImbalance:     start.BookImbalance,
+		StartBookDepthReady:    start.BookDepthReady,
+		TerminalBid:            terminalBid,
+		TerminalAsk:            terminalAsk,
+		BuyExcursionBps:        math.Log(startAsk/minAsk) * 10_000,
+		SellExcursionBps:       math.Log(maxBid/startBid) * 10_000,
+		ConditionalState:       conditionalExecutionStateAtIndex(points, index, horizon),
 	}, true
 }
 

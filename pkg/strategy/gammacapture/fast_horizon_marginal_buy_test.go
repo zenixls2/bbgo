@@ -38,6 +38,71 @@ func TestScoreFastHorizonWithMarginalBuyUsesCommonBpsPerHourUnit(t *testing.T) {
 	}
 }
 
+func TestScoreFastHorizonWithPathUtilityReplacesCrossingScore(t *testing.T) {
+	decision := MarketMakerHorizonDecision{
+		Horizon: 5 * time.Minute, ScoreBpsPerHour: 999,
+	}
+	stats := JointPathPayoffStats{
+		EffectiveSamples: 25,
+		BuyDominant: jointPathPayoffMoments{
+			BuyMeanBps: 30, SellMeanBps: 30,
+			BuyVarBps2: 4, SellVarBps2: 4,
+		},
+		SellDominant: jointPathPayoffMoments{
+			BuyMeanBps: 30, SellMeanBps: 30,
+			BuyVarBps2: 4, SellVarBps2: 4,
+		},
+	}
+	in := FastHorizonMarginalBuyInput{
+		CurrentInventoryNotionalJPY: 500,
+		TargetInventoryNotionalJPY:  500,
+		HardMinInventoryNotionalJPY: 0,
+		HardMaxInventoryNotionalJPY: 1_000,
+		PairEquityJPY:               1_000,
+		MarginalBuyNotionalJPY:      100,
+		AvailableBuyCapitalJPY:      500,
+		MarginalSellNotionalJPY:     100,
+		AvailableSellInventoryJPY:   500,
+		ConfidenceZScore:            1,
+	}
+	got := scoreFastHorizonWithPathUtility(decision, stats, in)
+	if !got.PathUtilityEvaluated || got.PathUtilityCertaintyEquivalentJPY <= 0 ||
+		got.PathUtilityBuyNotionalJPY != 100 || got.PathUtilitySellNotionalJPY != 100 {
+		t.Fatalf("expected executable bilateral path utility: %+v", got)
+	}
+	want := got.PathUtilityCertaintyEquivalentJPY / in.PairEquityJPY * 10_000 /
+		decision.Horizon.Hours()
+	if math.Abs(got.SelectionScoreBpsPerHour-want) > 1e-12 ||
+		math.Abs(got.PathUtilityBpsPerHour-want) > 1e-12 ||
+		got.SelectionScoreBpsPerHour == decision.ScoreBpsPerHour {
+		t.Fatalf("path utility must replace, not mix with, crossing score: got=%+v want=%f", got, want)
+	}
+}
+
+func TestScoreFastHorizonWithPathUtilityUsesOnlyExecutableSides(t *testing.T) {
+	decision := MarketMakerHorizonDecision{Horizon: 10 * time.Minute, ScoreBpsPerHour: 5}
+	stats := JointPathPayoffStats{
+		EffectiveSamples: 20,
+		SellDominant:     jointPathPayoffMoments{SellMeanBps: 20, SellVarBps2: 4},
+	}
+	in := FastHorizonMarginalBuyInput{
+		CurrentInventoryNotionalJPY: 900,
+		TargetInventoryNotionalJPY:  500,
+		HardMinInventoryNotionalJPY: 0,
+		HardMaxInventoryNotionalJPY: 900,
+		PairEquityJPY:               1_000,
+		MarginalBuyNotionalJPY:      100,
+		AvailableBuyCapitalJPY:      100,
+		MarginalSellNotionalJPY:     100,
+		AvailableSellInventoryJPY:   900,
+	}
+	got := scoreFastHorizonWithPathUtility(decision, stats, in)
+	if !got.PathUtilityEvaluated || got.PathUtilityBuyNotionalJPY != 0 ||
+		got.PathUtilitySellNotionalJPY != 100 {
+		t.Fatalf("hard inventory headroom must remove only the infeasible side: %+v", got)
+	}
+}
+
 func TestScoreFastHorizonWithMarginalBuyRequiresExecutableTargetDeficit(t *testing.T) {
 	decision := MarketMakerHorizonDecision{Horizon: 15 * time.Minute, ScoreBpsPerHour: 7}
 	stats := JointPathPayoffStats{
@@ -86,5 +151,38 @@ func TestScoreFastHorizonWithMarginalBuyDeclinesNegativeOptionWithoutPenalizingH
 		got.MarginalBuyUtilityBpsPerHour != 0 ||
 		got.SelectionScoreBpsPerHour != decision.ScoreBpsPerHour {
 		t.Fatalf("negative BUY option must be declined without penalizing the horizon: %+v", got)
+	}
+}
+
+func TestScoreFastHorizonWithMarginalBuyUsesSameHorizonPosteriorTarget(t *testing.T) {
+	decision := MarketMakerHorizonDecision{Horizon: 10 * time.Minute, ScoreBpsPerHour: 5}
+	stats := JointPathPayoffStats{
+		EffectiveSamples: 25,
+		BuyDominant: jointPathPayoffMoments{
+			InventoryMeanBps: 20, InventoryVarBps2: 100,
+			InventoryDirectionalMeanBps: 20, InventoryDirectionalVarBps2: 100,
+			BuyMeanBps: 20, BuyVarBps2: 100, InventoryBuyCovBps2: 100,
+		},
+		SellDominant: jointPathPayoffMoments{
+			InventoryMeanBps: 20, InventoryVarBps2: 100,
+			InventoryDirectionalMeanBps: 20, InventoryDirectionalVarBps2: 100,
+			BuyMeanBps: 20, BuyVarBps2: 100, InventoryBuyCovBps2: 100,
+		},
+	}
+	in := FastHorizonMarginalBuyInput{
+		CurrentInventoryNotionalJPY: 600,
+		TargetInventoryNotionalJPY:  500,
+		HardMinInventoryNotionalJPY: 0,
+		HardMaxInventoryNotionalJPY: 1_000,
+		PosteriorInventoryTarget:    true,
+		PairEquityJPY:               1_000,
+		MarginalBuyNotionalJPY:      100,
+		AvailableBuyCapitalJPY:      400,
+		RiskAversion:                1,
+	}
+	got := scoreFastHorizonWithMarginalBuy(decision, stats, in)
+	if !got.MarginalBuyEvaluated || got.MarginalBuyTargetNotionalJPY <= 600 ||
+		got.MarginalBuyTargetUpProbability <= 0.5 {
+		t.Fatalf("supported upside must move the horizon target before valuing BUY: %+v", got)
 	}
 }

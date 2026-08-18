@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -202,5 +203,119 @@ func TestMakerStartupRestoresCheckpointWhenAggTradeWarmupDisabled(t *testing.T) 
 	}
 	if restarted.State.LastReferenceTime != t2 {
 		t.Fatalf("unexpected replay cursor: got=%s want=%s", restarted.State.LastReferenceTime, t2)
+	}
+}
+
+func TestModelCheckpointRoundTripsVolumeProfileState(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 17, 8, 0, 0, 0, time.UTC)
+	first := newCheckpointTestStrategy(root)
+	first.MarketMaker.VolumeProfile = VolumeProfileConfig{
+		Enabled: true, HalfLife: types.Duration(45 * time.Minute),
+		BinWidthBps: 1, MaxBins: 64, MinEffectiveTrades: 1,
+	}
+	first.initializeAdaptiveFastModels()
+	config := first.MarketMaker
+	config.setDefaults()
+	first.observeMakerReplayTrade(makerStartupTrade{when: now.Add(-3 * time.Second), trade: types.Trade{
+		ID: 1, Symbol: first.Symbol, Price: fixedpoint.NewFromFloat(99.99),
+		Quantity: fixedpoint.One, Side: types.SideTypeSell,
+	}}, config)
+	first.observeMakerReplayTrade(makerStartupTrade{when: now.Add(-2 * time.Second), trade: types.Trade{
+		ID: 2, Symbol: first.Symbol, Price: fixedpoint.NewFromFloat(100.01),
+		Quantity: fixedpoint.One, Side: types.SideTypeBuy,
+	}}, config)
+	first.observeMakerReplayBBO(now.Add(-time.Second), evidenceBBO(first.Symbol, 99.99, 1, 100.01, 1), false, config)
+	window := config.FastModelWindows()[0]
+	before := first.makerHorizonModel.volumeProfiles[window].Snapshot(100)
+	if !before.Valid {
+		t.Fatalf("test setup did not build a valid volume profile: %+v", before)
+	}
+	if err := first.prepareModelCheckpoint(now); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(first.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state State
+	if err := json.Unmarshal(encoded, &state); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newCheckpointTestStrategy(root)
+	restarted.MarketMaker.VolumeProfile = first.MarketMaker.VolumeProfile
+	restarted.State = &state
+	restarted.initializeAdaptiveFastModels()
+	if _, restored, err := restarted.restoreModelCheckpoint(now); err != nil || !restored {
+		t.Fatalf("volume-profile checkpoint restore failed: restored=%v err=%v", restored, err)
+	}
+	after := restarted.makerHorizonModel.volumeProfiles[window].Snapshot(100)
+	if !after.Valid || after.EffectiveTrades != before.EffectiveTrades || after.POCDistanceBps != before.POCDistanceBps {
+		t.Fatalf("restored volume profile differs: before=%+v after=%+v", before, after)
+	}
+	point := restarted.makerHorizonModel.points[len(restarted.makerHorizonModel.points)-1]
+	if historical := point.volumeProfileState(window); !historical.Valid {
+		t.Fatalf("historical BBO point lost its volume-profile snapshot: %+v", historical)
+	}
+}
+
+func TestMakerStartupCausallyLoadsTradesAndRecordsCheckpoint(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 17, 8, 0, 5, 0, time.UTC)
+	strategy := newCheckpointTestStrategy(root)
+	strategy.Config.setDefaults()
+	strategy.MarketMaker.VolumeProfile = VolumeProfileConfig{
+		Enabled: true, HalfLife: types.Duration(45 * time.Minute),
+		BinWidthBps: 1, MaxBins: 64, MinEffectiveTrades: 1,
+	}
+	strategy.initializeAdaptiveFastModels()
+	strategy.makerExecutableCrossingModel = NewExecutableCrossingModel(strategy.Symbol, strategy.Barrier, strategy.Intensity)
+	collector := filepath.Join(root, strategy.Symbol)
+	if err := os.MkdirAll(collector, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	day := now.Format(time.DateOnly)
+	book := "received_at,bid,bid_quantity,ask,ask_quantity,gap_before_ms\n" +
+		fmt.Sprintf("%s,99.99,1,100.01,1,0\n", now.Add(-3*time.Second).Format(time.RFC3339Nano)) +
+		fmt.Sprintf("%s,100.00,1,100.02,1,0\n", now.Add(-time.Second).Format(time.RFC3339Nano))
+	if err := os.WriteFile(filepath.Join(collector, fmt.Sprintf("%s-bookticker-%s.csv", strategy.Symbol, day)), []byte(book), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trades := "received_at,event_time_ms,trade_id,price,quantity,side\n" +
+		fmt.Sprintf("%s,0,1,100.00,1,SELL\n", now.Add(-4*time.Second).Format(time.RFC3339Nano)) +
+		fmt.Sprintf("%s,0,2,100.01,1,BUY\n", now.Add(-2*time.Second).Format(time.RFC3339Nano)) +
+		fmt.Sprintf("%s,0,3,100.02,1,BUY\n", now.Add(-500*time.Millisecond).Format(time.RFC3339Nano))
+	if err := os.WriteFile(filepath.Join(collector, fmt.Sprintf("%s-trades-%s.csv", strategy.Symbol, day)), []byte(trades), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := strategy.restoreAndWarmMakerModelsFromBinanceCapture(now); err != nil {
+		t.Fatal(err)
+	}
+	if strategy.State.ModelCheckpoint == nil {
+		t.Fatal("startup did not record a model checkpoint")
+	}
+	if strategy.State.ModelCheckpoint.ReplayAfter != now.Add(-time.Second) ||
+		strategy.State.ModelCheckpoint.TradeReplayAfter != now.Add(-2*time.Second) {
+		t.Fatalf("unexpected checkpoint cursors: bbo=%s trade=%s",
+			strategy.State.ModelCheckpoint.ReplayAfter, strategy.State.ModelCheckpoint.TradeReplayAfter)
+	}
+	window := strategy.MarketMaker.FastModelWindows()[0]
+	state := strategy.makerHorizonModel.volumeProfiles[window].Snapshot(100.01)
+	if !state.Valid || state.EffectiveTrades < 1.9 {
+		t.Fatalf("startup did not causally warm volume profile: %+v", state)
+	}
+	lastPoint := strategy.makerHorizonModel.points[len(strategy.makerHorizonModel.points)-1]
+	if historical := lastPoint.volumeProfileState(window); !historical.Valid {
+		t.Fatalf("last BBO was observed before its prior trades: %+v", historical)
+	}
+	if len(strategy.makerStartupPendingTrades) != 1 {
+		t.Fatalf("trade newer than the last captured BBO must wait for the first live BBO: %d", len(strategy.makerStartupPendingTrades))
+	}
+	strategy.drainMakerStartupTrades(now, strategy.MarketMaker)
+	if len(strategy.makerStartupPendingTrades) != 0 || strategy.makerLastPublicTradeAt != now.Add(-500*time.Millisecond) {
+		t.Fatalf("first live BBO did not consume pending causal trades: pending=%d cursor=%s",
+			len(strategy.makerStartupPendingTrades), strategy.makerLastPublicTradeAt)
 	}
 }

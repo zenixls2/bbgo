@@ -38,7 +38,7 @@ func runQuantityProjectionComparison(in quantityProjectionComparisonInput) {
 		fatalf("invalid quantity projection replay interval, balances, or queue multiplier")
 	}
 	barrier, intensity, cfg := loadProductionConfig(in.ConfigPath, in.Symbol)
-	warmupFrom := in.From.Add(-macroReplayWarmup(cfg))
+	warmupFrom := in.From.Add(-productionReplayWarmup(cfg))
 	books, trades, cacheHit := loadMacroReplayDataset(in.DataPath, in.Symbol, warmupFrom, in.To, in.From, replayConfigFingerprint(in.ConfigPath), in.ReplayCacheDir)
 	books = compactBBO(books)
 	trades = compactTrades(trades)

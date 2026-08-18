@@ -1568,19 +1568,39 @@ the side-specific executable-BBO history already maintained by the maker
 model. The `onlineArrival` YAML/state fields remain passive compatibility
 fields for older files and are ignored by quote selection and warmup.
 
-The BBGO strategy state persists a bounded, versioned model checkpoint. It
-contains the crossing engine, slow/fast crossing windows, decayed direction
-events, recent fast evidence, the executable-BBO horizon ring, and closed/open
-Macro bars. It contains no orders, balances, credentials, or fills. A compatible
-live restart replays only capture rows newer than the causal cursor; backtest
-and replay environments never load this live checkpoint. Checkpoint restoration
-and delta replay are independent of the retired online-arrival learner and run
-even when `aggTradeWarmup.enabled` is false. The checkpoint cursor, rather than
-a possibly newer top-level state timestamp, is authoritative for the delta
-boundary. When the checkpoint is missing, incompatible, or older than the
-bounded sufficient window, live startup reconstructs the rolling crossing and
-executable-BBO models from indexed local capture before stale orders are
-reconciled; it does not begin quoting from an empty model.
+The BBGO strategy state persists a bounded, versioned model checkpoint. Schema
+version 7 contains the crossing engine, slow/fast crossing windows, decayed
+direction events, recent fast evidence, BOCPD run states and calibration,
+Fast-drift state, the executable-BBO horizon ring (including each historical
+Volume Profile snapshot), current rolling Volume Profile bins, and closed/open
+Macro bars. It contains no orders, balances, credentials, or fills. BBO and
+public-trade cursors are stored separately, so a trade received after the last
+BBO is neither duplicated nor skipped after restart.
+
+A compatible live restart replays only capture rows newer than the respective
+causal cursors; backtest and replay environments never load this live
+checkpoint. Checkpoint restoration and delta replay are independent of the
+retired online-arrival learner and run even when `aggTradeWarmup.enabled` is
+false. When the checkpoint is missing, incompatible, or older than the
+sufficient window, startup reconstructs the models from indexed local capture
+before stale orders are reconciled; it does not begin quoting from an empty
+model. The sufficient maker interval is
+
+    HorizonLookback + max_H(H + continuation(H)),
+
+extended when BOCPD calibration or an enabled Macro controller requires more
+history, and then combined with the strategy-level intensity and Fast-evidence
+windows. Public trades and BBO are merged by event time during this rebuild;
+at equal timestamps the BBO precedes the trade, matching deterministic
+production replay and preventing a same-timestamp trade from leaking into its
+BBO feature snapshot. The newly rebuilt checkpoint is synchronized before
+startup order reconciliation, then refreshed every ten minutes during live BBO
+processing.
+
+An ETHJPY local-capture smoke test on 2026-08-18 rebuilt 107,022 BBO updates and
+3,569 public trades in 4.49 seconds. Slow, selected Fast, Fast evidence,
+BOCPD calibration, and BOCPD direction were all healthy/ready. A JSON-persisted
+restart restored the same model states with zero replayed rows in 29.86 ms.
 
 Research replay has a separate deterministic parsed-event checkpoint for
 repeated experiments over the same interval. It is enabled by default at
@@ -2563,14 +2583,55 @@ applies to overlap-adjusted exposure, not raw BBO count.
 Every final BUY review uses its actual distance from the executable ask and the
 ask-side volatility model; every final SELL review uses its actual distance
 from the executable bid and the bid-side volatility model. The statistical
-window remains 10, 15, or 30 minutes, while the order review duration is derived
-after the final quote price is known:
-
-`T_review,s = min(H, delta_s^2 / sigma_s^2)`,
-
-subject to the configured refresh bounds. `orderKeepDistanceBps` therefore
+window remains 10, 15, or 30 minutes. The final order lease is exactly the
+selected statistical horizon `H`; `delta_s^2 / sigma_s^2` remains a diagnostic
+characteristic first-passage time and does not silently change the Bernoulli
+experiment whose touch probability priced the order. `orderKeepDistanceBps`
 reports the selected executable distance rather than a hard-coded 80 bps
 fallback.
+
+### Joint horizon, distance, and quantity posterior objective
+
+The preliminary horizon score is no longer authoritative for a physical
+order. The final Fast optimizer evaluates the Cartesian candidate set
+
+`a = (H, delta_buy, delta_sell, q_buy, q_sell)`
+
+over every configured 10/15/30-minute horizon and the existing executable
+price/quantity grids. For each feasible action, completed same-symbol BBO paths
+produce the fee-net target-relative terminal payoff and the covariance change
+against the existing whole position. Let `CE_path(a)` denote that payoff after
+its posterior lower-partial-moment regret and Kelly whole-position variance
+penalty. A finite-horizon comparison with no new order must not make a material
+inventory error an absorbing state, so the same scale-free proximal controller
+contributes its Bellman continuation value. For `e=I-I*` and random signed fill
+notional `D=q_buy B-q_sell A`, it is
+
+`B_target(a) = -e E[D]/W - E[D^2]/(2 |e|)`.
+
+For a certain one-sided target-restoring fill this concave expression is
+maximized at `q*=e^2/W`, exactly matching the existing proximal controller; it
+automatically becomes negative for movement away from target or excessive
+overshoot. The comparable renewal-reward objective is
+
+`J(a) = rho_H (CE_path(a)+B_target(a)) / H_hours`,
+
+with `rho_H = n_eff,H / (n_eff,H + n_0)`.
+
+Here `n_0` is the configured `horizonMinSamples`. The empirical-Bayes precision
+`rho_H` continuously shrinks a sparse window toward the explicit no-new-order
+action, whose excess utility is zero. Consequently categorical
+`HEALTHY/DEGRADED/INSUFFICIENT_DATA` labels are diagnostics rather than horizon
+switches. Exchange filters, balances, and the hard inventory interval still
+define feasibility; they are not model-selection heuristics. A minimum of one
+completed path remains necessary only to identify path dispersion.
+
+The selected action exposes `horizonJointCandidateCount`,
+`horizonJointEffectiveSamples`, `horizonJointReliability`,
+`horizonJointRawUtilityJPYHour`, and
+`horizonJointSelectionUtilityJPYHour`. `horizonPreliminarySelected` preserves
+the old neutral-score result for comparison, while `selectedHorizon` and the
+order lease follow the joint posterior optimum.
 
 At a clean window expiry, the strategy revalidates each side against the latest
 executable BBO and the full round-trip floor. A side that remains close enough
@@ -2796,7 +2857,8 @@ the existing second-moment inventory constraint remain binding.
 
 Candidate selection now uses completed-path terminal executable wealth rather
 than treating every touch as a completed cycle. A one-sided fill pays its one
-actual maker/adverse-selection cost and is marked at terminal bid/ask; a path
+actual maker/adverse-selection cost and is compared with terminal-bid
+liquidatable wealth; a path
 that touches both quotes pays two fill costs plus `minimumNetEdgeBps`. This
 fixed an earlier accounting error that charged a hypothetical second fee to
 inventory still held at the end of the crossing horizon.
@@ -3706,11 +3768,12 @@ enabled in the live YAML by this change. Research activation uses
 `--enable-fast-drift`; accepted artifacts are
 `/tmp/gc-fast-drift-final-{decline,rise,range,mixed}.json`.
 
-The features deliberately exclude trade-volume inputs for now. Live and
-startup replay currently consume BBO and trade files in different passes;
-including those features would make a restart train a different model from the
-continuous live path. They can be added only after replay ordering is unified
-and equivalence-tested.
+The original Fast-drift study deliberately excluded trade-volume inputs. As of
+checkpoint schema version 7, live startup merges public trades and BBO on one
+causal event-time path and persists independent stream cursors. This removes
+the former restart-ordering blocker, but it does not retroactively validate a
+trade-volume Fast-drift feature; any such alpha still requires its own
+prequential screening and holdout evidence before it can enter the model.
 
 ## 2026-08-12: target-aware minimum-BUY admission
 
@@ -4484,10 +4547,10 @@ when the option actually changes the selected window.
 
 ### Target-relative inventory risk redesign (research decision)
 
-The current whole-position objective evaluates every explicit price/quantity
+Before this change, the whole-position objective evaluated every explicit price/quantity
 candidate against submitting no new order. It therefore knows the candidate
 BUY and SELL notionals when it computes terminal wealth and covariance. The
-remaining conceptual mismatch is the risk benchmark: the variance term is
+conceptual mismatch was the risk benchmark: the variance term was
 measured around unchanged absolute risky inventory, while the Fast inventory
 target appears mainly in the Bernoulli inventory projection and chance
 constraint. A BUY below the statistically supported target can consequently be
@@ -4495,18 +4558,18 @@ classified as increasing absolute exposure even when it reduces the strategy's
 economically relevant target error. This especially suppresses multi-cell BUY
 promotion during an early rebound.
 
-The next risk-model stage will use a target-relative action value. For an action
+The implemented risk-model stage uses a target-relative action value. For an action
 `a = (deltaBuy, deltaSell, qBuy, qSell)`, Bernoulli fills `B` and `A`, current
 risky notional `I`, and horizon target `I*_H`, define
 
     I_H(a) = I + B qBuy - A qSell
-    R_H(a) = E[sigma_H^2 (I_H(a) - I*_H)^2 | F_t]
+    R_H(a) = Var((I-I*_H) r_H + DeltaW_H(a) | F_t)
     DeltaCE(a) = E[Pi_H(a) | F_t]
                  - z SE[Pi_H(a) | F_t]
                  - gamma/(2 W) (R_H(a) - R_H(0)).
 
-`Pi_H` remains executable terminal wealth: maker fees, terminal bid/ask
-markout, adverse continuation after a one-sided fill, and completed two-sided
+`Pi_H` remains executable terminal wealth: maker fees, terminal-bid
+liquidation markout, adverse continuation after a one-sided fill, and completed two-sided
 cycle value are not replaced. Hard balance, venue, and inventory bounds also
 remain constraints. The change is that risk is measured as the action's
 marginal movement around a same-horizon target rather than around zero risky
@@ -4516,24 +4579,59 @@ inventory. For one possible BUY fill this risk difference contains
 
 Thus a BUY below target is risk-reducing while `0 < qBuy < 2(I*_H-I)`, but
 becomes increasingly costly after overshooting the target. SELL has the exact
-reflected behavior. Quantity is selected on the exchange lattice by adding a
-cell only while its marginal `DeltaCE` is positive; it is not determined by a
+reflected behavior. Quantity is selected from the exchange-lattice candidate
+set by maximum `DeltaCE`; promotion above one executable cell additionally
+requires positive confidence-adjusted utility. It is not determined by a
 post-hoc risk multiplier.
 
-The moving target will be derived from the same Fast horizon and same-symbol
-executable-BBO posterior used by the quote decision. A conservative form is
+The moving target is derived from the same Fast horizon and same-symbol
+executable-BBO posterior used by the quote decision. Its directional return is
+not the old start-mid-to-terminal-bid liquidation stress. For each BBO update,
+visible opposite-side depth defines the microprice
 
-    muRobust_H = sign(muHat_H) max(|muHat_H| - z SE(muHat_H), 0)
-    I*_H = clip(I0* + W muRobust_H/(gamma sigma_H^2), I_min, I_max).
+    P_BBO = (Ask * BidSize + Bid * AskSize) / (BidSize + AskSize).
 
-This makes statistically supported rebound evidence raise the target early,
-neutral evidence retain the capital anchor, and supported downside lower the
-target. BUY calculations continue to use ask entry and terminal bid
-liquidation; SELL uses bid entry and terminal ask liquidation. Price drift and
-inventory target must share this posterior: the target must not be disabled
-merely because Fast price drift was applied.
+Because Binance book ticker is change-driven, the completed future-window
+reference is time weighted rather than event counted:
 
-The implementation must also remove a remaining optimization mismatch. Current
+    Pbar_H = integral_[t,t+H] P_BBO(u) du / H,
+    r_direction,H = log(Pbar_H / P_BBO(t)).
+
+This makes the target describe the average price available over its selected
+future horizon and prevents a burst of quote updates from dominating it. The
+separate `log(TerminalBid/StartMid)` statistic remains intentionally available
+for aggressive whole-position liquidation stress and downside covariance; its
+half-spread haircut is not reused as directional evidence. Directly applying the
+unbounded Markowitz ratio `W mu/(gamma sigma^2)` would almost always hit a hard
+capital boundary at the observed account size and short-horizon variance. The
+implemented bounded posterior aim therefore uses
+
+    SEmean_H = sigmaHat_H / sqrt(nEff_H)
+    sigmaPred_H = sqrt(sigmaHat_H^2 + SEmean_H^2)
+    p_H = Phi(muHat_H / sigmaPred_H)
+    c_H = 2 p_H - 1
+    I*_H = I0* + c_H (I_max - I0*)       when c_H >= 0
+         = I0* + c_H (I0* - I_min)       when c_H < 0.
+
+The predictive denominator keeps both irreducible next-window path variance and
+effective-sample estimation uncertainty. This distinction is essential:
+`Phi(muHat/SEmean)` estimates confidence that the historical mean is positive
+and approaches one for any tiny positive mean as the sample grows; it does not
+estimate the probability that the next Fast window is positive. The corrected
+`Phi(muHat/sigmaPred)` converges instead to the next-window sign probability and
+therefore cannot drive the target to a hard boundary merely because a negligible
+mean was measured precisely. No BPS coefficient or significance gate is fitted.
+This makes supported rebound evidence raise the target early, neutral evidence
+retain the strategic capital target, and supported downside lower the target. BUY
+calculations continue to use ask entry and terminal bid liquidation; a one-sided
+SELL compares its cash proceeds with the unfilled counterfactual inventory at
+terminal bid. Terminal ask is reserved for an explicitly modeled future
+repurchase cycle, which must also charge that second execution fee. Price drift and inventory target now
+share the selected horizon: target inference is no longer disabled merely
+because Fast price drift was applied. The horizon selector values its marginal
+BUY against that horizon's own posterior target, rather than a static 50% target.
+
+One follow-up optimization mismatch remains deliberately isolated. Current
 post-selection admissions can reduce quantity after a price has won. Their
 limits will instead become part of the candidate feasible set, or the affected
 candidate will be re-solved, so the submitted quantity is the quantity whose
@@ -4541,6 +4639,105 @@ price, lifetime, and terminal value were evaluated. A robust downside stress
 constraint will remain separate from the target-relative quadratic objective;
 raw empirical CVaR is deferred because the effective per-horizon path sample is
 often too small for a stable tail quantile.
+
+#### BBO-weighted future-window target correction
+
+The first target-relative prototype reused
+`log(TerminalBid/StartMid)` as both a conservative liquidation-risk return and
+the directional target label. That statistic was intentional for aggressive
+whole-position stress, but its half-spread liquidation haircut is not a
+directional forecast. The implementation now retains it only for risk and uses
+the time-weighted, depth-weighted BBO future-window return defined above for the
+target posterior. Live, startup replay, and production replay all pass the
+recorded best bid/ask sizes through the same horizon cache. Initial cache build
+uses a prefix integral, keeping the historical build O(N); event-count
+averaging is not used.
+
+Exact next-BBO ETHJPY replay, zero synthetic queue and the same 6,830.6723 JPY
+opening equity produced:
+
+| interval UTC | strategy PnL | hold PnL | excess | BUY / SELL | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -80.0265 | -80.0265 | 0.0000 | 0 / 0 | 1.3274% |
+| 2026-08-05 15:00--21:00 rise | +68.3562 | +68.7376 | -0.3814 | 5 / 8 | 0.3590% |
+| 2026-08-08 00:00--12:00 range | +13.3713 | +12.0675 | +1.3038 | 1 / 1 | 0.1316% |
+| 2026-08-10 00:00--18:00 mixed | -47.1328 | -36.8376 | -10.2952 | 6 / 8 | 1.2787% |
+
+This improves the mixed prototype from -52.4557 JPY and 1.4108% drawdown, but
+does not make the dynamic target acceptable: total excess over hold remains
+-9.3728 JPY and rise falls slightly below hold. The remaining defect is the
+separate probability-to-allocation mapping over the full 0--100% hard band,
+not the BBO-weighted future-window estimator. This version is research-only and
+must not be promoted merely from these four finite paths.
+
+#### Posterior-predictive dynamic target correction
+
+The first BBO-weighted implementation still used
+`Phi(muHat/SEmean)` for allocation. That quantity is confidence that the
+historical mean is positive, not the probability that the next selected Fast
+window is positive. As `nEff` grows, it approaches one for any fixed positive
+mean, however small relative to next-window variation, and therefore recreates
+the unwanted hard-band saturation. The corrected estimator keeps the future
+path variance in the denominator:
+
+    SEmean_H = sigmaHat_H / sqrt(nEff_H)
+    sigmaPred_H = sqrt(sigmaHat_H^2 + SEmean_H^2)
+    pPred_H = Phi(muHat_H / sigmaPred_H).
+
+The dynamic target continues to be the posterior expectation of the bounded
+up/down inventory policy, but now uses `pPred_H`. More history removes only
+estimation uncertainty; it does not remove irreducible next-window risk. A
+regression test with one million effective samples verifies that a 0.01 bps
+mean against 20 bps path volatility remains essentially neutral instead of
+moving to the hard maximum. Live logs expose both `posteriorInventoryReturnSEBps`
+and `posteriorInventoryPredictiveSDBps` so this distinction is observable.
+
+Exact next-BBO replay under the same conditions as the preceding table gave:
+
+| interval UTC | strategy PnL | hold PnL | excess | BUY / SELL | target JPY min--mean--max | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -78.7374 | -80.0265 | +1.2891 | 1 / 1 | 2,372.65--2,836.18--3,623.04 | 1.2999% |
+| 2026-08-05 15:00--21:00 rise | +69.6656 | +68.7376 | +0.9280 | 5 / 7 | 3,536.12--4,103.21--4,778.08 | 0.3510% |
+| 2026-08-08 00:00--12:00 range | +11.5960 | +12.0675 | -0.4715 | 0 / 3 | 2,911.73--3,713.27--4,292.06 | 0.1170% |
+| 2026-08-10 00:00--18:00 mixed | -43.4519 | -36.8376 | -6.6143 | 8 / 6 | 1,800.47--3,049.08--4,306.14 | 1.4112% |
+
+Total excess improves from -9.3728 to -4.8687 JPY. The decline and rise controls
+both move above hold, while the mixed and range controls remain below hold; this
+is an estimator correction, not evidence that directional inventory timing is
+now universally profitable. A second tested mapping based on predictable
+second-moment share was rejected: pulling the target too strongly toward 50%
+caused five BUYs during the decline and worsened that interval to -0.9884 JPY
+excess. It is not present in production code.
+
+#### Terminal-liquidatable SELL correction
+
+One-sided SELL value previously used
+
+    log(Psell_t / Ask_[t+H]) - feeSell,
+
+which silently inserted a future repurchase that did not occur and omitted the
+economic distinction between terminal wealth and a completed cycle. All
+one-sided terminal-wealth paths now value the unfilled counterfactual base at
+the executable terminal bid:
+
+    BUY:  log(Bid_[t+H] / Pbuy_t)  - feeBuy,
+    SELL: log(Psell_t / Bid_[t+H]) - feeSell.
+
+This convention is shared by the joint path optimizer, conditional inward-price
+optimizer, and post-fill opposite-side repricer. The previous fill in the
+post-fill controller is sunk and common to its candidates, so only the newly
+evaluated fill cost is charged. A terminal ask may be used only by a separately
+explicit `SELL -> future BUY` cycle, in which case the future BUY fee must also
+be charged. A path where both maker quotes actually touch continues to use its
+observed quote-to-quote cycle and both fill costs.
+
+A wide-spread regression fixes terminal bid and changes an unexecuted terminal
+ask from 99.01 to 150; one-sided SELL value is invariant. Exact next-BBO replay
+of the four fixed ETHJPY regimes is unchanged after this correction: decline
+`+1.2891`, rise `+0.9280`, range `-0.4715`, and mixed `-6.6143` JPY excess over
+hold, with the same fills and maximum drawdowns. The corrected quantity/value
+semantics therefore did not cross a discrete quote-selection boundary on these
+four paths, but removes spread-dependent bias from future decisions.
 
 This design follows the action-value/inventory-control formulation in Gueant,
 Lehalle, and Fernandez-Tapia, *Dealing with the Inventory Risk* (2011), the
@@ -4559,3 +4756,1355 @@ Primary references:
 - https://www.nber.org/papers/w15205
 - https://arxiv.org/abs/2101.03086
 - https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2310645
+
+#### Fast-horizon expected-wait active execution
+
+The retired Macro active-execution path used a Poisson upper arrival rate and
+a long-horizon directional forecast. It cannot be reused after Macro inventory
+ownership has moved into Fast: doing so would give a second controller the
+right to change both target and execution. The replacement is a Fast-native
+actuator under `marketMaker.fastTargetExecution`. It consumes the already
+selected 10/15/30-minute horizon, its empirical completed-window maker-touch
+posterior, the posterior-predictive terminal inventory return, and the current
+Fast target gap. It has no fitted BPS trigger and makes no Poisson-arrival
+assumption.
+
+For direction `D=+1` (BUY) or `D=-1` (SELL), let the executable terminal return
+on the selected Fast horizon be
+
+    X_D = D R_H ~ N(D mu_H, sigmaPred_H^2).
+
+The cost of waiting is not the signed mean alone. A BUY loses opportunity when
+the price rises before the maker bid fills; a SELL loses opportunity when the
+price falls before the maker ask fills. The posterior expected adverse move is
+therefore the Gaussian positive-part expectation
+
+    A_D = E[(X_D)^+]
+        = sigmaPred_H phi(z_D) + D mu_H Phi(z_D),
+    z_D = D mu_H / sigmaPred_H.
+
+The empirical touch posterior supplies `pTouch` and standard error `seTouch`.
+Using its one-sided upper bound deliberately favors waiting:
+
+    pTouch^U = min(1, pTouch + zRisk seTouch),
+    pMiss^L  = 1 - pTouch^U,
+    Lwait    = pMiss^L A_D.
+
+The maker alternative is a Bernoulli maker-or-hold policy, so its price benefit
+and maker fee exist only on the empirical touch branch. With conservative
+upper touch bound `pTouch^U`, raw passive distance `dside`, maker fee `fm`, and
+taker fee `ft`, the active-execution cost is
+
+    Cside = pTouch^U dside + ft - pTouch^U fm.
+
+If the joint terminal-wealth optimizer authoritatively rejects a SELL maker and
+the independent executable bid/ask downside e-process is active, the
+counterfactual is explicitly hold to `H`: `pTouch^U=0`, `Cside=ft`, and the full
+adverse SELL markout enters waiting loss. Without that time-uniform evidence,
+the maker rejection remains a no-order decision; this prevents noisy
+overlapping posterior means from manufacturing a taker exit. BUY uses the
+reciprocal executable BBO `(1/Ask, 1/Bid)`, under which an original ask rise is
+the identical e-process drawdown. A maker-rejected BUY additionally requires
+that upside alarm, no simultaneous downside alarm, and positive portfolio
+certainty equivalent after the taker fee and incremental inventory variance:
+
+    CEbuy_bps = mu_H - ft - gamma N sigmaPred_H^2 / (2 W 10^4) > 0,
+
+where `N` is IOC notional and `W` is current pair equity. This makes the BUY
+fallback mathematically symmetric in passage evidence while retaining its
+asymmetric inventory consequence: SELL removes existing long exposure, whereas
+BUY must pay for newly created risk. A valid BUY maker continues to use the
+symmetric probability-weighted formula.
+
+An IOC is admissible only when `Lwait > Cside`. Its tranche remains part of the
+same Fast target rather than a second inventory policy:
+
+    fUrgent = pMiss^L min(1, (Lwait-Cside)/Lwait),
+    qIOC = min(|qTarget-qNow| fUrgent, opposite L1 depth, free balance).
+
+The residual target gap stays with the normal Fast maker quote. The surplus
+`Lwait-Cside` also bounds the IOC worst price. Live execution validates tick,
+quantity, notional, balance and worst price before cancelling the old quote
+window; cancellation releases locked funds and prevents self-trading. The IOC
+is submitted as a marketable limit, and the next BBO reconstructs both residual
+maker sides through the ordinary Fast price/quantity/risk pipeline. After an
+IOC, a new active tranche is forbidden until that decision's reference horizon
+has matured, so five-minute refreshes cannot treat overlapping 10/15/30-minute
+posteriors as independent evidence.
+
+Maker quote lifetime is exactly the reference horizon that priced the order.
+The first-passage characteristic time remains diagnostic and no longer rounds a
+10-minute posterior into a 15/30-minute lease. All selectable windows are
+recomputed on one fixed five-minute clock. Raw BBO/QV observations continue to
+accumulate between ticks, but their decision snapshot is published only at the
+next five-minute boundary. A newer snapshot is observable but cannot cancel an
+order born under an unresolved older window. Crossed or
+missing-side safety transitions and confirmed-fill rebalancing remain
+immediately actionable.
+
+Persistent slow-decline evidence is supplied by the executable-price QV-time
+e-process. Bid and ask must agree, the predeclared 10/15/30-minute alternatives
+are mixed rather than maximized, and jumps raise QV instead of being counted as
+persistent drift. Once the time-uniform alarm is active, its half-normal
+posterior maps the executable-bid QV rate to a SELL adverse-markout forecast at
+the selected Fast horizon. The reciprocal process maps executable-ask QV to the
+corresponding BUY opportunity-cost forecast. These inputs can only raise the
+waiting loss of an already existing same-side Fast target gap; neither creates
+a target nor changes ordinary maker quantity. Checkpoint restore rebuilds both
+states from bounded BBO history, so no pretrained artifact is required.
+
+Implementation validation caught two unsafe interactions before deployment.
+Applying maker-rejection fallback symmetrically produced nine taker BUYs in the
+fixed `2026-08-05T15:00:00Z--21:00:00Z` rise window; that ungated BUY fallback
+was therefore removed. Its replacement requires independent reciprocal-BBO
+upside evidence, downside non-conflict, and the positive portfolio CE above.
+Replaying the same rise after this replacement produced zero IOC attempts,
+zero fills, and `68.7376 JPY`, exactly equal to the same-inventory hold path;
+the earlier nine-taker-BUY failure did not recur. Synthetic unit paths verify
+that persistent ask-side upside with positive CE can still trigger, so this is
+an evidence rejection rather than a hard-disabled BUY implementation.
+
+Final-code zero-queue replay of all four canonical UTC regimes used
+`6830.672313565 JPY` pair equity and `0.01024405 ETH` initial inventory:
+
+| regime | strategy / hold PnL (JPY) | excess | completed BUY / SELL | execution events | Fast IOC | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| decline, 2026-08-03 00:00--08:00Z | -80.0265 / -80.0265 | 0.0000 | 0 / 0 | 0 | 0 | 1.3274% |
+| rise, 2026-08-05 15:00--21:00Z | +68.7376 / +68.7376 | 0.0000 | 0 / 0 | 0 | 0 | 0.2954% |
+| range, 2026-08-04 12:00--2026-08-05 00:00Z | -0.3217 / +0.7683 | -1.0900 | 1 / 0 | 2 | 0 | 0.5608% |
+| mixed, 2026-08-10 00:00--18:00Z | -11.6427 / -36.8376 | +25.1949 | 0 / 2 | 4 | 1 SELL | 0.6723% |
+
+No BUY IOC triggered in any canonical regime, so the safe reciprocal-upside
+addition is behaviorally dormant on these paths. Decline and rise match hold;
+they do not demonstrate active hedge or upside capture. Mixed passes the point
+estimate through SELL inventory reduction. Range fails because one ordinary
+maker BUY was partially executed in two events and never completed a SELL
+cycle; this is a maker BUY admission/terminal-cycle problem, not a failure of
+the new BUY IOC CE gate. The strategy therefore still fails the all-regime
+promotion criterion.
+
+Allowing maker-rejected SELL from the Fast posterior alone produced
+seven decline-window IOC fills and `-86.2608 JPY` versus `-80.0265 JPY` hold;
+adding a same-reference-horizon IOC lease reduced this to five fills and
+`-84.5530 JPY`, but still failed. Requiring the independent e-process removed
+those IOC fills. The exact-reference-window maker lifecycle nevertheless
+allowed one ordinary maker BUY in that historical decline and finished
+`-101.2819 JPY`, so this change set is not a regime-robust promotion claim and
+was not used to restart the live service. The result isolates the remaining
+problem to BUY admission/quote replacement under the shorter exact lease,
+rather than weakening the SELL evidence gate to fit the target day.
+
+Production replay follows the same causal ordering: a decision at `BBO[t]` may
+execute only against `BBO[t+1]`, using that next book's price and L1 depth. IOC
+fills are included in BUY/SELL counts, round trips, fees, inventory, equity and
+drawdown. Unit tests cover symmetric BUY/SELL action, empirical-probability
+uncertainty, direction disagreement, update deduplication, L1 caps, escaped
+limits and exchange minimums. Small live orders make partial-fill state
+unnecessary here; a depth-capped IOC is conservatively represented as zero or
+one next-BBO tranche.
+
+The four fixed ETHJPY replays provide an important negative result rather than
+a claimed improvement:
+
+| interval UTC | PnL before / after | BUY / SELL | Fast IOC attempts / fills | max DD |
+| --- | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | -78.7374 / -78.7374 | 1 / 1 | 0 / 0 | 1.2999% |
+| 2026-08-05 15:00--21:00 rise | +69.6656 / +69.6656 | 5 / 7 | 0 / 0 | 0.3510% |
+| 2026-08-08 00:00--12:00 range | +11.5960 / +11.5960 | 0 / 3 | 0 / 0 | 0.1170% |
+| 2026-08-10 00:00--18:00 mixed | -43.4519 / -43.4519 | 8 / 6 | 0 / 0 | 1.4112% |
+
+On these samples, the conservative expected wait loss never exceeded the
+roughly 15 bps best observed maker-to-touch cost, so forcing an IOC would have
+required either a manual threshold subsidy or the retired long-horizon Macro
+drift. Neither is accepted. The actuator is enabled and observable, but it
+will act only when a future same-horizon Fast distribution economically
+justifies taking liquidity. BBO-state ML tagging and calibration-score
+weighting remain a separate prequential research task; they are not silently
+mixed into this execution rule.
+
+#### Causal BBO-state filtering and Fast switching cost (2026-08-14)
+
+The BBO state is now an input to the existing endogenous Fast drift model,
+not another independent price or quantity controller. For active horizon
+`H`, executable ask/bid paths produce normalized path-location and short
+reversal tags:
+
+    zPath = tanh((sellRunup - buyDrawdown) / (spread + QV)),
+    zRev  = tanh((buyRebound30s - sellReversal30s)
+                 / (spread + QV sqrt(min(1, 30s/H)))),
+    zBBO  = (zPath + zRev) / 2.
+
+Swapping BUY and SELL paths negates `zBBO` exactly. It is bounded to `[-1,1]`
+and sampled at most once per minute per horizon, so an event burst cannot
+manufacture many correlated signals. The first calculation in a minute uses
+the exact side-specific multiscale/noise-robust state; subsequent BBO events
+are O(1) cache reads. Capture gaps invalidate the cache.
+
+`zBBO` joins Fast direction and book imbalance in the same online linear
+forecast of future executable ask and bid log returns. Training labels mature
+only after their 10/15/30-minute horizon, anchors do not overlap, and each
+prediction is recorded before its label enters the fit. The model is applied
+only when its strictly prequential squared-error gain over zero drift is
+positive; the normal approximation to mean gain divided by its standard error
+produces the continuous model strength. Thus BBO tagging, ML filtering, and
+calibration-score weighting are one causal model rather than three multiplied
+heuristics. Checkpoint version 4 intentionally rebuilds older three-feature
+state from bounded startup BBO replay.
+
+Fast target changes also have a same-horizon proportional switching-cost
+optimizer. Let `x0` be the previous intended risky notional, `xc` the new
+posterior candidate, `mu` and `sigma` the executable terminal-return posterior,
+`W` pair equity, `gamma` risk aversion, and `k` one-way execution cost. On the
+segment between `x0` and `xc` it solves the concave problem
+
+    max_x  x mu - gamma x^2 sigma^2 / (2 W) - k |x-x0|.
+
+The closed-form stationary point is clipped to that segment, permitting a
+partial Garleanu--Pedersen-style adjustment; it does not add a fixed BPS
+hysteresis or a second Macro target. Maker fee plus modeled adverse selection
+defines `k`.
+
+The current four-regime ablation (JST intervals, zero queue multiplier) was:
+
+| interval | neither feature PnL / ML-only PnL / ML+switch PnL (JPY) | neither / ML+switch max DD | switch decisions |
+| --- | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | +34.4566 / +36.0100 / +32.6064 | 0.6062% / 0.4268% | 0 change, 29 retain |
+| 2026-08-05 15:00--21:00 rise | -8.9405 / -8.9405 / -9.1343 | 0.2575% / 0.2783% | 0 change, 15 retain |
+| 2026-08-08 00:00--12:00 range | -6.0754 / -5.9823 / -3.7438 | 0.4592% / 0.4509% | 0 change, 43 retain |
+| 2026-08-10 00:00--18:00 mixed | +18.9173 / +18.9173 / +26.0563 | 0.5791% / 0.8013% | 0 change, 57 retain |
+
+The prequential ML feature did not regress any of these four segments and is
+enabled. Target switching improved mean PnL but worsened the worst observed
+drawdown and slightly worsened the rise segment; it therefore remains
+`shadowOnly: true` pending a larger chronological confidence interval. This is
+an explicit promotion gate, not a hidden manual weight.
+
+#### Fast-native fee-value admission (2026-08-14)
+
+The probability-only bilateral minimum used to reintroduce a venue-minimum
+order after the terminal-path optimizer rejected every candidate. Minimum-cell
+candidates also bypassed the robust value test applied to larger quantities,
+and SELL used an optimistic upper utility bound. These paths generated market
+sampling, not demonstrably fee-positive execution, and explained most of the
+four-regime deficit versus holding the same initial ETH/JPY inventory.
+
+Low-value admission now belongs to the Fast feasible set itself. For a joint
+or one-sided candidate, `X` is incremental terminal liquidatable wealth versus
+placing no new order. It already contains maker fees, modeled adverse
+selection, executable terminal markout, and the whole-position variance change:
+
+    mu = E[Delta W] - gamma Delta Var(W) / (2 pairEquity).
+
+With the local normal posterior `X ~ N(mu, sigma^2)`, Fast computes posterior
+downside regret and net decision value
+
+    Lminus = E[(-X)^+]
+           = sigma phi(mu/sigma) - mu Phi(-mu/sigma),
+    Vfast  = mu - Lminus.
+
+Only `Vfast > 0` enters the distance/quantity optimizer. This is not a fitted
+BPS gate: uncertainty raises the hurdle in JPY automatically, while additional
+samples lower it. A joint cycle with positive value preserves both sides. If
+the joint candidate fails, BUY and SELL are tested independently. Inventory
+risk reduction remains admissible because a negative marginal variance gives a
+positive contribution to `mu`; target deficit/excess no longer grants a second
+exception after that covariance benefit has already been counted.
+
+A completed-path rejection is an explicit Fast no-order action. It cannot fall
+back to probability-only quantity, cannot trigger Fast target IOC, and cancels
+old maker orders rather than preserving them for lack of a replacement. The
+live no-order decision is leased until the next horizon-model update to avoid a
+cancel/retry loop. Missing path evidence still fails open to the original Fast
+crossing model; this distinction prevents startup data scarcity from being
+mistaken for evidence of negative value.
+
+Zero-queue four-regime replay against the same-inventory hold benchmark:
+
+| JST interval | old strategy / value-filter / hold PnL (JPY) | old / new fills | new excess vs hold | old / new max DD |
+| --- | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 | +36.0100 / +37.6431 / +38.6815 | 12 / 2 | -1.0385 | 0.5494% / 0.4347% |
+| 2026-08-05 15:00--21:00 | -8.9405 / -7.7855 / -7.7855 | 6 / 0 | 0 | 0.2575% / 0.2480% |
+| 2026-08-08 00:00--12:00 | -5.9823 / -3.2576 / -3.2576 | 4 / 0 | 0 | 0.4592% / 0.4509% |
+| 2026-08-10 00:00--18:00 | +18.9173 / +24.8823 / +20.3140 | 14 / 4 | +4.5683 | 0.5791% / 0.8316% |
+
+Across the four disjoint samples, fills fall from 36 to 6 and aggregate excess
+versus hold changes from `-7.9478` to `+3.5298 JPY`, an `+11.4776 JPY`
+improvement. This supports removal of low-value fills, but it is not a tail-risk
+claim: the mixed interval's maximum drawdown rose above both the previous
+strategy and hold. Promotion therefore requires continued live observation and
+a larger chronological paired confidence interval.
+
+#### Economically identifiable Fast value and live-version comparison (2026-08-14)
+
+Maximizing `Vfast` over the distance/quantity ladder can still select a tiny
+positive value created by estimation noise. This is an optimizer-winner problem,
+not evidence that joint BUY/SELL utility is invalid: requiring both sides to be
+profitable in isolation removed the profitable mixed-regime gamma cycle and was
+rejected in ablation.
+
+Fast now applies an economic-identifiability floor derived only from the venue
+lattice, fee, and existing model time scales. If `m` is the minimum executable
+notional, `f_m` the one-way maker fee, `H` the selected Fast horizon, and `L` the
+crossing lookback, a candidate must satisfy
+
+    Vfast > Vid(H),
+    Vid(H) = m f_m min(1, H/L).
+
+Equivalently, if the decision were renewed once per independent horizon, its
+modeled contribution over the evidence lookback must exceed one maker fee on
+one minimum executable order. This is not a fitted BPS hurdle and does not
+double-charge the candidate fee already present in terminal wealth. It defines
+the smallest economically identifiable effect and suppresses repeated
+winner's-curse churn. Candidate ranking uses `(Vfast - Vid)/H`.
+
+The replay ledger also records every partial maker execution immediately.
+`fullFills`, `buyFills`, and `sellFills` retain completed-order semantics for
+queue calibration, while `fillEvents` now has the same per-execution granularity
+as Binance private trades. A partial execution followed by next-BBO cancellation
+can no longer change replay inventory and fees while disappearing from the
+reported trade list.
+
+The following zero-queue table used wall-clock timestamps interpreted as JST.
+It is retained only as an audit record and **must not be used as a regime
+acceptance result**: the canonical regression intervals had originally been
+defined in UTC, so this replay shifted every market path forward by nine hours.
+
+| interval | running-era strategy / identifiable-value / hold PnL (JPY) | new excess | completed orders / execution events | new max DD |
+| --- | ---: | ---: | ---: | ---: |
+| 2026-08-03 00:00--08:00 decline | +36.0100 / +38.6815 / +38.6815 | 0 | 0 / 0 | 0.4780% |
+| 2026-08-05 15:00--21:00 rise | -8.9405 / -7.7855 / -7.7855 | 0 | 0 / 0 | 0.2480% |
+| 2026-08-08 00:00--12:00 range | -5.9823 / -3.2576 / -3.2576 | 0 | 0 / 0 | 0.4509% |
+| 2026-08-10 00:00--18:00 mixed | +18.9173 / +31.0107 / +20.3140 | +10.6968 | 2 / 5 | 0.8486% |
+
+Consequently, the former claims that the observed regime floor was
+non-negative and that decline/rise/range matched hold are retracted. In
+particular, the row labelled rise actually had a negative market return and the
+row labelled decline had a positive market return. Strategy PnL must never be
+used to define the market regime being tested.
+
+#### Regime timestamp and economic-scale audit (2026-08-14)
+
+Regimes are now classified from the market path independently of strategy
+orders and PnL, and all canonical timestamps carry an explicit `Z` suffix. The
+old 2026-08-08 00:00--12:00 UTC “range” is also retired: as documented in the
+fee-scale pivot audit above, it completed no cycle at the 26 bps economic
+threshold. The replacement range was selected without reference to strategy
+PnL, using one-minute BBO mids and requiring at least two directional-change
+legs in each direction at
+
+    economicPivotBps = 2 (makerFeeBps + adverseSelectionBps)
+                       + minimumNetEdgeBps = 26 bps.
+
+The selector now reports the economic up/down legs and completed cycles and
+rejects visually noisy but sub-fee oscillation. Unit tests cover both a genuine
+oscillation and a sub-fee false range.
+
+| canonical interval (UTC) | independent market-path evidence | strategy / hold PnL (JPY) | excess | executions | acceptance |
+| --- | --- | ---: | ---: | ---: | --- |
+| decline, 2026-08-03 00:00--08:00Z | net -260.98 bps; max excursion 0; min -281.10 bps | -80.0265 / -80.0265 | 0 | 0 BUY / 0 SELL | **fail:** no downside hedge |
+| rise, 2026-08-05 15:00--21:00Z | net +228.32 bps; min -4.91; max +271.57 bps | +67.3244 / +68.7376 | -1.4132 | 0 BUY / 1 SELL | **fail:** sold too early |
+| range, 2026-08-04 12:00--2026-08-05 00:00Z | net +4.92 bps; 135.00 bps span; 9 up + 9 down economic legs; 9 cycles | +0.4522 / +0.7683 | -0.3161 | 1 BUY / 0 SELL | **fail:** no gamma round trip |
+| mixed, 2026-08-10 00:00--18:00Z | start-relative max +143.31 bps, min -140.28 bps, end -112.64 bps | -22.4127 / -36.8376 | +14.4249 | 1 BUY / 1 SELL | point-estimate pass only; no CI claim |
+
+The range selector's sampled opening point gives `+4.92 bps`; the production
+replay's exact boundary observations give `+7.30 bps`. Both are economically
+flat relative to 26 bps, and the nine completed cost-scale cycles make the
+range label robust to that boundary difference.
+
+This audit changes the engineering conclusion materially. The identifiable
+value floor reduces low-value turnover and helps the mixed path, but the
+current model is **not regime robust**: it fails the downside-hedge requirement,
+sells inventory during a qualified rise, and does not monetize a qualified
+range. Aggregate PnL across mislabeled windows is no longer an acceptable
+promotion criterion. Future changes must first pass these fixed UTC intervals,
+with market-path qualification stored alongside each replay artifact.
+
+For the actual userspace process started at `2026-08-13 22:13:16 JST`, the old
+binary executed 12 private trade records (6 BUY, 6 SELL), bought `1022.20 JPY`,
+sold `511.68 JPY`, and ended the matched `14:50 JST` comparison about
+`-2.0094 JPY` behind holding its startup inventory. Same-data replay of this
+identifiable-value version submits no fill and exactly matches hold, improving
+paired excess by `2.0094 JPY`. This is a replay comparison, not a claim that
+public BBO/trade data reproduces private queue position.
+
+#### Paired-cycle admission and Fast-target lease correction (2026-08-14)
+
+The preceding value filter treated posterior uncertainty as if every candidate
+were unilateral. This charged the expected negative part after the joint path
+model had already represented BUY-only, SELL-only, both-touch, terminal BBO
+markout, fees, and inventory covariance, and after posterior confidence had
+already reduced quantity. In a qualified oscillation this removed nearly every
+economically useful Fast opportunity.
+
+The unit of inference is now the complete Fast cycle. Let `pB`, `pA`, and `pBA`
+be the same-window BUY-touch, SELL-touch, and both-touch probabilities. The
+joint terminal-path mean and whole-position variance remain authoritative. The
+extra normal-posterior downside regret is charged only for the empirical share
+of unmatched side touches,
+
+    u = 1 - 2 pBA / (pB + pA),
+    Vpair = E[Delta W] - gamma Delta Var(W) / (2 pairEquity)
+            - u E[(-X)+].
+
+Thus `u=0` for a perfectly paired cycle and `u=1` for disjoint/unilateral
+touches. This coefficient is calculated from the joint crossing table; it is
+not a tuned BPS weight. A genuinely unilateral trend candidate continues to
+pay the full downside-regret charge. The economic-identifiability floor is
+applied once to the complete selected reference-window action, rather than
+independently vetoing both legs. Independent time-uniform downside evidence may
+still limit BUY risk because it is a separate QV-time observation, not a second
+copy of the joint path posterior.
+
+After a confirmed fill, the post-fill conditional utility model owns the
+opposite completion leg. Its first fill is sunk, so a later unconditional
+fresh-cycle rejection cannot delete an exchange-feasible minimum completion
+cell. Live and production replay carry the approved completion side through the
+same optimizer input and log `jointQuoteCompletionProtected` when this path is
+used.
+
+Replay diagnosis found a separate lease implementation error. In the decline
+control, the BUY that filled at `07:03:15Z` had been submitted while the Fast
+target was above current inventory. By `07:00:01Z`, the Fast target had crossed
+below current inventory, but refresh compared only the Macro target with its
+quoted value. The now-wrong-side BUY remained protected by its old 15-minute
+reference lease. Live and replay now compare the actual selected Fast target
+with `makerQuotedFastTargetRatio`/`quotedFastTargetRatio`. A correction-side
+sign reversal is an executable risk transition after the ordinary minimum
+anti-churn interval; it cancels/rebuilds the quote without waiting for the old
+reference horizon. Ordinary target drift on the same side still respects the
+lease.
+
+Final next-BBO, zero-queue replay used `6830.672313565 JPY` pair equity,
+`0.01024405 ETH` initial inventory, the fixed UTC regimes, and a 5% early
+drawdown stop:
+
+| regime | strategy / hold PnL (JPY) | excess | completed BUY / SELL | execution events | round trips | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| decline, 2026-08-03 00:00--08:00Z | -80.0265 / -80.0265 | 0.0000 | 0 / 0 | 0 | 0 | 1.3274% |
+| rise, 2026-08-05 15:00--21:00Z | +68.7376 / +68.7376 | 0.0000 | 0 / 0 | 0 | 0 | 0.2954% |
+| range, 2026-08-04 12:00--2026-08-05 00:00Z | +5.0303 / +0.7683 | +4.2620 | 1 / 0 | 1 | 0 | 0.6177% |
+| mixed, 2026-08-10 00:00--18:00Z | -21.5324 / -36.8376 | +15.3052 | 0 / 4 | 6 | 0 | 0.9385% |
+
+Every fixed regime has a non-negative excess point estimate and none stopped
+early. This corrects the former range failure without reintroducing the decline
+BUY or rise SELL. It is not a confidence-interval claim, and it trades away
+part of the previous mixed-only advantage (`+25.1949 JPY` previously versus
+`+15.3052 JPY` now). No completed round trip occurred in these four finite
+windows, so the result demonstrates improved conditional entry/exit valuation,
+not yet statistically established repeated gamma-cycle profitability.
+
+#### Executable Fast target and post-fill value correction (2026-08-14)
+
+Three related state/value mismatches were found after the paired-cycle change.
+
+First, post-fill repricing compared every candidate only with the old opposite
+quote. The old quote's payoff was subtracted path by path, so its modeled value
+was identically zero. This cannot answer the actual control question: after the
+first fill is sunk, is submitting the opposite order better than holding the
+new inventory to the end of the same Fast horizon? Each candidate now estimates
+absolute incremental liquidatable wealth relative to no new order. For a BUY
+completion it uses terminal executable bid wealth; for a SELL completion it
+uses the quote received versus terminal executable bid wealth. The candidate
+is admitted only when
+
+    mean(candidate payoff) - z standardError(candidate payoff) > 0.
+
+The old relative-to-base diagnostics remain observable, but they no longer
+decide whether the base quote itself has value. The approved post-fill state is
+valid for the original Fast horizon instead of only the first replacement BBO.
+Production replay also clears a fill-refresh generation after one complete
+planning call, matching the live rebalance worker even if the model correctly
+chooses no replacement. Previously a no-order replay action left the generation
+pending and recomputed it on every later BBO, including after the horizon.
+
+Second, `CurrentInventoryBase` was passed into Fast target switching but was
+not used. The old impulse cost was charged between the previous unfilled target
+and the new target, although changing an unfilled intention creates no exchange
+fee. The controller now solves the piecewise-concave problem
+
+    max over x in [previous target, posterior target]
+        { mu x - gamma sigma_H^2 x^2 / (2 pairEquity)
+          - executionCost |x - current inventory| }.
+
+Endpoints, the current-inventory kink, and both analytic stationary points are
+evaluated, so target reversal and partial adjustment use actual executable
+turnover without a fitted hysteresis weight.
+
+Third, when the joint maker model chose no order, Fast target IOC required a
+second persistent-upside/downside model to authorize execution. In the fixed
+rise interval, 54 bullish target decisions were rejected by this duplicate gate
+before wait loss, depth, or certainty equivalent was evaluated. The selected
+same-horizon Fast target now remains the single owner. Persistent QV evidence
+may enlarge its adverse-move estimate, but cannot veto or manufacture a target.
+For IOC notional `N`, current target-relative inventory deviation `D`, and
+signed inventory change `Delta`, the active decision uses
+
+    DeltaVar = ((D + Delta)^2 - D^2) sigma_H^2,
+    CE_bps = direction * mu_H - takerFee
+             - gamma DeltaVar / (2 pairEquity N) * 10,000.
+
+Thus moving toward the selected target receives the exact variance-reduction
+credit; moving away pays the exact marginal variance cost. IOC still requires
+expected passive/hold wait loss to exceed its probability-weighted execution
+cost, uses next-BBO execution in replay, is capped by visible L1 depth and
+balances, and cannot repeat until its reference horizon resolves.
+
+Two tempting relaxations were rejected before promotion. A crossing-only
+fallback restored turnover but produced wrong-way BUYs in decline, SELLs in
+rise, and negative range excess. Removing all paired posterior downside regret
+also added an adverse decline BUY and reduced both range and mixed PnL. Neither
+candidate remains in production code.
+
+With target switching live and the unified Fast IOC, the same fixed-regime
+next-BBO/zero-queue replay gives:
+
+| regime | strategy / hold PnL (JPY) | excess | Fast IOC fills | max DD |
+| --- | ---: | ---: | ---: | ---: |
+| decline, 2026-08-03 00:00--08:00Z | -77.0617 / -80.0265 | +2.9648 | 2 | 1.2679% |
+| rise, 2026-08-05 15:00--21:00Z | +75.0947 / +68.7376 | +6.3572 | 3 | 0.4425% |
+| range, 2026-08-04 12:00--2026-08-05 00:00Z | +4.8049 / +0.6146 | +4.1902 | 0 | 0.6177% |
+| mixed, 2026-08-10 00:00--18:00Z | -13.7263 / -36.8376 | +23.1113 | 1 | 0.8393% |
+
+All four excess point estimates are positive. This is a causal engineering
+acceptance result, not yet a lower-confidence-bound claim: the selected finite
+windows and sparse number of independent IOC decisions do not establish that
+future regime excess is positive with statistical significance.
+
+An additional sizing audit found that the selected target gap was multiplied
+by `(waitLoss - executionCost) / waitLoss` after target switching had already
+solved the proportional-cost impulse problem. That charged cost twice. When a
+maker alternative exists, the miss-probability/edge fraction remains necessary
+because IOC competes with a possible passive fill. When maker is authoritatively
+rejected, the counterfactual is hold and the selected target is already
+cost-optimal; the strategy now executes that full gap once, still capped by L1
+depth, balances, target-relative CE, and the unresolved-reference-horizon
+cooldown. This raised rise excess from `+1.2795` to `+6.3572 JPY` and decline
+excess from `+2.6650` to `+2.9648 JPY`, while range and mixed were unchanged.
+
+The replay result now reports `holdPnLJPY` at the exact terminal BBO used by
+`netPnLJPY`. Deriving hold from the last minute-sampled equity-curve point can
+compare two different timestamps; this previously overstated range hold PnL as
+`+0.7683 JPY` instead of `+0.6146 JPY` and can create non-zero apparent excess
+even with no executions.
+
+As a guard against selecting only those four intervals, three additional
+chronological 12-hour slices that were not used to derive this change were
+replayed with the same account and execution assumptions:
+
+| holdout interval (UTC) | strategy / hold PnL (JPY) | excess | execution events | Fast IOC fills |
+| --- | ---: | ---: | ---: | ---: |
+| 2026-08-06 00:00--12:00Z | +3.7903 / +3.7903 | 0.0000 | 0 | 0 |
+| 2026-08-08 00:00--12:00Z | +12.0675 / +12.0675 | 0.0000 | 0 | 0 |
+| 2026-08-12 00:00--12:00Z | +54.2750 / +48.9870 | +5.2879 | 1 | 0 |
+
+No holdout has negative point-estimate excess, but two have no execution event;
+they primarily verify that the new active path does not manufacture turnover.
+They are not sufficient for a Sharpe, t-statistic, or positive lower confidence
+bound. More independent live/chronological target decisions are required.
+
+#### Multi-day validation and rejected short-trade filters (2026-08-14)
+
+The full-gap IOC correction was also replayed continuously rather than only on
+the four canonical slices. On 2026-07-29--2026-07-31 UTC (72 hours), fractional
+IOC sizing produced `-183.7545 JPY` strategy PnL versus `-215.3812 JPY` hold,
+or `+31.6266 JPY` excess, with 12 execution events, four Fast fills, and
+3.1905% maximum drawdown. Executing the already cost-optimal full target gap
+produced `-178.4072 JPY`, or `+36.9739 JPY` excess, with 14 events, three Fast
+fills, and 3.1018% maximum drawdown. The improvement was `+5.3473 JPY` and did
+not increase drawdown.
+
+The independent 2026-08-11--2026-08-13 UTC replay remained a negative paired
+control: both fractional and full-gap variants produced `+23.1364 JPY` versus
+`+24.9852 JPY` hold (`-1.8488 JPY` excess), nine maker executions, and no Fast
+IOC. Attribution showed that this is a maker-admission/lifetime observation,
+not a full-gap IOC regression. In particular, a 2026-08-11 BUY had negative
+fee-adjusted 10-, 30-, and 180-minute markouts, while other fills in the same
+continuous sample had mixed signs.
+
+Three causal filters were tested and rejected rather than promoted:
+
+1. Requiring a negative standalone side rescued by positive joint value to pay
+   an additional minimum-order maker-fee unit removed the bad BUY, but also
+   deleted every canonical range execution. Range excess fell from
+   `+4.1902 JPY` to zero and mixed excess fell from `+23.1113 JPY` to
+   `+15.0114 JPY`. This fee had already been represented in joint terminal
+   wealth and was therefore a second charge.
+2. Restricting that extra floor to the side opposite the instantaneous Fast
+   direction did not solve the problem. A profitable range BUY was admitted at
+   direction `+0.000295`; treating every non-zero posterior mean as a sign is
+   numerically equivalent to fitting noise.
+3. Replacing the raw sign with a Beta-posterior credible direction made the
+   lifecycle statistically interpretable, but making that state a hard quote
+   transition reduced the canonical rise from three Fast IOC BUYs and positive
+   excess to two BUYs and `-1.7595 JPY` excess. Direction updates therefore may
+   inform the next reference-window decision, but must not independently break
+   the current first-passage lease.
+
+The production decision remains the complete-cycle model: joint touch paths,
+fees, terminal executable BBO wealth, inventory covariance, and unmatched-touch
+regret are evaluated once in the Fast objective. A short-horizon standalone
+filter must not veto that result a second time. The adverse 2026-08-11 BUY is a
+documented residual model risk; current causal state could not separate it from
+the profitable range BUY without harming predeclared rise/range controls, so it
+is not hidden with an ex-post threshold.
+
+#### Placement-time attribution and rejected state-conditioned filters (2026-08-14)
+
+Replay fills now retain an immutable `quoteOrigin` snapshot from the actual
+maker submission. It includes the selected Fast horizon, BBO, book imbalance,
+Fast direction/evidence, short returns, drawdown/rebound, public trade/OFI
+features, current and target inventory, target-return posterior, touch
+probabilities, joint path value, and standalone side-utility bounds. This makes
+fill analysis strictly causal: a later BBO or model value can no longer be
+accidentally joined to an earlier order and described as its premise. Partial
+fills keep the same origin until the order is replaced.
+
+The attribution isolated two different BUY cases. The canonical range order
+was submitted at `2026-08-04T13:38:11Z`, below its target inventory, with a
+15-minute reference window. The adverse continuous-holdout order was submitted
+at `2026-08-11T14:00:02Z` while the observable Fast evidence was bullish and
+inventory was also below the then-selected target. A later replacement at
+`14:23:02Z` occurred after the path had turned bearish, but removing it with a
+downstream rule does not establish that the first order was causally
+predictable.
+
+Three further model-level corrections were evaluated and rejected:
+
+| candidate | sensitive-window result | fixed-regime or continuous counterexample | decision |
+| --- | --- | --- | --- |
+| condition the global posterior inventory target on the current joint ask/bid BBO kernel | range short excess improved from `-2.3065` to `-2.2321 JPY`; adverse short from `-3.8805` to `-3.4532 JPY` | rise excess became `-1.8968 JPY`; mixed fell to `+3.8407 JPY` | rejected: local execution state took ownership of the medium-horizon IOC target |
+| condition every base maker quote, rather than only inward-concession candidates | adverse short improved to `-3.3679 JPY` | the canonical range BUY disappeared and the short range became hold-equivalent | rejected: selective BBO kernels are too narrow to replace the unconditional first-passage feasible set |
+| after a partial fill, require a replenished same-side quote to pass standalone utility rather than reusing joint-cycle complementarity | adverse short improved to `-3.1614 JPY`, and all four canonical results were unchanged | the independent 2026-08-11--13 continuous excess worsened from `-1.8488` to `-2.9779 JPY` | rejected: it also removes valuable same-side replenishment on other paths |
+
+None of these candidates remains in the production decision. The final audit
+replayed both sensitive windows and matched the accepted baseline exactly in
+order placement time, price, every partial quantity, completed-fill count, and
+PnL. The four canonical results therefore remain `+2.9648`, `+6.3572`,
+`+4.1902`, and `+23.1113 JPY` excess for decline, rise, range, and mixed.
+
+One semantic correction is retained without changing the unconditional live
+numbers. `JointPathPayoffStats` now carries explicit side-neutral
+`InventoryTarget` moments and their own effective sample count. The posterior
+inventory target reads those moments instead of silently borrowing
+`BuyDominant`, whose weights belong to asymmetric quote allocation. Ordinary
+unconditional statistics give both fields identical path weights, so the final
+replay is numerically unchanged; the separation prevents any future
+side-specific execution kernel from biasing the single inventory aim by
+construction. A regression test deliberately gives BUY-dominant and target
+moments opposite signs and verifies that the target follows only the explicit
+side-neutral distribution.
+
+#### Interior target-restoring continuation after a partial fill (2026-08-15)
+
+Live ETHJPY exposed a Bellman-continuation gap after a target-restoring SELL.
+The account moved from an all-base boundary to an interior state with both ETH
+and JPY above the exchange minimum, but inventory remained above the selected
+Fast target.  The terminal-path optimizer authoritatively rejected a fresh
+profitable cycle, while the old continuation fallback required exactly one
+balance-feasible side.  Those two individually reasonable rules composed into
+an absorbing no-order state: every five-minute review set both quote notionals
+to zero even though a SELL would continue reducing target-relative inventory
+risk.
+
+The continuation controller now uses the same scale-free proximal adjustment
+on an interior target error `g = abs(I - I*)` and pair equity `W`:
+
+    q* = g^2 / W = g abs(w - w*).
+
+When both sides are balance-feasible, only the side toward `I*` is retained,
+and only if `q*` reaches that side's exchange minimum.  Thus `q* < q_min` is an
+endogenous no-trade region rather than a fitted inventory threshold.  A larger
+interior error receives exactly one target-restoring continuation action sized
+by `q*`; the opposite risk-increasing side remains rejected.  The existing
+sequential-cycle fee floor, positive opening-side first-passage requirement,
+hard balance/inventory capacities, and one-sided price search remain in force.
+Small-error authoritative no-order decisions and the bearish-posterior BUY
+restraint are unchanged by construction.
+
+The zero-queue, next-BBO replay before live promotion used `6830.672313565
+JPY`, `0.01024405 ETH`, and a 5% early drawdown stop:
+
+| regime | strategy / hold PnL (JPY) | excess | BUY / SELL | max DD |
+| --- | ---: | ---: | ---: | ---: |
+| decline, 2026-08-03 00:00--08:00Z | -75.6685 / -80.0265 | +4.3580 | 0 / 1 | 1.2478% |
+| rise, 2026-08-05 15:00--21:00Z | +68.9984 / +68.7376 | +0.2609 | 1 / 0 | 0.3404% |
+| range, 2026-08-04 12:00--2026-08-05 00:00Z | +0.6146 / +0.6146 | 0.0000 | 0 / 0 | 0.5608% |
+| mixed, 2026-08-10 00:00--18:00Z | -35.2406 / -36.8376 | +1.5970 | 0 / 2 | 1.2060% |
+
+No regime hit the stop.  The interior continuation was selected six times in
+rise and once in mixed without adding a wrong-way fill; mixed improved by about
+`0.4975 JPY` relative to the immediately preceding accepted replay.  The
+available 2026-08-15 partial-day full-base replay selected the new continuation
+three times after its SELL but none filled, so its `-1.4264 JPY` versus
+`-0.2961 JPY` hold result was unchanged by this correction and remains
+attributable to the pre-existing first SELL decision.  The live strategy was
+promoted at 2026-08-15 23:31 JST; its first evaluation selected the interior
+continuation and submitted one risk-reducing SELL rather than returning to the
+previous zero-order state.
+
+#### Joint-horizon lifecycle audit (2026-08-16)
+
+Production replay diagnostics previously wrote the preliminary horizon into a
+`jointQuoteDecision` even when the final joint optimizer selected another
+horizon. The physical quote already used `joint.Crossing.Horizon`; replay now
+reports both `preliminaryHorizon` and the final `horizon`, preventing a valid
+10-minute order from being mislabeled as a 15-minute action.
+
+The low-fill audit separated admission from execution. In the 12-hour range
+window, 17 of 25 evaluations selected no order; the eight admitted BUY quotes
+had only about 1.35%--2.28% estimated touch probability and lived for an
+average 1,764 seconds. Extending their statistical lease therefore did not add
+a fill. The limiting mechanism was low posterior arrival probability plus
+no-order selection, not premature cancellation. Pulling target-restoring
+quotes to the BBO raised touch probability to roughly 79%--84%, but caused
+repeated same-direction fills and worsened mixed PnL; that experiment was
+rejected and is not in production.
+
+One lifecycle defect was retained as a correction. Near-fill renewal formerly
+required both bid and ask to be physically active, although a target-restoring
+Fast action intentionally submits one side and values it against a modeled
+opposite completion price. A one-sided resting order may now retain queue age
+at a review boundary only when (1) it is at least as close to touch as the new
+plan and (2) its resting price together with the new opposite completion
+reference still clears the full two-fee, adverse-selection, and residual-edge
+floor. The opposite reference is never submitted by this check. Focused live
+and replay tests cover this behavior. Canonical replay remained numerically
+unchanged, confirming that the historical low-fill sample contained no
+near-fill expiry that this correction would have rescued.
+
+#### Statistically identified distance concessions (2026-08-16)
+
+The target-restoring continuation path previously searched an inward price
+ladder with terminal CE but bypassed the conditional paired-distance test used
+by the ordinary Fast optimizer. It now compares every nearer BUY or SELL price
+with the original Fast quote on the same matured executable-BBO paths. The
+paired response includes the concession lost on paths where both prices touch
+and the terminal executable-price markout gained or lost on paths that touch
+only the nearer price. A concession is admissible only when
+
+    mean(delta terminal wealth) - z_simultaneous * SE(delta terminal wealth) > 0.
+
+`z_simultaneous` controls the family-wise one-sided error over the complete
+nested price ladder. The same predicate now governs ordinary and
+target-restoring inward candidates. Outward candidates are also required by the
+live ETHJPY profile to show a positive simultaneous paired improvement over the
+ordinary quote; maximizing many noisy point estimates can no longer move a
+quote farther by itself.
+
+Canonical replay found only about 5--8 effective conditional paths and no
+inward candidate with a positive simultaneous lower bound. Candidate grids of
+3, 5, and 13 points produced identical decisions, and expanding the common
+lookback to 12 or 24 hours reduced rather than increased admitted turnover.
+Consequently the accepted implementation fails closed at the existing price on
+these historical states; it does not claim unsupported extra fills. A separate
+experiment that seeded every joint ladder at the 15 bps economic floor raised
+touch probability but caused excess same-direction BUYs in the rise regime and
+changed its excess versus hold from about `+0.0463 JPY` to `-1.8229 JPY`; that
+experiment was removed. The final four-regime PnL and fills remain unchanged,
+while one unsupported outward Mixed candidate is no longer admitted.
+
+#### Fast ownership boundary and downside-cap consolidation (2026-08-16)
+
+An audit of the live quote path found that not every pre/post step can safely
+be deleted merely because the joint optimizer has a terminal-wealth objective.
+The correct boundary is between statistical action selection and physical
+execution feasibility:
+
+| component | disposition | reason |
+| --- | --- | --- |
+| side-specific BUY/SELL QV edge surface | retain as Fast price prior | it defines the candidate surface from executable ask/bid paths, not a second inventory opinion |
+| learned prequential Fast drift | retain once in the reservation center | the terminal path state does not yet contain an equivalent calibrated conditional-mean feature |
+| inventory target, fill probability, covariance, price distance, and quantity | joint Fast objective | these share one target-relative terminal-wealth unit and must be selected together |
+| terminal downside BUY cap | merged into the candidate feasible set | both the full and probability-baseline searches now see the same capped BUY capacity before selecting price/quantity |
+| one-sided admission resize after selection | retired from the production call path | the selected candidate already pays fee, markout, whole-position covariance, downside regret, and target-progress value; resizing it afterward made price and quantity inconsistent |
+| post-fill opposite leg | conditional Fast state, partially integrated | the first fill is sunk and cannot be pooled with unconditional two-leg paths; its completion side is already a candidate input, but the remaining pre-plan transformation should eventually become an explicit Bellman state/action |
+| maker/IOC choice | keep as execution impulse for now | IOC has depth, slippage, and order-type feasibility absent from the passive crossing action; it should be added later as a separate action in the same Bellman objective, not treated as a price skew |
+| balances, hard inventory limits, Binance filters, queue age, cancel/replace | remain outside the model | these define the executable action set and transport lifecycle rather than statistical utility |
+
+The accepted downside rule no longer requires a raw bearish direction flag in
+addition to a bearish executable-inventory return and non-positive marginal
+BUY terminal wealth. The raw direction was a duplicate observation; the
+terminal distribution and its standard error are the mathematical evidence.
+When identified, the resulting maximum BUY notional is applied before the
+Cartesian horizon/distance/quantity search:
+
+    A_feasible = {a : q_buy(a) <= q_downside, balances and hard bands hold}.
+
+No post-selection controller then changes `q_buy`. Missing dispersion or a
+positive exchange-cell BUY certainty equivalent still fails open, and the cap
+never removes the minimum BUY cell.
+
+An attempted stronger inward-distance rule exposed an important non-composable
+interaction. Replacing the paired lower-bound gate with a soft JPY penalty let
+inventory target-progress value subsidize an unidentified price concession.
+In the fixed Rise replay this selected two bids at the BBO, increased BUY fills
+from two to three (six when reservation preprocessing was also removed), and
+reduced PnL below hold. The experiment was removed. Price concession therefore
+remains an identified feasibility condition
+
+    E[Delta W_execution] - z_sim SE[Delta W_execution] > 0,
+
+after which whole-portfolio terminal wealth chooses price and quantity. This
+separation prevents an optimistic target from paying for unsupported chase
+bps while still keeping the final action inside one Fast optimizer.
+
+Final next-BBO, zero-queue replay used `6830.672313565 JPY`, `0.01024405 ETH`,
+and a 5% early drawdown stop:
+
+| regime | strategy / hold PnL (JPY) | excess | BUY / SELL | max DD |
+| --- | ---: | ---: | ---: | ---: |
+| decline, 2026-08-03 00:00--08:00Z | -75.6685 / -80.0265 | +4.3580 | 0 / 1 | 1.2478% |
+| rise, 2026-08-05 15:00--21:00Z | +68.7839 / +68.7376 | +0.0463 | 2 / 0 | 0.3178% |
+| range, 2026-08-08 00:00--12:00Z | +12.0675 / +12.0675 | 0.0000 | 0 / 0 | 0.1209% |
+| mixed, 2026-08-10 00:00--18:00Z | -38.4092 / -36.8376 | -1.5716 | 1 / 1 | 1.3119% |
+
+The downside-feasible-set consolidation preserves the accepted decline, rise,
+and range behavior and improves Mixed by about `1.53 JPY` versus the preceding
+`-39.9413 JPY` strategy result, but Mixed still trails hold. It is therefore an
+engineering/model-consistency improvement, not a claim of all-regime
+dominance. The service was not restarted by this change.
+
+#### Single statistical-clock ownership (2026-08-16)
+
+The subsequent window audit found a more fundamental consistency error. The
+preliminary selector computed a complete evidence bundle separately at 10, 15,
+and 30 minutes, including executable-side volatility, drift, target, inventory
+variation, path utility, and caps. The joint optimizer then searched those
+horizons again by changing only `Horizon` while reusing the already-computed
+bundle. Live diagnostics showed 30/30 recent evaluations disagreed (29 changed
+30m to 10m); the range replay disagreed in 7/8 accepted decisions. A decision
+labelled 10m was therefore often priced and sized with 30m inputs.
+
+Production and replay now use one statistical clock:
+
+1. the preliminary Fast selector compares complete per-window bundles and owns
+   the choice of `H`;
+2. adaptive Fast evidence, side volatility, drift, target, feasible caps,
+   crossing probability, price, quantity, and order lease all use that `H`;
+3. the joint stage searches distance and quantity only;
+4. fixed-clock executable downside/upside forecasts are rescaled exactly to
+   the requested `H` (future QV is linear in horizon) without admitting
+   intra-bucket observations; and
+5. replay completion contracts retain their admitted reference horizon for
+   crossing statistics while only their order lease counts down.
+
+`jointHorizonSelection` is consequently disabled in the live ETHJPY profile.
+It must not be re-enabled until the optimizer accepts a complete per-horizon
+input bundle rather than substituting `H` alone.
+
+The corrected next-BBO, zero-queue replay used the same capital and intervals:
+
+| regime | corrected / hold PnL (JPY) | excess | BUY / SELL | max DD | accepted horizon mismatch |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| decline | -75.6685 / -80.0265 | +4.3580 | 0 / 1 | 1.2478% | 0 |
+| rise | +68.7376 / +68.7376 | 0.0000 | 0 / 0 | 0.2954% | 0 |
+| range | +12.0675 / +12.0675 | 0.0000 | 0 / 0 | 0.1209% | 0 |
+| mixed | -38.4986 / -36.8376 | -1.6610 | 1 / 1 | 1.3125% | 0 |
+
+Relative to the inconsistent implementation, decline and range are unchanged,
+rise loses two BUY fills and `0.0463 JPY` of apparent excess, and Mixed loses
+about `0.0894 JPY`. Those small gains depended on cross-window input reuse and
+are not statistically defensible. A future genuine joint-H optimizer must
+recompute every horizon-dependent feature before its result can be compared to
+this causal baseline. This change was tested and backtested but not restarted.
+
+#### Side-specific depth-conditioned terminal payoff (2026-08-16)
+
+The unified Fast terminal-payoff estimator now conditions only its 15m
+BUY-only and SELL-only payoff means on causal top-of-book depth. BUY trains on
+`I=(Q_bid-Q_ask)/(Q_bid+Q_ask)`; SELL trains on `-I`. Both use the existing
+overlap/recency path weights with a unit-ridge online regression. The resulting
+mean correction is multiplied by the empirical probability of that one-sided
+path. It does not independently skew quotes, resize orders, alter crossing
+probabilities, or move the inventory target. Missing depth retains the exact
+unconditional model.
+
+Checkpoint schema version 5 stores depth readiness and imbalance with every
+horizon BBO point. Version 4 checkpoints are intentionally rejected once, so
+startup reconstructs the new sufficient history from the dated BBO archive;
+subsequent starts resume normally from version 5 instead of silently waiting
+for new 15m/30m labels to mature.
+
+The former optimizer floor
+`minNotional * makerFee * min(1, H/lookback)` was removed. Terminal path wealth
+already deducts the actual fee of every realized fill, so amortizing another
+fee across possible decisions double-counted cost. Admission now compares the
+fee-net, posterior-risk terminal certainty equivalent with the zero-order
+action. Paired confidence bounds continue to control candidate search and the
+separate switching-cost model controls cancel/replace churn.
+
+Standalone ETHJPY evidence remains deliberately modest: 15m payoff MAE
+improved by `0.027538 bps` with simultaneous lower bound `+0.009482 bps`, while
+30m did not clear its lower bound. Replaying the component with the corrected
+zero floor changed zero actions at both horizons. The integration therefore
+preserves a statistically supported calibration term without claiming a
+material standalone PnL improvement or applying an arbitrary gain.
+
+#### Bilateral-rejection side fallback (2026-08-17)
+
+Live ETHJPY diagnostics exposed an execution loophole: when the joint
+BUY+SELL candidate had non-positive posterior utility, the quote loop treated
+that paired rejection as an instruction to clear *both* sides. This conflated
+the covariance risk of a simultaneous pair with the safety of each individual
+exchange-minimum action. During the 2026-08-17 pullback/rebound this left the
+strategy with no executable BUY even when the independent side scan had a
+positive fee-net score.
+
+The optimizer now retains the best independent side score and price. After
+post-fill and target-boundary continuations are checked, a bilateral rejection
+may produce one side-safe Fast cell only when all of the following hold:
+
+* the side's independent posterior-risk score is strictly positive;
+* crossing data and the round-trip edge are available at that retained price;
+* the same horizon terminal payoff, posterior downside regret, and target
+  continuation value remain positive; and
+* the venue minimum, Fast budget, balance, and hard inventory cap are all
+  executable.
+
+Only the higher-scoring side is kept, so this repair cannot recreate the
+rejected two-sided covariance exposure. A side with non-positive independent
+utility is still removed, and a fully unsupported state still fails closed.
+The new `jointQuoteFallback*Score` diagnostics make the distinction visible in
+replay and live logs. This is an execution-consistency repair; it does not
+promote the separate early-bump/rebound alpha, which remains shadow-only until
+its conditional terminal payoff clears the prequential promotion test.
+
+The focused ETHJPY replay on the previously declared mixed interval
+(`2026-08-10 00:00--18:00 UTC`) used the same event cache, balances, queue
+multiplier, and production YAML before and after this repair:
+
+| metric | before fallback | after fallback |
+| --- | ---: | ---: |
+| net PnL (JPY) | -38.4986 | -38.3977 |
+| hold PnL (JPY) | -36.8376 | -36.8376 |
+| excess vs hold (JPY) | -1.6610 | -1.5601 |
+| completed fills (BUY / SELL) | 1 / 1 | 1 / 1 |
+| maker fees (JPY) | 0.1112 | 0.1000 |
+| joint evaluations / accepted | 82 / 2 | 82 / 6 |
+| independent side-safe fallbacks | 0 | 5 (BUY 3, SELL 2) |
+
+The fallback reduced the mixed loss by `0.1010 JPY` and increased executable
+quote coverage, but did not create an additional fill and still trails hold.
+Therefore it is an execution repair, not a promoted profitability result. A
+separate recent two-hour replay (`2026-08-16 09:00--11:00 UTC`) had zero fills
+before and after the repair and both paths matched hold; that interval contains
+no evidence on which to tune the rebound alpha. Artifacts are kept locally at
+`/tmp/gammacapture-ethjpy-fallback-mixed-18h.json` and
+`/tmp/gammacapture-ethjpy-fallback-mixed-18h-current.json`.
+
+#### Zero-fill diagnosis and inventory actuation repair (2026-08-17)
+
+The exact two-hour ETHJPY replay (`2026-08-16 09:00--11:00 UTC`) separates the
+zero-fill causes instead of attributing them to order lifetime:
+
+| diagnostic | observed |
+| --- | ---: |
+| BBO events | 10,684 |
+| aggregate trades | 198 |
+| completed maker fills | 0 |
+| quote refreshes | 5 |
+| quote uptime | 52.79% |
+| average quote life | 661 s |
+| mean bid / ask distance | 16.88 / 15.85 bps |
+| BBO midpoint range | 15.22 bps |
+| joint evaluations / accepted | 10 / 0 |
+
+The primary gate was terminal-wealth admission: 5 of 10 evaluations lacked
+the minimum completed crossing sample, and the other 5 had no side with
+positive posterior-risk terminal wealth. The quotes that did remain were
+farther from the market than
+the entire midpoint excursion, so they could not be touched. Quote lifetime
+was therefore not the primary cause. Disabling the joint gate restored 95.69%
+quote uptime but still produced zero fills in this quiet interval; it is not a
+safe fix. Lowering the configured minimum half-spread to 12 bps likewise did
+not produce a fill, so a fixed spread relaxation is not promoted.
+
+There was also an implementation defect: `InventoryActuation` existed and was
+unit-tested, but the production quote path only initialized its neutral value
+and never called it. The repaired path evaluates it with the selected Fast
+window (or the shorter Macro forecast), the executable exchange cell, the
+side-specific arrival rates, and Fast momentum, then feeds its contraction and
+inward strength into both the unified quote and quantity projections. Missing
+arrival evidence remains fail-closed. A bilateral rejection may additionally
+retain a one-sided target-restoring cell when its confidence-adjusted whole-
+position certainty equivalent is positive and variance-reducing; an ordinary
+fee-negative side is still rejected.
+
+The same two-hour replay after the actuation wiring and risk-reducing fallback
+repair remains 0 fills / 52.79% uptime, because that interval has no valid
+arrival posterior at the rejected decisions. The 18-hour mixed replay remains
+2 fills (1 BUY / 1 SELL), net `-38.3977 JPY` versus hold `-36.8376 JPY`.
+This is intentional: the code repair removes a latent inventory-actuation
+bug without claiming that a data-starved interval has a profitable fill. No
+live service was restarted.
+
+The live journal confirms the same failure mode (2026-08-17 14:22:58 JST):
+`activeMakerOrders=0`, `allowBid=false`, `allowAsk=false`, current risky weight
+`0.7156` versus target `0.5000`, and
+`jointQuoteReason="no candidate has positive posterior marginal whole-position
+utility; interior target-restoring proximal control is below executable
+minimum"`. The independent SELL fallback was marked supported, but the
+bilateral decision still did not apply it. The live quote distances at that
+evaluation were 58.60 bps (BUY) and 26.56 bps (SELL-to-current-BID), so the
+empty book was caused by the model decision, not an exchange quantity rejection.
+The collector also reported BBO gaps up to 45 s and aggregate-trade gaps up to
+3m21; these reduce arrival evidence but are not the direct reason for the
+rejected quote. The actuation fields in that log are zero because the running
+binary predates the production wiring above; deployment/restart remains a
+separate explicit action.
+
+#### Two-sided continuity floor and minimum-ticket diagnosis (2026-08-17)
+
+The ETHJPY order database shows that the first unsold asks were not partial
+fills: the recent `SELL` orders were mostly `0.00034 ETH` (about `¥102`) with
+`executed_quantity=0`, then were fully canceled. The one later `SELL` of the
+same size was fully filled. Thus the small ticket reduced queue priority, but
+the immediate cause of the long no-order intervals was the terminal-wealth
+decision setting both projected side quantities to zero.
+
+`jointDistanceQuantity.preserveTwoSidedQuotes` now adds an explicit continuity
+floor. When Fast's base plan permits both sides, the BBO crossing posterior has
+support and a positive fee-net round-trip edge, and raw balances/hard inventory
+headroom can carry both exchange-minimum cells, a terminal-path rejection no
+longer clears the book. The target-restoring side is sized by
+
+\[
+q^*=|I-I^*|\left(\frac{|I-I^*|}{W}-c\right)_+,
+\qquad c=\frac{\text{maker fee}+\text{adverse selection}}{10^4},
+\]
+
+clipped by balance, hard headroom, and the exchange lattice; the opposite side
+remains at its minimum. This floor reports no positive terminal-PnL lower
+bound and does not bypass the downside BUY cap by more than one minimum cell.
+
+On the 6-hour-warm ETHJPY replay (`2026-08-16 15:00--22:20 UTC`), the floor
+changed the accepted/applied joint decisions from `0/0` to `22/22`, raised
+quote uptime from `8.74%` to `99.92%`, and produced 7 synthetic BBO fills
+(`3 BUY / 4 SELL`) instead of 0. Net PnL was `-12.2926 JPY` versus hold
+`-12.8234 JPY`; this is evidence of improved executable continuity, not a
+claim of live profitability because the replay has no private queue/fill
+state. The source changes are tested in
+`TestUnifiedFastQuantityPreservesBoundedTwoSidedQuoteAfterTerminalRejection`.
+
+#### Quote lifecycle action value and Bellman continuation (2026-08-18)
+
+The terminal-payoff audit separates three quantities that must not be reused
+under one name:
+
+    G_cycle = 10,000 log(P_sell / P_buy)
+
+is the pure quote-to-quote gross return and is defined only when both legs
+complete. A one-fill terminal markout is instead
+
+    M_buy  = 10,000 log(Bid_[t+H] / P_buy),
+    M_sell = 10,000 log(P_sell / Bid_[t+H]).
+
+The latter compares one conditional fill with the no-new-order inventory
+counterfactual. It is not a forecast that `P_buy` or `P_sell` will be the
+future market price. Exact multiplicative maker fees are applied separately:
+
+    N_cycle = G_cycle
+              + 10,000[log(1-f_buy) + log(1-f_sell)].
+
+Adverse-selection and minimum-edge amounts remain admission/risk hurdles, not
+gross return. A future ask is used only by an explicitly modeled
+`SELL -> future BUY` cycle; inserting it into one-sided terminal wealth would
+silently charge a hypothetical second leg.
+
+At a window boundary, cancel/requote is now represented by a removable,
+research-only action-value component in
+`pkg/strategy/gammacapture/quote_lifecycle_action_value.go`. For state `s`
+and action `a`:
+
+    Q(a|s) = p_a(m_a - c_a - r_a)
+             + (1-p_a) gamma V_next,a - k_a.
+
+`KEEP` has `k=0` and preserves exchange queue age. `REPLACE` pays only the
+queue-age/opportunity loss `k_replace`; it does not pay a maker fee until a
+fill occurs. `CANCEL` is the explicit no-passive-order action and may carry a
+risk-reduction benefit. `V_next` is conditional on no fill, so the value of a
+later quote window is not counted as an immediate trade return. For the short
+spot windows the research replay uses `gamma=1` (zero short-rate convention),
+not a fitted decay constant.
+
+The evaluator is pure. It is now connected to the existing strategy quote
+review only at an expired, two-sided window boundary, after exchange
+feasibility, inventory hard caps, crossed-quote, adverse-move, fill-rebalance,
+and side-policy checks. `KEEP` only extends the current review lease;
+`REPLACE` enters the existing cancel-then-submit path; `CANCEL` clears the
+passive pair and schedules a bounded retry. The YAML field
+`marketMaker.quoteLifecycleAction.enabled` is absent/false by default, so the
+live strategy remains unchanged. The production replay exposes the explicit
+research override `--enable-quote-lifecycle-action`, and reports the lifecycle
+run separately from the baseline. Focused tests cover gross cycle invariance
+to terminal price, exact fees, executable-bid markout, queue preservation on
+equal values, replacement cost, cancellation under negative value, and
+invalid/non-causal probabilities.
+
+The standalone prequential replay uses only same-symbol public ETHJPY BBO,
+delays labels until the selected window matures, and treats BBO touch as a
+public execution proxy rather than a private fill. On 2026-08-03--08-11 UTC,
+the single-leg screen produced:
+
+| horizon / distance | decisions | KEEP | REPLACE | CANCEL | Bellman minus always-replace | gate |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 15m / 15bps | 1,530 | 0 | 0 | 1,530 | +3.039bps/decision, lower 95% +1.979bps | INCONCLUSIVE_NO_ACTION_DIVERSITY |
+| 15m / 5bps | 1,530 | 1 | 9 | 1,520 | +7.555bps/decision, lower 95% +5.974bps | INCONCLUSIVE_NO_ACTION_DIVERSITY |
+
+This is intentionally not a promotion: the apparent improvement is produced
+by cancelling almost every fee-negative isolated leg, not by demonstrating a
+profitable passive cycle. The result confirms that Bellman continuation must
+be fed the competing two-leg path value (or the post-fill opposite-leg state),
+not a one-sided terminal markout. The live YAML and systemd service were not
+changed by this screening step; the evaluator is now wired into the strategy
+behind the disabled `quoteLifecycleAction` gate and is only exercised in the
+research replay override.
+
+The production replay is still a research comparison: its labels must include
+either a completed quote cycle or an explicit post-fill continuation lease,
+use future executable ask/bid prices for the second leg, and report fills,
+fee-net PnL, turnover, and hold excess before the YAML gate can be enabled.
+
+The next lifecycle revision keeps the Bellman component removable and adds
+four causal pieces without changing the Fast quote model:
+
+1. `QuoteLifecycleHazardModel` is a Beta--Bernoulli, age- and distance-bucketed
+   discrete hazard. BUY labels use the executable ask path and SELL labels use
+   the executable bid path. Each bucket accepts at most one public-BBO exposure
+   per `updateInterval` (default 5m), so continuation snapshots update every
+   five minutes and do not wait for a long terminal label to mature. The
+   multi-review touch probability is `1-(1-h)^n`; it is not converted into a
+   homogeneous Poisson arrival rate.
+2. `EstimateQuoteLifecycleReplacementCostBps` prices replacement as an
+   observable opportunity cost: queue-age exposure, BBO drift, and
+   volatility-scaled latency. It never adds a second maker-fee charge. The
+   dynamic cost is disabled unless the lifecycle research override enables it.
+3. `EvaluateQuoteLifecycleAction` now propagates posterior probability error
+   with a delta-method standard error. A KEEP/REPLACE action must clear the
+   configured lower-confidence margin (`ActionMarginBps`, default zero for
+   compatibility); replay overrides use `z=1.645` and a 0.25bps margin.
+4. `--quote-lifecycle-component-only` runs only the paired legacy and lifecycle
+   arms. `--replay-bbo-interval=1s` or `5s` keeps the last BBO in each fixed
+   bucket, bounding repeated `CrossingDecisionAtSideDistances` work for long
+   studies. An interval is recorded in the JSON report and is an explicit
+   approximation; the default zero interval retains the exact compacted BBO
+   stream.
+
+On the same-symbol 8-hour ETHJPY smoke replay (`2026-08-10 00:00--08:00 UTC`,
+causal 1-hour lookback, 1-second BBO buckets), the new component path observed
+607 hazard exposures and 175 ready paired hazard reviews. The baseline had 15
+synthetic fills and `500.5140 JPY` net; the lifecycle arm had 9 fills and
+`560.3884 JPY` net versus the same `1025.1640 JPY` hold. It selected
+`KEEP=9`, `CANCEL=4`, `REPLACE=0` over 13 expired paired boundaries, with a
+point action increment of `-3.0611bps` per review. This is still a replay
+regression/inconclusive sample (and calibration was not passed), not a live
+promotion: the live YAML remains disabled and the result does not justify
+turning on the lifecycle gate.
+
+An 8-hour same-symbol ETHJPY smoke/replay (`2026-08-10 00:00--08:00 UTC`)
+with a causal 1-hour lookback and the same simulator produced 18 fills / 9
+round trips and `36.0931 JPY` net versus `36.5917 JPY` hold for the existing
+HorizonTouch path. Enabling the Bellman lifecycle through the research-only
+override produced 13 fills / 5 round trips and `34.8147 JPY` net versus the
+same `36.5917 JPY` hold, with 22 evaluated boundaries (`KEEP=16`,
+`REPLACE=6`) and mean incremental action value `+0.5599 bps` versus KEEP.
+The lower realized PnL is a replay regression despite a slightly lower maximum
+drawdown; therefore the lifecycle remains disabled in live YAML and is not
+promoted. The result also demonstrates why action-value uplift alone is not a
+promotion criterion: it must improve realized fee-net cycle PnL and hold
+excess under a sufficiently long, same-symbol holdout.
+
+## Dynamic inventory aim and partial adjustment (2026-08-18)
+
+`DynamicInventoryAim` is an isolated inventory/quantity component based on the
+moving-aim and partial-adjustment structure of Gârleanu--Pedersen. It accepts
+only the same-symbol, executable-BBO inventory-return posterior and the
+current hard inventory interval. It does not own price distance, arrival
+probability, order submission, or lifecycle decisions.
+
+The component solves the bounded one-dimensional approximation
+
+\[
+\max_d\; \mu d-\tfrac12\gamma\sigma^2d^2-c|d|,
+\]
+
+then applies the causal partial-adjustment step
+
+\[
+w_{t+\Delta}=w_t+\kappa(a_t-w_t),\qquad
+\kappa=1-e^{-\Delta/\tau_{execution}}.
+\]
+
+The absolute cost term is the sole fee/adverse-selection gate. Evidence is
+empirical-Bayes shrunk by one prior sample, predictive variance includes
+estimation variance, and the result is projected once into the hard capacity
+interval. When evidence is insufficient or the net return is inside the fee
+no-trade region, the component retains the strategic target rather than
+falling back to the current inventory or deleting one side.
+
+`FastTargetSwitching` is skipped only after `DynamicInventoryAim` has passed
+its evidence and fee gates (and is not shadow-only), so an immature or
+fee-negative dynamic estimate cannot accidentally strand the old target
+switcher. The component is available in live/replay config but remains
+disabled until a same-symbol component replay passes the alpha-screening
+gate. The research override is `--dynamic-inventory-aim`; no live YAML or
+service restart is performed by the screening implementation.
+
+The first paired ETHJPY component replay used the exact same compacted
+market-data stream for both arms. On `2026-08-09 08:00--2026-08-10 00:00 UTC`
+with 16 hours of same-symbol BBO/trade data and queue multiplier zero, both
+arms produced 14 synthetic fills / 4 round trips and `-197.3868 JPY` net
+versus `-302.3545 JPY` hold. The dynamic arm passed its gate zero times
+(`1123` fee-gate rejections and `201` immature-sample rejections), so its
+orders and PnL were exactly identical to baseline; this is an
+`INCONCLUSIVE_NO_ACTION_DIVERSITY` result, not evidence to enable the live
+setting. The replay command is
+`--dynamic-inventory-aim-compare`; it reports gate counts explicitly and
+requires a later untouched holdout with non-zero dynamic actions before
+promotion.
+
+The full 8/17 ETHJPY day was then replayed with the explicit `1m` BBO bucket
+approximation (the raw file contains about 354k BBO rows and makes exact
+per-row path recomputation impractical). The paired results were deterministic
+after sorting replay Fast windows and resolving Volume Profile POC/bin ties:
+
+| arm | fills (BUY/SELL) | round trips | net PnL | hold PnL | max drawdown |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline | 21 (6/15) | 6 | +970.2688 JPY | +1,748.6910 JPY | 0.4638% |
+| dynamic aim | 21 (6/15) | 6 | +970.2688 JPY | +1,748.6910 JPY | 0.4638% |
+
+The dynamic arm evaluated 1,440 target states and passed zero: all were
+`insufficient samples`. The horizon diagnostics show effective path samples
+roughly 3.42 (10m), 2.72 (15m), and 1.82 (30m), below the configured minimum
+of 6. Thus 8/17 supplies many raw observations but not six independent,
+matured overlapping-window path observations; it still cannot test a dynamic
+target action under the then-current fixed gate. This remains an inconclusive
+component replay; the gate interpretation is superseded by the confidence-bound
+revision below, and live YAML is still disabled.
+
+A 30-second bucket sensitivity check reached 2,866 BBO decisions and 13,063
+public trades. Both arms again matched exactly: 29 fills (9 BUY/20 SELL), 9
+round trips, `+1,024.7230 JPY` net versus `+1,749.2650 JPY` hold and `0.5337%`
+maximum drawdown. Dynamic aim passed zero of 2,866 evaluations; effective
+path samples remained only 3.13 (10m), 2.49 (15m), and 1.71 (30m). The
+conclusion was therefore robust to this replay granularity under the old fixed
+gate: the blocker was independent matured path evidence, not simply too few raw
+BBO rows.
+
+### Dynamic inventory aim: replace the fixed six-sample gate (2026-08-18)
+
+The previous conclusion treated `minimumSamples: 6` as a universal economic
+gate. That interpretation is not valid for the weighted joint-path estimator.
+For a horizon \(H\), lookback \(L\), and one-minute causal anchors, the current
+overlap and recency weights imply the approximate information mass
+
+\[
+N_{\rm eff}\simeq {1\over \ln 2}\sqrt{L/H}.
+\]
+
+With \(L=6h\), the ideal upper bounds are about 8.66 (10m), 7.07 (15m), and
+5.00 (30m). Therefore a fixed six-sample gate makes the 30m dynamic target
+unreachable even with complete data. The field remains accepted for old YAML
+and checkpoints, but is no longer used as an economic gate.
+
+The evaluator now requires only \(N_{\rm eff}>1\) for a non-degenerate
+predictive estimate and admits a target shift only when the fee-adjusted
+one-sided predictive bound clears the one-way cost \(c\):
+
+\[
+\begin{aligned}
+\mathrm{BUY/increase}:&\quad
+\tilde\mu-z\,\sigma_{\rm pred}>c,\\
+\mathrm{SELL/decrease}:&\quad
+\tilde\mu+z\,\sigma_{\rm pred}<-c.
+\end{aligned}
+\]
+
+Here \(\tilde\mu\) is the empirical-Bayes-shrunk inventory return and
+\(\sigma_{\rm pred}\) already includes estimation variance. The default is
+the one-sided 95% value \(z=1.645\). This is stricter when 17-August-like
+volatility rises and does not confuse a large raw BBO count with independent
+evidence.
+
+Focused tests cover strong signals below six effective samples, high-volatility
+rejection, BUY/SELL symmetry, fee rejection, and the 30m case. The 8/17 paired
+replay with the new gate had 1,440 target evaluations: 1,379 failed the
+confidence-adjusted fee bound and 61 lacked \(N_{\rm eff}>1\); no dynamic action
+was admitted, so baseline and dynamic PnL remained identical. This is the
+correct `INCONCLUSIVE_NO_ACTION_DIVERSITY` result: the fixed gate was removed,
+but that day's fee-net predictive bounds still did not justify a target move.
+
+#### Online-causality clarification
+
+The value 5.00 above is an analytical upper bound used to expose the old
+configuration mismatch; it is not a runtime gate and is never computed from
+future or full-day data. At decision time the evaluator receives only the
+currently matured same-symbol BBO paths and their current \(N_{\rm eff}(t)\).
+The replay fields `MeanPathEffectiveSamples` are diagnostics only and must not
+be fed back into live decisions. Replacing them with a 24-hour average would
+introduce look-ahead bias.
+
+If an additional stability reference is needed, it must be an online trailing
+EWMA of already observed \(N_{\rm eff}(t-\Delta)\), updated after each matured
+decision. It should inflate the predictive uncertainty when current evidence
+falls below its own recent baseline, rather than create another hard sample
+threshold:
+
+\[
+\bar N_t=\lambda_t\bar N_{t-\Delta}+(1-\lambda_t)N_{\rm eff}(t-\Delta),
+\qquad
+z_t=z_0\max\left(1,\sqrt{\bar N_t/N_{\rm eff}(t)}\right).
+\]
+
+The current implementation already uses the causal \(N_{\rm eff}(t)\) and
+predictive fee bound. An EWMA stability multiplier is a separate alpha and
+must pass its own same-symbol component screening before being integrated.
+
+### Inventory-risk gradient correction (2026-08-18)
+
+The confidence-bound gate was still too restrictive when applied only to the
+directional inventory return \(\tilde\mu_t\). That discards a legitimate risk
+management action whenever the current inventory is far from the policy target
+but the expected directional markout is below one-way fees.
+
+For current inventory \(w_t\), policy target \(p_t\), and
+\(\kappa_t=\gamma\sigma_t^2\), the incremental certainty equivalent for an
+inventory move \(d\) is
+
+\[
+\Delta U_t(d)=g_t d-\tfrac12\kappa_t d^2-c|d|,
+\qquad
+g_t=\tilde\mu_t-\kappa_t(w_t-p_t).
+\]
+
+The predictive gate now tests the risk-adjusted gradient:
+
+\[
+g_t-z\sigma_{\rm pred,t}>c
+\quad\text{or}\quad
+g_t+z\sigma_{\rm pred,t}<-c.
+\]
+
+When it passes, the target move is the soft-threshold solution
+
+\[
+d_t^*=\operatorname{sign}(g_t)
+\frac{\max(|g_t|-c,0)}{\kappa_t},
+\]
+
+projected into the hard inventory interval and then partially adjusted over
+the execution horizon. Thus a large inventory deficit/excess can generate a
+BUY/SELL risk action even when \(|\tilde\mu_t|<c\); the fee is still charged
+once through the L1 switching cost and high volatility still widens the
+predictive bound.
+
+Focused tests now cover de-risking with zero directional return and strong
+inventory evidence below the legacy six-sample threshold. On the 8/17 ETHJPY
+1m-bucket paired component replay (pairEquity=1,000,000 JPY,
+startingBase=0.1, queueMultiplier=0), the corrected arm produced 321
+dynamic target actions instead of zero. The baseline/dynamic arms had 23/23
+fills, with dynamic +5,843.56 JPY versus baseline +2,805.03 JPY and hold
++609.30 JPY; maximum drawdown was 0.4242% versus baseline 0.2468%.
+This is evidence that the old hard directional gate was suppressing inventory
+management, not a promotion result: the replay still needs untouched
+same-symbol blocks and block-bootstrap confidence before any live activation.

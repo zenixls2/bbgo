@@ -89,3 +89,27 @@ func TestDrawdownEProcessGapResetsEvidence(t *testing.T) {
 		t.Fatalf("gap failed to reset sequential evidence: %+v", d)
 	}
 }
+
+func TestDrawdownEProcessSameMinuteDoesNotResetAndForecastsExecutableBid(t *testing.T) {
+	model := NewDrawdownEProcess(DrawdownEProcessConfig{
+		BarrierWidth: .001, ConfidenceZ: .1, MinimumMinutes: 2,
+	})
+	start := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+	model.ObserveMinute(start, 100, 100.1)
+	model.ObserveMinute(start.Add(20*time.Second), 99.9, 100)
+	var d DrawdownEProcessDecision
+	for i := 1; i <= 8; i++ {
+		price := 100 * math.Exp(-float64(i)*.001)
+		d = model.ObserveMinute(start.Add(time.Duration(i)*time.Minute), price, price+.1)
+		if d.Active {
+			break
+		}
+	}
+	if !d.Active {
+		t.Fatalf("same-minute book event reset sequential evidence: %+v", d)
+	}
+	forecast := model.DownsideForecastBps(15 * time.Minute)
+	if !(forecast > 0) || math.IsNaN(forecast) || math.IsInf(forecast, 0) {
+		t.Fatalf("expected finite positive executable-bid forecast, got %.8f", forecast)
+	}
+}

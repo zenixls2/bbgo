@@ -1,6 +1,7 @@
 package gammacapture
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,15 +62,55 @@ func TestLocalCaptureStartupSmoke(t *testing.T) {
 			}
 			strategy.model = NewIntensityModel(config.Intensity)
 			strategy.initializeAdaptiveFastModels()
+			strategy.makerExecutableCrossingModel = NewExecutableCrossingModel(strategy.Symbol, strategy.Barrier, strategy.Intensity)
 
 			started := time.Now()
-			if err := strategy.warmFastEvidenceFromCapture(now); err != nil {
-				t.Fatalf("trade/BBO evidence replay failed: %v", err)
+			if err := strategy.restoreAndWarmMakerModelsFromBinanceCapture(now); err != nil {
+				t.Fatalf("complete startup replay failed: %v", err)
 			}
 			selected := strategy.adaptiveFastSnapshot(now)
-			t.Logf("startup warmup=%s selectedWindow=%s slowHealth=%s fastHealth=%s evidenceHealth=%s",
+			if strategy.State.ModelCheckpoint == nil {
+				t.Fatal("startup replay did not produce an in-memory checkpoint")
+			}
+			beforeBOCPD := strategy.makerBOCPD45.Snapshot()
+			t.Logf("startup warmup=%s selectedWindow=%s slowHealth=%s fastHealth=%s evidenceHealth=%s checkpointBBO=%s checkpointTrade=%s",
 				time.Since(started), selected.Window, strategy.model.Snapshot(now).Health,
-				selected.Model.Health, selected.Evidence.Health)
+				selected.Model.Health, selected.Evidence.Health,
+				strategy.State.ModelCheckpoint.ReplayAfter,
+				strategy.State.ModelCheckpoint.TradeReplayAfter)
+
+			persisted, err := json.Marshal(strategy.State)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var restoredState State
+			if err := json.Unmarshal(persisted, &restoredState); err != nil {
+				t.Fatal(err)
+			}
+			if beforeBOCPD.Ready && (restoredState.ModelCheckpoint.BOCPD45 == nil ||
+				len(restoredState.ModelCheckpoint.BOCPD45.Bid.States) == 0 ||
+				len(restoredState.ModelCheckpoint.BOCPD45.Ask.States) == 0) {
+				beforeCheckpoint := strategy.State.ModelCheckpoint.BOCPD45
+				t.Fatalf("serialized checkpoint lost BOCPD run states: before bid=%d ask=%d after=%+v",
+					len(beforeCheckpoint.Bid.States), len(beforeCheckpoint.Ask.States), restoredState.ModelCheckpoint.BOCPD45)
+			}
+			restarted := &Strategy{Config: config, State: &restoredState}
+			restarted.model = NewIntensityModel(config.Intensity)
+			restarted.initializeAdaptiveFastModels()
+			restarted.makerExecutableCrossingModel = NewExecutableCrossingModel(restarted.Symbol, restarted.Barrier, restarted.Intensity)
+			restoreStarted := time.Now()
+			if err := restarted.restoreAndWarmMakerModelsFromBinanceCapture(now); err != nil {
+				t.Fatalf("checkpoint delta startup failed: %v", err)
+			}
+			restoredSnapshot := restarted.adaptiveFastSnapshot(now)
+			afterBOCPD := restarted.makerBOCPD45.Snapshot()
+			if beforeBOCPD.Ready && !afterBOCPD.Ready {
+				t.Fatalf("checkpoint restart lost BOCPD readiness: before=%+v after=%+v", beforeBOCPD, afterBOCPD)
+			}
+			t.Logf("checkpoint restart=%s selectedWindow=%s slowHealth=%s fastHealth=%s evidenceHealth=%s",
+				time.Since(restoreStarted), restoredSnapshot.Window,
+				restarted.model.Snapshot(now).Health,
+				restoredSnapshot.Model.Health, restoredSnapshot.Evidence.Health)
 		})
 	}
 }

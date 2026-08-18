@@ -1,0 +1,16 @@
+{
+  "name": "terminal-tail-conditional-target",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 1178.0,
+  "minimum_effective_samples": 48.0,
+  "incremental_mean_bps": -0.5837373290763094,
+  "incremental_standard_error_bps": 0.08971291218915578,
+  "incremental_cost_bps": 0.0,
+  "risk_penalty_bps": 0.0,
+  "candidate_tests": 2,
+  "alpha": 0.05,
+  "positive_blocks": 0,
+  "total_blocks": 13,
+  "minimum_positive_blocks": 7
+}

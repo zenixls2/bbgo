@@ -69,6 +69,10 @@ type DrawdownEProcessDecision struct {
 	BidScoreBps         float64
 	AskQV               float64
 	BidQV               float64
+	// BidForecastBps is the posterior mean adverse SELL markout over the
+	// requested reference horizon.  It is used only while the time-uniform
+	// bid/ask agreement alarm is active.
+	BidForecastBps float64
 }
 
 // DrawdownEProcess implements a two-sided executable-price state machine. A
@@ -76,12 +80,16 @@ type DrawdownEProcessDecision struct {
 // from the latest low can end it. Resetting at a new extremum discards evidence
 // and therefore cannot inflate an e-value.
 type DrawdownEProcess struct {
-	config       DrawdownEProcessConfig
-	lastAt       time.Time
-	active       bool
-	episodeStart time.Time
-	bid          drawdownESide
-	ask          drawdownESide
+	config        DrawdownEProcessConfig
+	lastAt        time.Time
+	active        bool
+	episodeStart  time.Time
+	bid           drawdownESide
+	ask           drawdownESide
+	alarmBidScore float64
+	alarmBidQV    float64
+	alarmMinutes  int
+	alarmEValue   float64
 }
 
 func NewDrawdownEProcess(c DrawdownEProcessConfig) *DrawdownEProcess {
@@ -108,6 +116,12 @@ func (m *DrawdownEProcess) ObserveMinute(at time.Time, bid, ask float64) Drawdow
 		m.ask.reset(ask)
 		return d
 	}
+	if at.Equal(m.lastAt) {
+		// Book ticker is event-driven.  More than one update in the same minute
+		// must not reset or multiply sequential evidence.
+		d.Reason = "same-minute executable update retained"
+		return d
+	}
 	if !at.Equal(m.lastAt.Add(time.Minute)) {
 		m.Reset()
 		m.lastAt = at
@@ -131,12 +145,17 @@ func (m *DrawdownEProcess) ObserveMinute(at time.Time, bid, ask float64) Drawdow
 		d.BidScoreBps = math.Log(m.bid.anchor/bid) * 10_000
 		d.AskQV, d.BidQV = m.ask.qv, m.bid.qv
 		if d.Minutes >= m.config.MinimumMinutes && d.DownEValue >= d.Threshold {
+			m.alarmBidScore = math.Log(m.bid.anchor / bid)
+			m.alarmBidQV = m.bid.qv
+			m.alarmMinutes = m.bid.minutes
+			m.alarmEValue = d.DownEValue
 			m.active = true
 			m.episodeStart = at
 			m.bid.reset(bid)
 			m.ask.reset(ask)
 			d.DownAlarm = true
 			d.Active = true
+			d.BidForecastBps = m.DownsideForecastBps(m.config.Windows[len(m.config.Windows)-1])
 			d.EpisodeStart = at
 			d.Healthy = true
 			d.Reason = "time-uniform executable drawdown evidence"
@@ -159,6 +178,9 @@ func (m *DrawdownEProcess) ObserveMinute(at time.Time, bid, ask float64) Drawdow
 	d.BidScoreBps = math.Log(bid/m.bid.anchor) * 10_000
 	d.AskQV, d.BidQV = m.ask.qv, m.bid.qv
 	d.Active = true
+	d.DownEValue = m.alarmEValue
+	d.DownProbability = d.DownEValue / (1 + d.DownEValue)
+	d.BidForecastBps = m.DownsideForecastBps(m.config.Windows[len(m.config.Windows)-1])
 	d.EpisodeStart = m.episodeStart
 	d.Healthy = true
 	d.Reason = "drawdown active; recovery evidence below threshold"
@@ -168,10 +190,44 @@ func (m *DrawdownEProcess) ObserveMinute(at time.Time, bid, ask float64) Drawdow
 		d.Reason = "time-uniform executable recovery evidence"
 		m.active = false
 		m.episodeStart = time.Time{}
+		m.alarmBidScore, m.alarmBidQV, m.alarmMinutes, m.alarmEValue = 0, 0, 0, 0
 		m.bid.reset(bid)
 		m.ask.reset(ask)
 	}
 	return d
+}
+
+// DownsideForecastBps converts the half-normal drift-mixture posterior from
+// executable-bid QV time back to a same-horizon adverse markout.  The QV rate
+// is estimated causally from the alarm episode; a jump raises QV and therefore
+// lowers the inferred drift rather than being mistaken for persistent trend.
+func (m *DrawdownEProcess) DownsideForecastBps(horizon time.Duration) float64 {
+	if m == nil || !m.active || horizon <= 0 || m.alarmBidScore <= 0 ||
+		m.alarmBidQV <= 0 || m.alarmMinutes <= 0 {
+		return 0
+	}
+	futureQV := m.alarmBidQV * horizon.Minutes() / float64(m.alarmMinutes)
+	minimum := m.config.Windows[0]
+	for _, window := range m.config.Windows[1:] {
+		if window > 0 && window < minimum {
+			minimum = window
+		}
+	}
+	var forecast float64
+	var count int
+	for _, window := range m.config.Windows {
+		if window <= 0 {
+			continue
+		}
+		scale := m.config.BarrierWidth * math.Sqrt(window.Seconds()/minimum.Seconds())
+		theta := halfNormalDriftPosteriorMean(m.alarmBidScore, m.alarmBidQV, 1/scale)
+		forecast += theta * futureQV * 10_000
+		count++
+	}
+	if count == 0 {
+		return 0
+	}
+	return forecast / float64(count)
 }
 
 func updateExtremumSide(side *drawdownESide, price float64, high bool) {
@@ -235,6 +291,22 @@ func halfNormalDriftMixtureE(score, qv, tau float64) float64 {
 		return math.MaxFloat64
 	}
 	return math.Exp(logE)
+}
+
+func halfNormalDriftPosteriorMean(score, qv, tau float64) float64 {
+	if score < 0 || qv <= 0 || tau <= 0 {
+		return 0
+	}
+	b := qv + 1/(tau*tau)
+	mean := score / b
+	sd := 1 / math.Sqrt(b)
+	z := mean / sd
+	cdf := .5 * math.Erfc(-z/math.Sqrt2)
+	if cdf <= math.SmallestNonzeroFloat64 {
+		return math.Max(0, mean)
+	}
+	density := math.Exp(-.5*z*z) / math.Sqrt(2*math.Pi)
+	return math.Max(0, mean+sd*density/cdf)
 }
 
 func eProcessThreshold(z float64) float64 {

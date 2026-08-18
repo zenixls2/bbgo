@@ -1,0 +1,37 @@
+{
+  "name": "ethjpy-asymmetric-oscillation-risk-integration",
+  "symbol": "ETHJPY",
+  "replay_from": "2026-07-23T13:30:00Z",
+  "replay_to": "2026-07-23T19:30:00Z",
+  "starting_inventory": "50/50",
+  "maker_fee_bps_each_side": 10,
+  "calibration_note": "diagnostic replay; actual calibration fills were zero",
+  "legacy": {
+    "net_pnl_jpy": -8606.482836502139,
+    "hold_pnl_jpy": -6489.600000000093,
+    "full_fills": 26,
+    "fills_per_hour": 4.384221086143648,
+    "markout_1m_bps": 0.3686303134131054,
+    "markout_5m_bps": 0.5502681939123529,
+    "markout_10m_bps": -1.3730061443028074,
+    "maker_fees_jpy": 1951.080775264558,
+    "maximum_drawdown_pct": 1.1355062410460917
+  },
+  "asymmetric_risk": {
+    "net_pnl_jpy": -8653.369691823376,
+    "hold_pnl_jpy": -6489.600000000093,
+    "full_fills": 21,
+    "fills_per_hour": 3.5411016465006386,
+    "markout_1m_bps": 1.7818536153551592,
+    "markout_5m_bps": 0.22674514810990512,
+    "markout_10m_bps": -3.7245858346527236,
+    "maker_fees_jpy": 1937.085376483628,
+    "maximum_drawdown_pct": 1.1489020807933137,
+    "samples": 17080,
+    "ready_samples": 16420,
+    "mean_multiplier": 1.1143527561403923,
+    "min_multiplier": 0.65,
+    "max_multiplier": 1.75
+  },
+  "decision": "integrated_as_risk_only; no return-promotion claim"
+}

@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-const fastDriftFeatureCount = 3
+const fastDriftFeatureCount = 4
 
 // FastDriftConfig controls the endogenous Fast reservation-price forecast.
 // Training is always online from matured, non-overlapping BBO windows.  The
@@ -24,6 +24,16 @@ type FastDriftConfig struct {
 type FastDriftFeatures struct {
 	Direction     float64
 	BookImbalance float64
+	// BBOStateTag is a side-reflection-symmetric, scale-normalized summary of
+	// the selected Fast window's drawdown/run-up and 30-second reversal state.
+	// It is an input to the online regression, never an independent quote skew.
+	BBOStateTag float64
+}
+
+type fastDriftBBOStateTagCache struct {
+	Bucket time.Time
+	Tag    float64
+	Valid  bool
 }
 
 func (f FastDriftFeatures) vector() [fastDriftFeatureCount]float64 {
@@ -33,7 +43,49 @@ func (f FastDriftFeatures) vector() [fastDriftFeatureCount]float64 {
 		}
 		return math.Max(-1, math.Min(1, value))
 	}
-	return [fastDriftFeatureCount]float64{1, finiteClamp(f.Direction), finiteClamp(f.BookImbalance)}
+	return [fastDriftFeatureCount]float64{
+		1, finiteClamp(f.Direction), finiteClamp(f.BookImbalance), finiteClamp(f.BBOStateTag),
+	}
+}
+
+// FastDriftBBOStateTag converts the continuous executable-side state into one
+// bounded ML feature. A positive value means recent ask rebound/up-run evidence
+// dominates bid reversal/down-drawdown evidence; swapping BUY and SELL paths
+// negates the tag exactly. QV and spread normalize the magnitude so a noisy,
+// wide-spread BBO burst cannot manufacture an oversized feature.
+func (m *MarketMakerHorizonModel) FastDriftBBOStateTag(horizon time.Duration) (float64, bool) {
+	if m == nil || horizon <= 0 || len(m.points) == 0 {
+		return 0, false
+	}
+	bucket := m.points[len(m.points)-1].At.Truncate(time.Minute)
+	if cached, ok := m.fastDriftBBOStateTags[horizon]; ok && cached.Bucket.Equal(bucket) {
+		return cached.Tag, cached.Valid
+	}
+	state := m.conditionalExecutionState(horizon)
+	tag, valid := fastDriftBBOStateTagFromState(state, horizon)
+	if m.fastDriftBBOStateTags == nil {
+		m.fastDriftBBOStateTags = make(map[time.Duration]fastDriftBBOStateTagCache)
+	}
+	m.fastDriftBBOStateTags[horizon] = fastDriftBBOStateTagCache{
+		Bucket: bucket, Tag: tag, Valid: valid,
+	}
+	return tag, valid
+}
+
+func fastDriftBBOStateTagFromState(state conditionalExecutionState, horizon time.Duration) (float64, bool) {
+	if !state.Valid || horizon <= 0 {
+		return 0, false
+	}
+	qvScale := 0.5 * (state.BuyQVBps + state.SellQVBps)
+	scale := math.Max(1, qvScale+state.SpreadBps)
+	shortScale := math.Max(1, qvScale*math.Sqrt(math.Min(1, 30/horizon.Seconds()))+state.SpreadBps)
+	pathLocation := math.Tanh((state.SellRunupBps - state.BuyDrawdownBps) / scale)
+	shortReversal := math.Tanh((state.BuyRebound30Bps - state.SellReversal30Bps) / shortScale)
+	tag := 0.5 * (pathLocation + shortReversal)
+	if !finiteFastDriftValue(tag) {
+		return 0, false
+	}
+	return math.Max(-1, math.Min(1, tag)), true
 }
 
 type fastDriftAnchor struct {

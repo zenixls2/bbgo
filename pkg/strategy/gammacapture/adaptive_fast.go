@@ -123,6 +123,12 @@ func inferFastCrossing(window time.Duration, fast ModelSnapshot, evidence FastEv
 
 func (s *Strategy) initializeAdaptiveFastModels() {
 	windows := s.MarketMaker.FastModelWindows()
+	if s.MarketMaker.AsymmetricOscillationRisk.Enabled {
+		s.makerAsymmetricOscillationRisk = NewAsymmetricOscillationRiskModel(
+			s.MarketMaker.AsymmetricOscillationRisk)
+	} else {
+		s.makerAsymmetricOscillationRisk = nil
+	}
 	if s.MarketMaker.BOCPD45.Enabled {
 		s.makerBOCPD45 = NewBOCPD45Model(s.MarketMaker.BOCPD45)
 	} else {
@@ -154,6 +160,30 @@ func (s *Strategy) initializeAdaptiveFastModels() {
 		s.fastEvidence = s.fastEvidenceModels[primary]
 		s.makerDirectionModel = s.makerDirectionModels[primary]
 	}
+}
+
+// observeAsymmetricOscillationRisk advances the strictly-prequential risk
+// multiplier from executable BBO data. It is deliberately one-dimensional:
+// the result is consumed only as a multiplier on the unified risk-aversion
+// coefficient, never as an independent side, price, quantity, or gate signal.
+func (s *Strategy) observeAsymmetricOscillationRisk(
+	at time.Time, bid, ask float64, horizon time.Duration, gapBefore bool,
+) AsymmetricOscillationRiskDecision {
+	if s.makerAsymmetricOscillationRisk == nil || horizon <= 0 {
+		return AsymmetricOscillationRiskDecision{RiskMultiplier: 1, Reason: "asymmetric oscillation risk disabled"}
+	}
+	model := s.makerAsymmetricOscillationRisk
+	if gapBefore {
+		model.ResetPending()
+	}
+	// Labels mature before the next prediction, so the current decision cannot
+	// read a future bid. A missing/invalid state remains neutral.
+	model.UpdateLabel(at, bid)
+	features, ready := s.makerHorizonModel.AsymmetricOscillationRiskFeatures(horizon)
+	if !ready {
+		return AsymmetricOscillationRiskDecision{Enabled: true, RiskMultiplier: 1, Reason: "asymmetric oscillation risk window not ready"}
+	}
+	return model.Predict(at, bid, horizon, features)
 }
 
 func (s *Strategy) observeFastModelExposure(at time.Time, gapBefore bool) {
@@ -188,9 +218,13 @@ func (s *Strategy) observeFastDriftModels(
 		if model == nil {
 			continue
 		}
+		bboStateTag, _ := s.makerHorizonModel.FastDriftBBOStateTag(window)
 		s.makerHorizonModel.ObserveFastDrift(
 			at, ticker.Buy.Float64(), ticker.Sell.Float64(), window, lookback,
-			FastDriftFeatures{Direction: rawFastDirection(model.Snapshot(at)), BookImbalance: imbalance},
+			FastDriftFeatures{
+				Direction: rawFastDirection(model.Snapshot(at)), BookImbalance: imbalance,
+				BBOStateTag: bboStateTag,
+			},
 			gapBefore)
 	}
 }

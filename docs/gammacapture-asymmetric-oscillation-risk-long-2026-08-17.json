@@ -1,0 +1,41 @@
+{
+  "name": "ethjpy-asymmetric-oscillation-inventory-risk-long",
+  "symbol": "ETHJPY",
+  "from": "2026-07-23T13:30:00Z",
+  "to": "2026-08-17T07:25:00Z",
+  "sampling": "last BBO per 5-minute UTC bucket; 15-minute past feature; next 15-minute executable bid label; non-overlapping stride",
+  "bbo_buckets": 7128,
+  "effective_samples": 2374,
+  "gap_skipped_samples": 0,
+  "six_hour_blocks": 99,
+  "up": {
+    "samples": 768,
+    "mean_multiplier": 0.8605546138692718,
+    "mean_terminal_bps": -0.17929541875557364,
+    "mean_min_return_bps": -5.077851096105001,
+    "downside_semivariance_bps2": 161.4207861447322
+  },
+  "down": {
+    "samples": 743,
+    "mean_multiplier": 1.1673159174508954,
+    "mean_terminal_bps": -1.2304265244247385,
+    "mean_min_return_bps": -7.061327799660061,
+    "downside_semivariance_bps2": 305.51093344574156
+  },
+  "low_multiplier": {
+    "samples": 610,
+    "downside_semivariance_bps2": 167.93505828983388
+  },
+  "high_multiplier": {
+    "samples": 636,
+    "downside_semivariance_bps2": 287.3191628652066
+  },
+  "paired_six_hour_down_minus_up_downside_semivariance_bps2": 115.50000144664885,
+  "paired_six_hour_se_bps2": 50.99991036877445,
+  "paired_six_hour_ci95_bps2": [15.540177123850924, 215.45982576944678],
+  "paired_six_hour_t": 2.264709890889645,
+  "causal": true,
+  "leakage_checks_passed": true,
+  "decision": "risk-ordering-supported; no PnL promotion",
+  "reason": "The long study supports a higher downside-risk multiplier in downward oscillations, but no order actions, fees, or inventory feedback were simulated. Component replay is required before strategy integration."
+}

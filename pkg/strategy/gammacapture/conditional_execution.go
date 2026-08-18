@@ -28,6 +28,13 @@ type conditionalExecutionState struct {
 	SellReversal30Bps float64
 	SellQVBps         float64
 	SpreadBps         float64
+	// Signed/absolute executable-bid path statistics are reused by the
+	// asymmetric oscillation risk controller. They are causal summaries of the
+	// same selected horizon; keeping them here avoids a second O(window) scan in
+	// the quote loop.
+	SellNetReturnBps      float64
+	SellTotalVariationBps float64
+	VolumeProfile         VolumeProfileState
 }
 
 func (s conditionalExecutionState) vector(buy bool, horizon time.Duration) [conditionalExecutionFeatureCount]float64 {
@@ -58,13 +65,32 @@ func conditionalExecutionKernel(current, historical conditionalExecutionState, b
 		difference := a[index] - b[index]
 		distanceSquared += difference * difference
 	}
+	// Volume Profile is a state descriptor, not a second decision gate. It
+	// contributes only when both causal states have enough effective public
+	// trades; otherwise the legacy conditional kernel is unchanged.
+	if current.VolumeProfile.Valid && historical.VolumeProfile.Valid {
+		currentProfile, historicalProfile := current.VolumeProfile.Vector(buy), historical.VolumeProfile.Vector(buy)
+		weight := current.VolumeProfile.KernelWeight
+		if weight <= 0 || (historical.VolumeProfile.KernelWeight > 0 && historical.VolumeProfile.KernelWeight < weight) {
+			weight = historical.VolumeProfile.KernelWeight
+		}
+		if weight <= 0 {
+			weight = 1
+		}
+		for index := range currentProfile {
+			difference := currentProfile[index] - historicalProfile[index]
+			distanceSquared += weight * difference * difference
+		}
+	}
 	return math.Exp(-0.5 * distanceSquared)
 }
 
 type conditionalExecutionReturn struct {
-	At         time.Time
-	AskSquared float64
-	BidSquared float64
+	At          time.Time
+	AskSquared  float64
+	BidSquared  float64
+	AskAbsolute float64
+	BidAbsolute float64
 }
 
 // buildConditionalExecutionStates computes every causal start state in O(N).
@@ -79,6 +105,7 @@ func buildConditionalExecutionStates(points []MarketMakerHorizonPoint, horizon t
 	var returns []conditionalExecutionReturn
 	returnHead := 0
 	buyQV2, sellQV2 := 0.0, 0.0
+	buyTotalVariation, sellTotalVariation := 0.0, 0.0
 	segmentStart := 0
 	leftH, left30 := 0, 0
 	for index, point := range points {
@@ -89,20 +116,26 @@ func buildConditionalExecutionStates(points []MarketMakerHorizonPoint, horizon t
 			returns = returns[:0]
 			returnHead = 0
 			buyQV2, sellQV2 = 0, 0
+			buyTotalVariation, sellTotalVariation = 0, 0
 		} else {
 			previous := points[index-1]
 			if previousAsk, currentAsk := previous.askPrice(), point.askPrice(); previousAsk > 0 && currentAsk > 0 {
 				value := math.Log(currentAsk / previousAsk)
 				buyQV2 += value * value
+				buyTotalVariation += math.Abs(value)
 				previousBid, currentBid := previous.bidPrice(), point.bidPrice()
 				bidSquared := 0.0
+				bidAbsolute := 0.0
 				if previousBid > 0 && currentBid > 0 {
 					bidReturn := math.Log(currentBid / previousBid)
 					bidSquared = bidReturn * bidReturn
+					bidAbsolute = math.Abs(bidReturn)
 					sellQV2 += bidSquared
+					sellTotalVariation += bidAbsolute
 				}
 				returns = append(returns, conditionalExecutionReturn{
 					At: point.At, AskSquared: value * value, BidSquared: bidSquared,
+					AskAbsolute: math.Abs(value), BidAbsolute: bidAbsolute,
 				})
 			}
 		}
@@ -118,6 +151,8 @@ func buildConditionalExecutionStates(points []MarketMakerHorizonPoint, horizon t
 		for returnHead < len(returns) && returns[returnHead].At.Before(cutoffH) {
 			buyQV2 -= returns[returnHead].AskSquared
 			sellQV2 -= returns[returnHead].BidSquared
+			buyTotalVariation -= returns[returnHead].AskAbsolute
+			sellTotalVariation -= returns[returnHead].BidAbsolute
 			returnHead++
 		}
 		trimFront := func(values []int, minimum int) []int {
@@ -151,14 +186,17 @@ func buildConditionalExecutionStates(points []MarketMakerHorizonPoint, horizon t
 			continue
 		}
 		states[index] = conditionalExecutionState{
-			Valid:             true,
-			BuyDrawdownBps:    math.Max(0, math.Log(points[maxAskH[0]].askPrice()/ask)*10_000),
-			BuyRebound30Bps:   math.Max(0, math.Log(ask/points[minAsk30[0]].askPrice())*10_000),
-			BuyQVBps:          math.Sqrt(math.Max(0, buyQV2)) * 10_000,
-			SellRunupBps:      math.Max(0, math.Log(bid/points[minBidH[0]].bidPrice())*10_000),
-			SellReversal30Bps: math.Max(0, math.Log(points[maxBid30[0]].bidPrice()/bid)*10_000),
-			SellQVBps:         math.Sqrt(math.Max(0, sellQV2)) * 10_000,
-			SpreadBps:         math.Max(0, math.Log(ask/bid)*10_000),
+			Valid:                 true,
+			BuyDrawdownBps:        math.Max(0, math.Log(points[maxAskH[0]].askPrice()/ask)*10_000),
+			BuyRebound30Bps:       math.Max(0, math.Log(ask/points[minAsk30[0]].askPrice())*10_000),
+			BuyQVBps:              math.Sqrt(math.Max(0, buyQV2)) * 10_000,
+			SellRunupBps:          math.Max(0, math.Log(bid/points[minBidH[0]].bidPrice())*10_000),
+			SellReversal30Bps:     math.Max(0, math.Log(points[maxBid30[0]].bidPrice()/bid)*10_000),
+			SellQVBps:             math.Sqrt(math.Max(0, sellQV2)) * 10_000,
+			SpreadBps:             math.Max(0, math.Log(ask/bid)*10_000),
+			SellNetReturnBps:      math.Log(bid/points[leftH].bidPrice()) * 10_000,
+			SellTotalVariationBps: math.Max(0, sellTotalVariation) * 10_000,
+			VolumeProfile:         point.volumeProfileState(horizon),
 		}
 	}
 	return states
@@ -198,6 +236,52 @@ func (m *MarketMakerHorizonModel) conditionalExecutionState(horizon time.Duratio
 		return conditionalExecutionState{}
 	}
 	return conditionalExecutionStateAtIndex(m.points, len(m.points)-1, horizon)
+}
+
+// VolumeProfileState exposes only the latest causal profile snapshot for
+// research diagnostics. Quote decisions continue to consume it through the
+// conditional kernel, not through this accessor.
+func (m *MarketMakerHorizonModel) VolumeProfileState(horizon time.Duration) (VolumeProfileState, bool) {
+	if m == nil || horizon <= 0 || len(m.points) == 0 {
+		return VolumeProfileState{}, false
+	}
+	state := m.conditionalExecutionState(horizon).VolumeProfile
+	return state, state.Valid
+}
+
+// AsymmetricOscillationRiskFeatures returns the causal executable-bid path
+// summary used by the inventory-risk alpha. It shares the conditional
+// execution state cache/definition, so the risk controller cannot silently
+// use a different window or a midpoint label than the quote optimizer.
+func (m *MarketMakerHorizonModel) AsymmetricOscillationRiskFeatures(horizon time.Duration) (AsymmetricOscillationRiskFeatures, bool) {
+	if m == nil || horizon <= 0 || len(m.points) == 0 {
+		return AsymmetricOscillationRiskFeatures{}, false
+	}
+	bucket := m.points[len(m.points)-1].At.Truncate(time.Minute)
+	if cached, ok := m.asymmetricRiskFeatures[horizon]; ok && cached.Bucket.Equal(bucket) {
+		return cached.Features, cached.Valid
+	}
+	state := m.conditionalExecutionState(horizon)
+	if !state.Valid || horizon <= 0 {
+		if m.asymmetricRiskFeatures == nil {
+			m.asymmetricRiskFeatures = make(map[time.Duration]asymmetricOscillationRiskFeatureCache)
+		}
+		m.asymmetricRiskFeatures[horizon] = asymmetricOscillationRiskFeatureCache{Bucket: bucket}
+		return AsymmetricOscillationRiskFeatures{}, false
+	}
+	features := AsymmetricOscillationRiskFeatures{
+		NetReturnBps:      state.SellNetReturnBps,
+		TotalVariationBps: state.SellTotalVariationBps,
+		ScaleBps:          state.SellQVBps,
+		SpreadBps:         state.SpreadBps,
+	}
+	if m.asymmetricRiskFeatures == nil {
+		m.asymmetricRiskFeatures = make(map[time.Duration]asymmetricOscillationRiskFeatureCache)
+	}
+	m.asymmetricRiskFeatures[horizon] = asymmetricOscillationRiskFeatureCache{
+		Bucket: bucket, Features: features, Valid: true,
+	}
+	return features, true
 }
 
 // ConditionalExecutionSideDecision exposes the nested passage decomposition
@@ -306,10 +390,12 @@ func (m *MarketMakerHorizonModel) conditionalExecutionSideDecision(
 			} else if candidateTouched {
 				if buy {
 					quote := exposure.StartAsk * math.Exp(-candidateDistanceBps/10_000)
-					value = math.Log(exposure.TerminalBid/quote)*10_000 - entryCostBps
+					value = makerFillTerminalWealthBps(
+						true, quote, exposure.TerminalBid, entryCostBps)
 				} else {
 					quote := exposure.StartBid * math.Exp(candidateDistanceBps/10_000)
-					value = math.Log(quote/exposure.TerminalAsk)*10_000 - entryCostBps
+					value = makerFillTerminalWealthBps(
+						false, quote, exposure.TerminalBid, entryCostBps)
 				}
 				incrementalMarkout.add(weight, value)
 				weightedIncremental += weight

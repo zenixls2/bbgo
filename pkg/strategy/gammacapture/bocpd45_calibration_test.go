@@ -1,6 +1,7 @@
 package gammacapture
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 	"time"
@@ -96,6 +97,37 @@ func TestBOCPD45CheckpointRestoresRollingCalibration(t *testing.T) {
 	}
 	if restored.pending == nil || !restored.pending.MaturesAt.Equal(original.pending.MaturesAt) {
 		t.Fatalf("pending maturity was not restored: %+v", restored.pending)
+	}
+}
+
+func TestBOCPD45CheckpointJSONPreservesBothExecutableSides(t *testing.T) {
+	config := testBOCPD45Config()
+	original := NewBOCPD45Model(config)
+	start := time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC)
+	original.Observe(start, 100, 100.1, false)
+	for index := 1; index <= config.MinimumChanges+2; index++ {
+		at := start.Add(time.Duration(index) * time.Second)
+		original.Observe(at, 100+float64(index)/100, 100.1+float64(index)/100, false)
+	}
+	before := original.Snapshot()
+	if !before.Ready {
+		t.Fatalf("test setup is not ready: %+v", before)
+	}
+	encoded, err := json.Marshal(original.checkpoint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checkpoint bocpd45Checkpoint
+	if err := json.Unmarshal(encoded, &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	restored := NewBOCPD45Model(config)
+	if err := restored.restore(&checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	after := restored.Snapshot()
+	if !after.Ready || after.BidChanges != before.BidChanges || after.AskChanges != before.AskChanges {
+		t.Fatalf("JSON checkpoint lost executable-side state: before=%+v after=%+v", before, after)
 	}
 }
 

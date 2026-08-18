@@ -1,0 +1,16 @@
+{
+  "name": "volume-profile-event-clock-future-mean-c80-h15",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 109.71,
+  "minimum_effective_samples": 24.0,
+  "incremental_mean_bps": -0.24213692210537743,
+  "incremental_standard_error_bps": 0.12597358592103405,
+  "incremental_cost_bps": 0.0,
+  "risk_penalty_bps": 0.0,
+  "candidate_tests": 2,
+  "alpha": 0.05,
+  "positive_blocks": 1,
+  "total_blocks": 8,
+  "minimum_positive_blocks": 5
+}

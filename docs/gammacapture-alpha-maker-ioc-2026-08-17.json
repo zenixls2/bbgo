@@ -1,0 +1,20 @@
+{
+  "name": "ethjpy-vp-maker-ioc-lifecycle-15m",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 1834,
+  "minimum_effective_samples": 24,
+  "incremental_mean_bps": -0.2923293898,
+  "incremental_standard_error_bps": 0.2216918652,
+  "incremental_cost_bps": 0,
+  "risk_penalty_bps": 0,
+  "candidate_tests": 6,
+  "alpha": 0.05,
+  "positive_blocks": 6,
+  "total_blocks": 16,
+  "minimum_positive_blocks": 5,
+  "response_unit": "fee-net terminal wealth bps",
+  "horizon": "15m",
+  "data_from": "2026-08-01T00:00:00Z",
+  "data_to": "2026-08-17T00:00:00Z"
+}

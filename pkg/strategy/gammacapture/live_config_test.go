@@ -43,6 +43,9 @@ func TestLiveETHJPYConfigDecodesInventoryControllers(t *testing.T) {
 		!strategy.MarketMaker.JointDistanceQuantity.Enabled {
 		t.Fatal("live ETHJPY config must give Fast joint price/quantity ownership")
 	}
+	if strategy.MarketMaker.JointDistanceQuantity.JointHorizonSelection {
+		t.Fatal("live ETHJPY config must select one complete horizon evidence bundle before joint price/quantity optimization")
+	}
 	if !strategy.MarketMaker.ConditionalExecution.Enabled {
 		t.Fatal("live ETHJPY config must enable symmetric conditional Fast execution")
 	}

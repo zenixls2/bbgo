@@ -117,6 +117,14 @@ func loadMacroReplayDataset(path, symbol string, from, to, exactFrom time.Time, 
 	return loadReplayDataset(path, symbol, from, to, exactFrom, configFingerprint, cacheDir, "macro-1s")
 }
 
+// loadWarmReplayDataset keeps the evaluation/calibration interval tick-exact
+// while retaining one BBO close per second before exactFrom. Public trades are
+// never compacted. This is sufficient to seed the production Fast path models
+// without making a multi-hour warm-up dominate replay memory and CPU.
+func loadWarmReplayDataset(path, symbol string, from, to, exactFrom time.Time, configFingerprint, cacheDir string) ([]bboSnapshot, []tick, bool) {
+	return loadReplayDataset(path, symbol, from, to, exactFrom, configFingerprint, cacheDir, "warm-1s")
+}
+
 // loadExactReplayDataset is used by the ordinary event replay and preserves
 // every captured BBO/trade row in the interval. It shares the same checkpoint
 // keying and invalidation rules as the Macro warm-up cache.
@@ -140,7 +148,7 @@ func loadReplayDataset(path, symbol string, from, to, exactFrom time.Time, confi
 		}
 	}
 	books := readBBOFiles(bboFiles, from, to)
-	if mode == "macro-1s" {
+	if mode == "macro-1s" || mode == "warm-1s" {
 		books = compactMacroReplayBBO(books, exactFrom)
 	}
 	trades := readLiveTradesFiles(tradeFiles, from, to)

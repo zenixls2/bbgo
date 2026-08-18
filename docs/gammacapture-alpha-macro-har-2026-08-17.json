@@ -1,0 +1,20 @@
+{
+  "name": "ethjpy-vp-macro-har-variance-15m",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 1379,
+  "minimum_effective_samples": 24,
+  "incremental_mean_bps": 0.0312247734,
+  "incremental_standard_error_bps": 0.0627940821,
+  "incremental_cost_bps": 0,
+  "risk_penalty_bps": 0,
+  "candidate_tests": 6,
+  "alpha": 0.05,
+  "positive_blocks": 10,
+  "total_blocks": 16,
+  "minimum_positive_blocks": 5,
+  "response_unit": "side-average QLIKE improvement (dimensionless; field retained for alpha_gate compatibility)",
+  "horizon": "15m",
+  "data_from": "2026-08-01T00:00:00Z",
+  "data_to": "2026-08-17T00:00:00Z"
+}

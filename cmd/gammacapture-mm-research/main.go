@@ -107,6 +107,7 @@ func main() {
 	quoteNotional := flag.Float64("quote-notional-jpy", 50_000, "notional per quote")
 	minOrderNotional := flag.Float64("min-order-notional-jpy", 100, "exchange minimum order notional")
 	statsQuoteDistance := flag.Float64("stats-quote-distance-bps", 15, "quote distance used for ticker crossing statistics")
+	quoteLifecycleReplacementCost := flag.Float64("quote-lifecycle-replacement-cost-bps", 0, "research-only queue-age/opportunity cost charged on cancel/replace")
 	inventoryLimit := flag.Float64("inventory-limit", 100, "base-unit inventory limit; larger limits are required for high turnover but increase inventory risk")
 	inventoryTargetRatio := flag.Float64("inventory-target-ratio", 0.5, "spot inventory target as a fraction of the hard base-unit inventory limit")
 	startingQuote := flag.Float64("starting-quote-jpy", 1_000_000, "starting quote balance")
@@ -117,12 +118,17 @@ func main() {
 	fixedInventorySkew := flag.Float64("fixed-inventory-skew-bps", -1, "evaluate only this inventory skew; negative keeps the training grid")
 	fixedVolatilityMult := flag.Float64("fixed-volatility-multiplier", 0, "evaluate only this volatility multiplier; zero keeps the training grid")
 	productionCompare := flag.Bool("production-compare", false, "compare legacy and horizon-touch policies with the production-state event replay")
+	quoteLifecycleComponentOnly := flag.Bool("quote-lifecycle-component-only", false, "production replay only the legacy and Bellman lifecycle arms")
+	replayBBOInterval := flag.Duration("replay-bbo-interval", 0, "replay-only BBO bucket interval; zero keeps every compacted event")
 	macroReversalCompare := flag.Bool("macro-reversal-compare", false, "compare confirmed-only and early-sequential Macro reversal paths")
 	quantityProjectionCompare := flag.Bool("quantity-projection-compare", false, "compare staged and probability-centered quantity policies")
 	quantityProjectionCurrentOnly := flag.Bool("quantity-projection-current-only", false, "run only the current probability-centered policy")
+	dynamicInventoryAimCompare := flag.Bool("dynamic-inventory-aim-compare", false, "paired component replay of baseline versus the fee/risk-gated dynamic inventory aim")
 	posteriorBaseInventoryTarget := flag.Bool("posterior-base-inventory-target", false, "research-only choose Fast inventory target from the executable-bid terminal-return posterior")
 	enableFastDrift := flag.Bool("enable-fast-drift", false, "research-only enable endogenous causal Fast reservation-price drift")
+	enableDynamicInventoryAim := flag.Bool("dynamic-inventory-aim", false, "research-only enable the unified fee/risk-gated inventory aim and partial-adjustment target")
 	enableBOCPD45Direction := flag.Bool("bocpd45-fast-direction", false, "research-only replace the retired 45-second Hawkes Fast-direction auxiliary with executable-BBO BOCPD")
+	enableQuoteLifecycleAction := flag.Bool("enable-quote-lifecycle-action", false, "research-only enable Bellman KEEP/REPLACE/CANCEL quote lifecycle")
 	bocpd45Calibration := flag.String("bocpd45-calibration", "platt", "research-only strictly-prequential BOCPD45 calibration: raw, platt, beta, or isotonic")
 	bocpd45SkillOnly := flag.Bool("bocpd45-skill-only", false, "research-only score 45-second executable-BBO BOCPD against a prequential climatology")
 	postFillUtilityCompare := flag.Bool("post-fill-utility-compare", false, "compare current policy with confidence-adjusted post-fill utility")
@@ -137,6 +143,16 @@ func main() {
 	fastOnlyFixedHalf := flag.Bool("fast-only-fixed-half", false, "with --no-trade-ioc-compare, run only Fast quoting around a fixed 50/50 inventory target with Macro and IOC disabled")
 	multiscaleVarianceStudy := flag.Bool("multiscale-variance-study", false, "evaluate standalone side-specific online HAR variance forecasts without Macro or orders")
 	drawdownEProcessStudy := flag.Bool("drawdown-eprocess-study", false, "evaluate the standalone QV-time drawdown/recovery e-process without Macro or orders")
+	competingPathStudy := flag.Bool("competing-path-study", false, "standalone causal comparison of direct competing Fast-path outcomes versus reconstructed marginal probabilities")
+	quoteLifecycleReplay := flag.Bool("quote-lifecycle-replay", false, "standalone prequential Bellman keep/replace/cancel replay for passive quote windows")
+	conditionalPayoffStudy := flag.Bool("conditional-payoff-study", false, "standalone causal comparison of raw and empirical-Bayes one-sided terminal payoff means")
+	sideImbalancePayoffStudy := flag.Bool("side-imbalance-payoff-study", false, "standalone causal side-specific terminal payoff regression on current BBO depth imbalance")
+	terminalTailTargetStudy := flag.Bool("terminal-tail-target-study", false, "standalone causal comparison of full-window and conditional terminal-tail inventory targets")
+	volumeProfileStudy := flag.Bool("volume-profile-study", false, "standalone causal multi-window POC/corridor path-value study")
+	volumeProfileVarianceStudy := flag.Bool("volume-profile-variance-study", false, "standalone causal VP conditional executable-terminal variance study")
+	alphaVariantsStudy := flag.Bool("alpha-variants-study", false, "standalone causal maker/IOC, Fast-variance, and Macro-HAR alpha screens")
+	volumeTerminalRegimeCompare := flag.Bool("volume-terminal-regime-compare", false, "diagnostic four-regime replay of post-fill terminal target with and without Volume Profile residual")
+	volumeProfileFillCoverage := flag.Float64("volume-profile-fill-coverage", 0.80, "mature first-passage coverage used to derive each Fast window's POC observation range")
 	consolidationHazardStudy := flag.Bool("consolidation-hazard-study", false, "evaluate causal short-consolidation down/up competing risks without Macro or orders")
 	rangeRegimeStudy := flag.Bool("range-regime-study", false, "select non-overlapping ETHJPY ranging windows without using strategy P&L")
 	rangeWindow := flag.Duration("range-window", 12*time.Hour, "window length for blind ranging-regime selection")
@@ -161,6 +177,10 @@ func main() {
 	disableJointDistanceQuantity := flag.Bool("disable-joint-distance-quantity", false, "research-only disable joint distance/quantity optimizer")
 	disableConditionalExecution := flag.Bool("disable-conditional-execution", false, "research-only use unconditional crossing/path statistics and outward quotes only")
 	activateJointDistanceQuantity := flag.Bool("activate-joint-distance-quantity", false, "research-only activate joint distance/quantity optimizer even when production is shadow-only")
+	enablePathUtilityHorizon := flag.Bool("enable-path-utility-horizon-selection", false, "research-only select each Fast horizon by its own bilateral terminal path utility")
+	symmetricHorizonCompare := flag.Bool("symmetric-horizon-action-compare", false, "paired compact replay of the current BUY-only and symmetric Fast horizon action selectors")
+	enableJointHorizonSelection := flag.Bool("enable-joint-horizon-selection", false, "research-only jointly optimize Fast horizon, distance, and quantity under terminal-wealth utility")
+	earlyStatisticalRealignment := flag.Bool("early-statistical-realignment", false, "research-only evaluate statistically superior replacement quotes after the transport floor instead of waiting for the full modeled keep horizon")
 	overrideJointDistanceCandidates := flag.Int("override-joint-distance-candidates", -1, "research-only joint distance ladder candidate count")
 	replayFrom := flag.String("replay-from", "", "exact Macro replay start (RFC3339)")
 	replayTo := flag.String("replay-to", "", "exact Macro replay end (RFC3339)")
@@ -176,6 +196,7 @@ func main() {
 	journalData := flag.String("journal-data", "", "exported userspace journal JSONL; reconstructs actual gcmm LIMIT_MAKER lifecycles")
 	lifecycleOnly := flag.Bool("lifecycle-only", false, "report journal maker lifecycles without replaying either quote policy")
 	flag.Parse()
+	activeProductionEarlyStatisticalRealignment = *earlyStatisticalRealignment
 	activeProductionConfigOverrides = productionConfigOverrides{
 		InventoryRiskBudgetRatio:      *overrideRiskBudgetRatio,
 		InventoryRiskZScore:           *overrideRiskZScore,
@@ -192,10 +213,14 @@ func main() {
 		DisableJointDistanceQuantity:  *disableJointDistanceQuantity,
 		DisableConditionalExecution:   *disableConditionalExecution,
 		ActivateJointDistanceQuantity: *activateJointDistanceQuantity,
+		EnablePathUtilityHorizon:      *enablePathUtilityHorizon,
+		EnableJointHorizonSelection:   *enableJointHorizonSelection,
 		JointDistanceCandidateCount:   *overrideJointDistanceCandidates,
 		EnableFastDrift:               *enableFastDrift,
+		EnableDynamicInventoryAim:     *enableDynamicInventoryAim,
 		EnableBOCPD45Direction:        *enableBOCPD45Direction,
 		BOCPD45Calibration:            string(parseBOCPD45CalibrationMethod(*bocpd45Calibration)),
+		EnableQuoteLifecycleAction:    *enableQuoteLifecycleAction,
 	}
 	if *cpuProfilePath != "" {
 		profileFile, err := os.Create(*cpuProfilePath)
@@ -213,8 +238,45 @@ func main() {
 	}
 	trainStart, trainEnd := parseDate(*trainFrom), parseDate(*trainTo)
 	holdStart, holdEnd := parseDate(*holdoutFrom), parseDate(*holdoutTo)
-	if !trainStart.Before(trainEnd) || !holdStart.Before(holdEnd) || *fee < 0 || *takerFee < 0 || *acquisitionSlippage < 0 || *adverse < 0 || *inventoryLimit <= 0 || *inventoryTargetRatio < 0 || *inventoryTargetRatio > 1 || *quoteNotional <= 0 || *minOrderNotional <= 0 || *statsQuoteDistance <= 0 || *minTradingWindow <= 0 || *maxTradingWindow < *minTradingWindow {
+	if !trainStart.Before(trainEnd) || !holdStart.Before(holdEnd) || *fee < 0 || *takerFee < 0 || *acquisitionSlippage < 0 || *adverse < 0 || *quoteLifecycleReplacementCost < 0 || *replayBBOInterval < 0 || *inventoryLimit <= 0 || *inventoryTargetRatio < 0 || *inventoryTargetRatio > 1 || *quoteNotional <= 0 || *minOrderNotional <= 0 || *statsQuoteDistance <= 0 || *minTradingWindow <= 0 || *maxTradingWindow < *minTradingWindow {
 		fatalf("invalid date or fee/inventory configuration")
+	}
+	if *volumeTerminalRegimeCompare {
+		runVolumeTerminalRegimeComparison(volumeTerminalRegimeInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			ReplayCacheDir: *replayCacheDir, PairEquityJPY: *pairEquity,
+			StartingBase: *startingBase, QueueMultiplier: *queueMultiplier,
+			FillCoverage: *volumeProfileFillCoverage,
+		})
+		return
+	}
+	if *volumeProfileVarianceStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--volume-profile-variance-study requires --replay-from and --replay-to")
+		}
+		runVolumeProfileVarianceStudy(volumeProfileStudyInput{
+			competingPathStudyInput: competingPathStudyInput{
+				DataPath: *bboData, Symbol: *symbol,
+				From: parseTime(*replayFrom), To: parseTime(*replayTo),
+				ConfigPath: *configPath, ReplayCacheDir: *replayCacheDir,
+			},
+			FillCoverage: *volumeProfileFillCoverage,
+		})
+		return
+	}
+	if *alphaVariantsStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--alpha-variants-study requires --replay-from and --replay-to")
+		}
+		runAlphaVariantStudy(volumeProfileStudyInput{
+			competingPathStudyInput: competingPathStudyInput{
+				DataPath: *bboData, Symbol: *symbol,
+				From: parseTime(*replayFrom), To: parseTime(*replayTo),
+				ConfigPath: *configPath, ReplayCacheDir: *replayCacheDir,
+			},
+			FillCoverage: *volumeProfileFillCoverage,
+		})
+		return
 	}
 	if *rangeRegimeStudy {
 		if *replayFrom == "" || *replayTo == "" || *rangeWindow <= 0 || *rangeStep <= 0 || *rangeCount <= 0 {
@@ -223,6 +285,7 @@ func main() {
 		runRangeRegimeStudy(rangeRegimeStudyInput{
 			DataPath: *bboData, Symbol: *symbol, From: parseTime(*replayFrom), To: parseTime(*replayTo),
 			Window: *rangeWindow, Step: *rangeStep, MaximumWindows: *rangeCount,
+			EconomicPivotBps: 2*(*fee+*adverse) + *minimumEdge,
 		})
 		return
 	}
@@ -254,6 +317,77 @@ func main() {
 			Horizon:          *regimeHorizon,
 			RoundTripCostBps: 2*maker.MakerFeeBps + 2*maker.AdverseSelectionBps + maker.MinimumNetEdgeBps,
 			BarrierWidth:     barrier.Width, ConfidenceZ: maker.InventoryRiskZScore, Windows: maker.FastModelWindows(),
+		})
+		return
+	}
+	if *competingPathStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--competing-path-study requires --replay-from and --replay-to")
+		}
+		runCompetingPathStudy(competingPathStudyInput{
+			DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			ConfigPath: *configPath, ReplayCacheDir: *replayCacheDir,
+		})
+		return
+	}
+	if *quoteLifecycleReplay {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--quote-lifecycle-replay requires --replay-from and --replay-to")
+		}
+		runQuoteLifecycleReplay(quoteLifecycleReplayInput{
+			DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			ConfigPath: *configPath, ReplayCacheDir: *replayCacheDir,
+			Horizon: *regimeHorizon, DistanceBps: *statsQuoteDistance,
+			ReplacementCost: *quoteLifecycleReplacementCost,
+		})
+		return
+	}
+	if *conditionalPayoffStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--conditional-payoff-study requires --replay-from and --replay-to")
+		}
+		runConditionalPayoffStudy(competingPathStudyInput{
+			DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			ConfigPath: *configPath, ReplayCacheDir: *replayCacheDir,
+		})
+		return
+	}
+	if *sideImbalancePayoffStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--side-imbalance-payoff-study requires --replay-from and --replay-to")
+		}
+		runSideImbalancePayoffStudy(competingPathStudyInput{
+			DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			ConfigPath: *configPath, ReplayCacheDir: *replayCacheDir,
+		})
+		return
+	}
+	if *terminalTailTargetStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--terminal-tail-target-study requires --replay-from and --replay-to")
+		}
+		runTerminalTailTargetStudy(competingPathStudyInput{
+			DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			ConfigPath: *configPath, ReplayCacheDir: *replayCacheDir,
+		})
+		return
+	}
+	if *volumeProfileStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--volume-profile-study requires --replay-from and --replay-to")
+		}
+		runVolumeProfileStudy(volumeProfileStudyInput{
+			competingPathStudyInput: competingPathStudyInput{
+				DataPath: *bboData, Symbol: *symbol,
+				From: parseTime(*replayFrom), To: parseTime(*replayTo),
+				ConfigPath: *configPath, ReplayCacheDir: *replayCacheDir,
+			},
+			FillCoverage: *volumeProfileFillCoverage,
 		})
 		return
 	}
@@ -361,6 +495,33 @@ func main() {
 		})
 		return
 	}
+	if *dynamicInventoryAimCompare {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--dynamic-inventory-aim-compare requires --replay-from and --replay-to")
+		}
+		runDynamicInventoryAimComparison(dynamicInventoryAimComparisonInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			QueueMultiplier: *queueMultiplier, ReplayCacheDir: *replayCacheDir,
+			BBOInterval:        *replayBBOInterval,
+			MaxDrawdownStopPct: *maxDrawdownStopPct,
+		})
+		return
+	}
+	if *symmetricHorizonCompare {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--symmetric-horizon-action-compare requires --replay-from and --replay-to")
+		}
+		runSymmetricHorizonActionComparison(quantityProjectionComparisonInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			QueueMultiplier: *queueMultiplier, ReplayCacheDir: *replayCacheDir,
+			MaxDrawdownStopPct: *maxDrawdownStopPct,
+		})
+		return
+	}
 	if *macroReversalCompare {
 		if *replayFrom == "" || *replayTo == "" {
 			fatalf("--macro-reversal-compare requires --replay-from and --replay-to")
@@ -374,19 +535,35 @@ func main() {
 		})
 		return
 	}
-	if *productionCompare {
+	if *productionCompare || *quoteLifecycleComponentOnly {
 		if *pairEquity <= 0 || *startingBase < 0 || *actualBuyFills < 0 || *actualSellFills < 0 {
 			fatalf("invalid production replay balance or fill calibration")
 		}
+		productionFrom, productionTo := holdStart, holdEnd
+		// Date flags remain the default for the long canonical holdout, while
+		// --replay-from/--replay-to permit a compact exact interval for focused
+		// regression checks. This avoids spending minutes rebuilding an entire
+		// capture day when an execution fix only needs a two-hour causal replay.
+		if *replayFrom != "" || *replayTo != "" {
+			if *replayFrom == "" || *replayTo == "" {
+				fatalf("--production-compare requires both --replay-from and --replay-to")
+			}
+			productionFrom, productionTo = parseTime(*replayFrom), parseTime(*replayTo)
+			if !productionFrom.Before(productionTo) {
+				fatalf("production replay start must be before end")
+			}
+		}
 		runProductionComparison(productionComparisonInput{
 			ConfigPath: *configPath, ModelPath: *horizonTouchPath, DataPath: *bboData,
-			Symbol: *symbol, From: holdStart, To: holdEnd,
+			Symbol: *symbol, From: productionFrom, To: productionTo,
 			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
 			QueueMultiplier: *queueMultiplier,
 			CalibrationFrom: parseTime(*calibrationFrom), CalibrationTo: parseTime(*calibrationTo),
 			ActualBuyFills: *actualBuyFills, ActualSellFills: *actualSellFills,
 			JournalPath:    *journalData,
 			ReplayCacheDir: *replayCacheDir,
+			BBOInterval:    *replayBBOInterval,
+			ComponentOnly:  *quoteLifecycleComponentOnly,
 		})
 		return
 	}

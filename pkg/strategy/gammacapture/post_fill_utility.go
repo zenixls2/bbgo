@@ -36,6 +36,9 @@ type PostFillUtilityCandidate struct {
 	DistanceBps            float64
 	FillProbability        float64
 	EffectiveSamples       float64
+	ExpectedMeanBps        float64
+	ExpectedStdErrorBps    float64
+	ExpectedLowerBps       float64
 	IncrementalMeanBps     float64
 	IncrementalStdErrorBps float64
 	IncrementalLowerBps    float64
@@ -53,6 +56,9 @@ type PostFillUtilityDecision struct {
 	IncrementalMeanBps      float64
 	IncrementalStdErrorBps  float64
 	IncrementalLowerBps     float64
+	ExpectedMeanBps         float64
+	ExpectedStdErrorBps     float64
+	ExpectedLowerBps        float64
 	FillProbability         float64
 	EffectiveSamples        float64
 	CycleEdgeBps            float64
@@ -105,8 +111,12 @@ func (c MarketMakerConfig) ApplyPostFillUtility(model *MarketMakerHorizonModel, 
 	}
 
 	riskBenefit := postFillInventoryRiskBenefitBps(side, in)
+	// The previous fill is already sunk and common to every candidate. The
+	// paired terminal-wealth comparison charges only the newly evaluated maker
+	// fill; the resting-pair round-trip floor remains enforced below.
+	entryCostBps := c.MakerFeeBps + c.AdverseSelectionBps
 	candidates := model.postFillUtilityCandidates(in.Now, time.Duration(c.HorizonLookback), in.Horizon, side, distances,
-		2*c.MakerFeeBps+c.MinimumNetEdgeBps, riskBenefit, c.PostFillUtility.ConfidenceZScore)
+		entryCostBps, riskBenefit, c.PostFillUtility.ConfidenceZScore)
 	if len(candidates) != len(distances) || candidates[0].EffectiveSamples < float64(c.PostFillUtility.MinimumSamples) {
 		d.Reason = "insufficient paired post-fill utility samples"
 		if len(candidates) > 0 {
@@ -115,9 +125,9 @@ func (c MarketMakerConfig) ApplyPostFillUtility(model *MarketMakerHorizonModel, 
 		return d
 	}
 	d.InventoryRiskBenefitBps = riskBenefit
-	diagnosticIndex := 1
+	diagnosticIndex := 0
 	for i := 1; i < len(candidates); i++ {
-		if candidates[i].IncrementalLowerBps > candidates[diagnosticIndex].IncrementalLowerBps {
+		if candidates[i].ExpectedLowerBps > candidates[diagnosticIndex].ExpectedLowerBps {
 			diagnosticIndex = i
 		}
 	}
@@ -126,6 +136,9 @@ func (c MarketMakerConfig) ApplyPostFillUtility(model *MarketMakerHorizonModel, 
 	d.IncrementalMeanBps = diagnostic.IncrementalMeanBps
 	d.IncrementalStdErrorBps = diagnostic.IncrementalStdErrorBps
 	d.IncrementalLowerBps = diagnostic.IncrementalLowerBps
+	d.ExpectedMeanBps = diagnostic.ExpectedMeanBps
+	d.ExpectedStdErrorBps = diagnostic.ExpectedStdErrorBps
+	d.ExpectedLowerBps = diagnostic.ExpectedLowerBps
 	d.FillProbability = diagnostic.FillProbability
 	d.EffectiveSamples = diagnostic.EffectiveSamples
 	selectedPrice := 0.0
@@ -142,8 +155,8 @@ func (c MarketMakerConfig) ApplyPostFillUtility(model *MarketMakerHorizonModel, 
 	} else if side == types.SideTypeSell && in.Fill.Price > 0 {
 		d.CycleEdgeBps = math.Log(selectedPrice/in.Fill.Price) * 10_000
 	}
-	if diagnostic.EffectiveSamples < float64(c.PostFillUtility.MinimumSamples) || diagnostic.IncrementalLowerBps <= 0 {
-		d.Reason = "no inward candidate has positive paired utility lower bound"
+	if diagnostic.EffectiveSamples < float64(c.PostFillUtility.MinimumSamples) || diagnostic.ExpectedLowerBps <= 0 {
+		d.Reason = "no completion candidate has positive terminal-wealth lower bound"
 		return d
 	}
 	best := diagnostic
@@ -170,12 +183,15 @@ func (c MarketMakerConfig) ApplyPostFillUtility(model *MarketMakerHorizonModel, 
 	d.Plan.HalfSpreadBps = math.Max(d.Plan.BidDistanceBps, d.Plan.AskDistanceBps)
 
 	d.Applied = true
-	d.Reason = "positive paired terminal-wealth utility lower bound"
+	d.Reason = "positive post-fill terminal-wealth lower bound"
 	d.SelectedDistanceBps = best.DistanceBps
 	d.SelectedPrice = selectedPrice
 	d.IncrementalMeanBps = best.IncrementalMeanBps
 	d.IncrementalStdErrorBps = best.IncrementalStdErrorBps
 	d.IncrementalLowerBps = best.IncrementalLowerBps
+	d.ExpectedMeanBps = best.ExpectedMeanBps
+	d.ExpectedStdErrorBps = best.ExpectedStdErrorBps
+	d.ExpectedLowerBps = best.ExpectedLowerBps
 	d.FillProbability = best.FillProbability
 	d.EffectiveSamples = best.EffectiveSamples
 	return d
@@ -200,9 +216,11 @@ func postFillInventoryRiskBenefitBps(side types.SideType, in PostFillUtilityInpu
 }
 
 // postFillUtilityCandidates uses completed, overlap-adjusted executable-BBO
-// paths. BUY is touched on ask and marked at terminal bid; SELL is touched on
-// bid and marked at terminal ask, so adverse selection is observed directly.
-func (m MarketMakerHorizonModel) postFillUtilityCandidates(now time.Time, lookback, horizon time.Duration, side types.SideType, distances []float64, roundTripFeeAndEdgeBps, inventoryRiskBenefitBps, zScore float64) []PostFillUtilityCandidate {
+// paths. Both sides are measured as incremental terminal liquidatable wealth:
+// BUY acquires base and SELL avoids carrying base, so both counterfactuals use
+// terminal bid. A terminal ask is valid only in a separately explicit future
+// repurchase cycle.
+func (m MarketMakerHorizonModel) postFillUtilityCandidates(now time.Time, lookback, horizon time.Duration, side types.SideType, distances []float64, entryCostBps, inventoryRiskBenefitBps, zScore float64) []PostFillUtilityCandidate {
 	out := make([]PostFillUtilityCandidate, len(distances))
 	for i, distance := range distances {
 		out[i].DistanceBps = distance
@@ -227,6 +245,8 @@ func (m MarketMakerHorizonModel) postFillUtilityCandidates(now time.Time, lookba
 	var lastExposure time.Time
 	var sumWeight, sumWeightSquared float64
 	fillWeight := make([]float64, len(distances))
+	valueSum := make([]float64, len(distances))
+	valueSquareSum := make([]float64, len(distances))
 	diffSum := make([]float64, len(distances))
 	diffSquareSum := make([]float64, len(distances))
 	pushWindow := func(index int) {
@@ -275,7 +295,7 @@ func (m MarketMakerHorizonModel) postFillUtilityCandidates(now time.Time, lookba
 			continue
 		}
 		startBid, startAsk := start.bidPrice(), start.askPrice()
-		terminalBid, terminalAsk := m.points[right-1].bidPrice(), m.points[right-1].askPrice()
+		terminalBid := m.points[right-1].bidPrice()
 		maxBid := m.points[maxDeque[0]].bidPrice()
 		minAsk := m.points[minDeque[0]].askPrice()
 		outcomes := make([]float64, len(distances))
@@ -284,18 +304,22 @@ func (m MarketMakerHorizonModel) postFillUtilityCandidates(now time.Time, lookba
 				quote := startAsk * math.Exp(-distance/10_000)
 				if minAsk <= quote && terminalBid > 0 {
 					fillWeight[j] += weight
-					outcomes[j] = math.Log(terminalBid/quote)*10_000 - roundTripFeeAndEdgeBps + inventoryRiskBenefitBps
+					outcomes[j] = makerFillTerminalWealthBps(
+						true, quote, terminalBid, entryCostBps) + inventoryRiskBenefitBps
 				}
 			} else {
 				quote := startBid * math.Exp(distance/10_000)
-				if maxBid >= quote && terminalAsk > 0 {
+				if maxBid >= quote && terminalBid > 0 {
 					fillWeight[j] += weight
-					outcomes[j] = math.Log(quote/terminalAsk)*10_000 - roundTripFeeAndEdgeBps + inventoryRiskBenefitBps
+					outcomes[j] = makerFillTerminalWealthBps(
+						false, quote, terminalBid, entryCostBps) + inventoryRiskBenefitBps
 				}
 			}
 		}
 		base := outcomes[0]
 		for j := range distances {
+			valueSum[j] += weight * outcomes[j]
+			valueSquareSum[j] += weight * outcomes[j] * outcomes[j]
 			diff := outcomes[j] - base
 			diffSum[j] += weight * diff
 			diffSquareSum[j] += weight * diff * diff
@@ -314,6 +338,12 @@ func (m MarketMakerHorizonModel) postFillUtilityCandidates(now time.Time, lookba
 	for i := range out {
 		out[i].EffectiveSamples = effectiveN
 		out[i].FillProbability, _ = jeffreysBernoulliPosterior(fillWeight[i], sumWeight)
+		expectedMean := valueSum[i] / sumWeight
+		expectedVariance := math.Max(0, valueSquareSum[i]/sumWeight-expectedMean*expectedMean)
+		expectedSE := math.Sqrt(expectedVariance / math.Max(1, effectiveN))
+		out[i].ExpectedMeanBps = expectedMean
+		out[i].ExpectedStdErrorBps = expectedSE
+		out[i].ExpectedLowerBps = expectedMean - math.Max(0, zScore)*expectedSE
 		mean := diffSum[i] / sumWeight
 		variance := math.Max(0, diffSquareSum[i]/sumWeight-mean*mean)
 		se := math.Sqrt(variance / math.Max(1, effectiveN))

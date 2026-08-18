@@ -7,30 +7,33 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
-const modelCheckpointVersion = 3
+const modelCheckpointVersion = 7
 
 // ModelCheckpoint is the bounded, causal state required to continue live
 // learning from a capture delta. It contains no orders, balances, or fills.
 // Deterministic backtest/replay environments deliberately never restore it.
 type ModelCheckpoint struct {
-	Version      int            `json:"version"`
-	Symbol       string         `json:"symbol"`
-	ModelHash    string         `json:"modelHash"`
-	SavedAt      time.Time      `json:"savedAt"`
-	ReplayAfter  time.Time      `json:"replayAfter"`
-	Engine       CrossingEngine `json:"engine"`
-	CaptureFiles map[string]captureFileCheckpoint
-	Slow         intensityCheckpoint               `json:"slow"`
-	Fast         map[string]intensityCheckpoint    `json:"fast,omitempty"`
-	BOCPD45      *bocpd45Checkpoint                `json:"bocpd45,omitempty"`
-	Direction    map[string]directionCheckpoint    `json:"direction,omitempty"`
-	Evidence     map[string]fastEvidenceCheckpoint `json:"evidence,omitempty"`
-	FastDrift    map[string]fastDriftCheckpoint    `json:"fastDrift,omitempty"`
-	Horizon      horizonCheckpoint                 `json:"horizon"`
-	Macro        macroInventoryCheckpoint          `json:"macro"`
+	Version                   int                                  `json:"version"`
+	Symbol                    string                               `json:"symbol"`
+	ModelHash                 string                               `json:"modelHash"`
+	SavedAt                   time.Time                            `json:"savedAt"`
+	ReplayAfter               time.Time                            `json:"replayAfter"`
+	TradeReplayAfter          time.Time                            `json:"tradeReplayAfter,omitempty"`
+	Engine                    CrossingEngine                       `json:"engine"`
+	CaptureFiles              map[string]captureFileCheckpoint     `json:"captureFiles,omitempty"`
+	Slow                      intensityCheckpoint                  `json:"slow"`
+	Fast                      map[string]intensityCheckpoint       `json:"fast,omitempty"`
+	BOCPD45                   *bocpd45Checkpoint                   `json:"bocpd45,omitempty"`
+	AsymmetricOscillationRisk *asymmetricOscillationRiskCheckpoint `json:"asymmetricOscillationRisk,omitempty"`
+	Direction                 map[string]directionCheckpoint       `json:"direction,omitempty"`
+	Evidence                  map[string]fastEvidenceCheckpoint    `json:"evidence,omitempty"`
+	FastDrift                 map[string]fastDriftCheckpoint       `json:"fastDrift,omitempty"`
+	Horizon                   horizonCheckpoint                    `json:"horizon"`
+	Macro                     macroInventoryCheckpoint             `json:"macro"`
 }
 
 type intensityCheckpoint struct {
@@ -99,10 +102,44 @@ type fastDriftCheckpoint struct {
 }
 
 type horizonCheckpoint struct {
-	Points     []MarketMakerHorizonPoint  `json:"points,omitempty"`
-	LastSecond time.Time                  `json:"lastSecond,omitempty"`
-	LastUpdate time.Time                  `json:"lastUpdate,omitempty"`
-	Decision   MarketMakerHorizonDecision `json:"decision"`
+	Points         []horizonPointCheckpoint                  `json:"points,omitempty"`
+	LastSecond     time.Time                                 `json:"lastSecond,omitempty"`
+	LastUpdate     time.Time                                 `json:"lastUpdate,omitempty"`
+	Decision       MarketMakerHorizonDecision                `json:"decision"`
+	VolumeProfiles map[string]rollingVolumeProfileCheckpoint `json:"volumeProfiles,omitempty"`
+}
+
+type volumeProfileSnapshotCheckpoint struct {
+	Horizon time.Duration      `json:"horizon"`
+	State   VolumeProfileState `json:"state"`
+}
+
+type horizonPointCheckpoint struct {
+	At               time.Time                         `json:"at"`
+	Bid              float64                           `json:"bid"`
+	Ask              float64                           `json:"ask"`
+	Mid              float64                           `json:"mid"`
+	BBOWeightedPrice float64                           `json:"bboWeightedPrice"`
+	BookImbalance    float64                           `json:"bookImbalance"`
+	BookDepthReady   bool                              `json:"bookDepthReady"`
+	GapBefore        bool                              `json:"gapBefore"`
+	VolumeProfiles   []volumeProfileSnapshotCheckpoint `json:"volumeProfiles,omitempty"`
+}
+
+type volumeProfileBinCheckpoint struct {
+	Index int64   `json:"index"`
+	Buy   float64 `json:"buy"`
+	Sell  float64 `json:"sell"`
+	Count float64 `json:"count"`
+}
+
+type rollingVolumeProfileCheckpoint struct {
+	LastAt    time.Time                    `json:"lastAt,omitempty"`
+	Scale     float64                      `json:"scale"`
+	TotalRaw  float64                      `json:"totalRaw"`
+	CountRaw  float64                      `json:"countRaw"`
+	LastPrice float64                      `json:"lastPrice"`
+	Bins      []volumeProfileBinCheckpoint `json:"bins,omitempty"`
 }
 
 type macroCheckpointBar struct {
@@ -146,6 +183,8 @@ func (s *Strategy) modelCheckpointHash() (string, error) {
 		FastEvidenceMinTrades     int
 		FastEvidenceMinBBOUpdates int
 		FastDriftEnabled          bool
+		VolumeProfile             VolumeProfileConfig
+		AsymmetricOscillationRisk AsymmetricOscillationRiskConfig
 		BOCPD45                   BOCPD45Config
 		MacroBarInterval          time.Duration
 		MacroLookback             time.Duration
@@ -162,6 +201,8 @@ func (s *Strategy) modelCheckpointHash() (string, error) {
 		FastEvidenceMinTrades:     marketMaker.FastEvidenceMinTrades,
 		FastEvidenceMinBBOUpdates: marketMaker.FastEvidenceMinBBOUpdates,
 		FastDriftEnabled:          marketMaker.FastDrift.Enabled,
+		VolumeProfile:             marketMaker.VolumeProfile,
+		AsymmetricOscillationRisk: marketMaker.AsymmetricOscillationRisk,
 		BOCPD45:                   marketMaker.BOCPD45,
 		MacroBarInterval:          time.Duration(macro.BarInterval),
 		MacroLookback:             time.Duration(macro.Lookback),
@@ -192,7 +233,73 @@ func restoreIntensity(model *IntensityModel, checkpoint intensityCheckpoint) {
 	model.lastObservation = checkpoint.LastObservation
 }
 
-func (s *Strategy) completedCaptureFileCheckpoints(replayAfter time.Time) (map[string]captureFileCheckpoint, error) {
+func checkpointHorizonPoint(point MarketMakerHorizonPoint) horizonPointCheckpoint {
+	checkpoint := horizonPointCheckpoint{
+		At: point.At, Bid: point.Bid, Ask: point.Ask, Mid: point.Mid,
+		BBOWeightedPrice: point.BBOWeightedPrice, BookImbalance: point.BookImbalance,
+		BookDepthReady: point.BookDepthReady, GapBefore: point.GapBefore,
+	}
+	for index := 0; index < int(point.volumeProfileN) && index < len(point.volumeProfiles); index++ {
+		profile := point.volumeProfiles[index]
+		checkpoint.VolumeProfiles = append(checkpoint.VolumeProfiles, volumeProfileSnapshotCheckpoint{
+			Horizon: profile.Horizon, State: profile.State,
+		})
+	}
+	return checkpoint
+}
+
+func restoreHorizonPoint(checkpoint horizonPointCheckpoint) MarketMakerHorizonPoint {
+	point := MarketMakerHorizonPoint{
+		At: checkpoint.At, Bid: checkpoint.Bid, Ask: checkpoint.Ask, Mid: checkpoint.Mid,
+		BBOWeightedPrice: checkpoint.BBOWeightedPrice, BookImbalance: checkpoint.BookImbalance,
+		BookDepthReady: checkpoint.BookDepthReady, GapBefore: checkpoint.GapBefore,
+	}
+	for _, profile := range checkpoint.VolumeProfiles {
+		if int(point.volumeProfileN) >= len(point.volumeProfiles) {
+			break
+		}
+		point.volumeProfiles[point.volumeProfileN] = volumeProfileSnapshot{
+			Horizon: profile.Horizon, State: profile.State,
+		}
+		point.volumeProfileN++
+	}
+	return point
+}
+
+func checkpointRollingVolumeProfile(profile *RollingVolumeProfile) rollingVolumeProfileCheckpoint {
+	if profile == nil {
+		return rollingVolumeProfileCheckpoint{}
+	}
+	checkpoint := rollingVolumeProfileCheckpoint{
+		LastAt: profile.lastAt, Scale: profile.scale, TotalRaw: profile.totalRaw,
+		CountRaw: profile.countRaw, LastPrice: profile.lastPrice,
+		Bins: make([]volumeProfileBinCheckpoint, 0, len(profile.bins)),
+	}
+	for index, bin := range profile.bins {
+		checkpoint.Bins = append(checkpoint.Bins, volumeProfileBinCheckpoint{
+			Index: index, Buy: bin.buy, Sell: bin.sell, Count: bin.count,
+		})
+	}
+	return checkpoint
+}
+
+func restoreRollingVolumeProfile(config VolumeProfileConfig, checkpoint rollingVolumeProfileCheckpoint) (*RollingVolumeProfile, error) {
+	if checkpoint.Scale <= 0 {
+		return nil, fmt.Errorf("volume-profile checkpoint scale must be positive")
+	}
+	profile := NewRollingVolumeProfile(config)
+	profile.lastAt = checkpoint.LastAt
+	profile.scale = checkpoint.Scale
+	profile.totalRaw = checkpoint.TotalRaw
+	profile.countRaw = checkpoint.CountRaw
+	profile.lastPrice = checkpoint.LastPrice
+	for _, bin := range checkpoint.Bins {
+		profile.bins[bin.Index] = volumeProfileBin{buy: bin.Buy, sell: bin.Sell, count: bin.Count}
+	}
+	return profile, nil
+}
+
+func (s *Strategy) completedCaptureFileCheckpoints(replayAfter, tradeReplayAfter time.Time) (map[string]captureFileCheckpoint, error) {
 	files, err := s.binanceBBOCaptureFiles()
 	if err != nil {
 		return nil, err
@@ -212,11 +319,19 @@ func (s *Strategy) completedCaptureFileCheckpoints(replayAfter time.Time) (map[s
 	}
 	completed := make(map[string]captureFileCheckpoint)
 	for filename := range seen {
-		if checkpoint, ok := captureFileCheckpointIfComplete(filename, replayAfter); ok {
+		cursor := replayAfter
+		if filepath.Base(filename) != "" && isTradeCaptureFile(filename) {
+			cursor = tradeReplayAfter
+		}
+		if checkpoint, ok := captureFileCheckpointIfComplete(filename, cursor); ok {
 			completed[filename] = checkpoint
 		}
 	}
 	return completed, nil
+}
+
+func isTradeCaptureFile(filename string) bool {
+	return filepath.Ext(filename) == ".csv" && strings.Contains(filepath.Base(filename), "-trades-")
 }
 
 func (s *Strategy) prepareModelCheckpoint(now time.Time) error {
@@ -228,26 +343,29 @@ func (s *Strategy) prepareModelCheckpoint(now time.Time) error {
 	if err != nil {
 		return err
 	}
-	captureFiles, err := s.completedCaptureFileCheckpoints(s.State.LastReferenceTime)
+	captureFiles, err := s.completedCaptureFileCheckpoints(s.State.LastReferenceTime, s.makerLastPublicTradeAt)
 	if err != nil {
 		return err
 	}
 	checkpoint := &ModelCheckpoint{
 		Version: modelCheckpointVersion, Symbol: s.Symbol, ModelHash: hash,
 		SavedAt: now.UTC(), ReplayAfter: s.State.LastReferenceTime.UTC(),
-		Engine:       *s.State.Engine,
-		CaptureFiles: captureFiles,
-		Slow:         checkpointIntensity(s.model),
-		BOCPD45:      s.makerBOCPD45.checkpoint(),
-		Fast:         make(map[string]intensityCheckpoint, len(s.fastModels)),
-		Direction:    make(map[string]directionCheckpoint, len(s.makerDirectionModels)),
-		Evidence:     make(map[string]fastEvidenceCheckpoint, len(s.fastEvidenceModels)),
-		FastDrift:    make(map[string]fastDriftCheckpoint, len(s.makerHorizonModel.fastDrift)),
+		TradeReplayAfter:          s.makerLastPublicTradeAt.UTC(),
+		Engine:                    *s.State.Engine,
+		CaptureFiles:              captureFiles,
+		Slow:                      checkpointIntensity(s.model),
+		BOCPD45:                   s.makerBOCPD45.checkpoint(),
+		AsymmetricOscillationRisk: s.makerAsymmetricOscillationRisk.checkpoint(),
+		Fast:                      make(map[string]intensityCheckpoint, len(s.fastModels)),
+		Direction:                 make(map[string]directionCheckpoint, len(s.makerDirectionModels)),
+		Evidence:                  make(map[string]fastEvidenceCheckpoint, len(s.fastEvidenceModels)),
+		FastDrift:                 make(map[string]fastDriftCheckpoint, len(s.makerHorizonModel.fastDrift)),
 		Horizon: horizonCheckpoint{
-			Points:     append([]MarketMakerHorizonPoint(nil), s.makerHorizonModel.points...),
-			LastSecond: s.makerHorizonModel.lastSecond,
-			LastUpdate: s.makerHorizonModel.lastUpdate,
-			Decision:   s.makerHorizonModel.decision,
+			Points:         make([]horizonPointCheckpoint, 0, len(s.makerHorizonModel.points)),
+			LastSecond:     s.makerHorizonModel.lastSecond,
+			LastUpdate:     s.makerHorizonModel.lastUpdate,
+			Decision:       s.makerHorizonModel.decision,
+			VolumeProfiles: make(map[string]rollingVolumeProfileCheckpoint, len(s.makerHorizonModel.volumeProfiles)),
 		},
 		Macro: macroInventoryCheckpoint{
 			CurrentStart:    s.makerMacroInventoryModel.currentStart,
@@ -257,6 +375,12 @@ func (s *Strategy) prepareModelCheckpoint(now time.Time) error {
 			CurrentSegment:  s.makerMacroInventoryModel.currentSegment,
 			LastObservation: s.makerMacroInventoryModel.lastObservation,
 		},
+	}
+	for _, point := range s.makerHorizonModel.points {
+		checkpoint.Horizon.Points = append(checkpoint.Horizon.Points, checkpointHorizonPoint(point))
+	}
+	for window, profile := range s.makerHorizonModel.volumeProfiles {
+		checkpoint.Horizon.VolumeProfiles[checkpointWindowKey(window)] = checkpointRollingVolumeProfile(profile)
 	}
 	for window, model := range s.fastModels {
 		checkpoint.Fast[checkpointWindowKey(window)] = checkpointIntensity(model)
@@ -320,7 +444,8 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 	if checkpoint.Version != modelCheckpointVersion {
 		return time.Time{}, false, fmt.Errorf("model checkpoint version %d is not supported", checkpoint.Version)
 	}
-	if checkpoint.Symbol != s.Symbol || checkpoint.ReplayAfter.IsZero() || checkpoint.ReplayAfter.After(now) {
+	if checkpoint.Symbol != s.Symbol || checkpoint.ReplayAfter.IsZero() || checkpoint.ReplayAfter.After(now) ||
+		checkpoint.TradeReplayAfter.After(now) {
 		return time.Time{}, false, fmt.Errorf("model checkpoint identity or replay cursor is invalid")
 	}
 	hash, err := s.modelCheckpointHash()
@@ -335,6 +460,16 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 	}
 	if s.MarketMaker.BOCPD45.Enabled && checkpoint.BOCPD45 == nil {
 		return time.Time{}, false, fmt.Errorf("model checkpoint is missing BOCPD45 calibration state")
+	}
+	if s.MarketMaker.AsymmetricOscillationRisk.Enabled && checkpoint.AsymmetricOscillationRisk == nil {
+		return time.Time{}, false, fmt.Errorf("model checkpoint is missing asymmetric oscillation risk state")
+	}
+	if s.MarketMaker.VolumeProfile.Enabled {
+		for _, window := range s.MarketMaker.FastModelWindows() {
+			if _, ok := checkpoint.Horizon.VolumeProfiles[checkpointWindowKey(window)]; !ok {
+				return time.Time{}, false, fmt.Errorf("model checkpoint is missing volume profile window %s", window)
+			}
+		}
 	}
 	for window := range s.fastModels {
 		key := checkpointWindowKey(window)
@@ -357,6 +492,7 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 	// checkpoint. Model state is only complete through ReplayAfter, so delta
 	// replay must start from that cursor rather than the newer top-level value.
 	s.State.LastReferenceTime = checkpoint.ReplayAfter
+	s.makerLastPublicTradeAt = checkpoint.TradeReplayAfter
 	s.State.Engine = &checkpoint.Engine
 	s.makerCheckpointCaptureFiles = checkpoint.CaptureFiles
 	restoreIntensity(s.model, checkpoint.Slow)
@@ -383,6 +519,11 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 			return time.Time{}, false, err
 		}
 	}
+	if s.MarketMaker.AsymmetricOscillationRisk.Enabled {
+		if err := s.makerAsymmetricOscillationRisk.restore(checkpoint.AsymmetricOscillationRisk); err != nil {
+			return time.Time{}, false, err
+		}
+	}
 	for window, model := range s.fastEvidenceModels {
 		state, ok := checkpoint.Evidence[checkpointWindowKey(window)]
 		if !ok {
@@ -404,12 +545,26 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 		model.trimLocked(now)
 		model.mu.Unlock()
 	}
-	s.makerHorizonModel.points = append([]MarketMakerHorizonPoint(nil), checkpoint.Horizon.Points...)
+	s.makerHorizonModel.points = make([]MarketMakerHorizonPoint, 0, len(checkpoint.Horizon.Points))
+	for _, point := range checkpoint.Horizon.Points {
+		s.makerHorizonModel.points = append(s.makerHorizonModel.points, restoreHorizonPoint(point))
+	}
 	s.makerHorizonModel.lastSecond = checkpoint.Horizon.LastSecond
 	// Preserve learned points and the last decision for diagnostics, but force
 	// the first live BBO to recompute distance under the current quote algorithm.
 	s.makerHorizonModel.lastUpdate = time.Time{}
 	s.makerHorizonModel.decision = checkpoint.Horizon.Decision
+	if s.MarketMaker.VolumeProfile.Enabled {
+		s.makerHorizonModel.configureVolumeProfiles(s.MarketMaker)
+		for _, window := range s.MarketMaker.FastModelWindows() {
+			state := checkpoint.Horizon.VolumeProfiles[checkpointWindowKey(window)]
+			profile, restoreErr := restoreRollingVolumeProfile(s.MarketMaker.VolumeProfile, state)
+			if restoreErr != nil {
+				return time.Time{}, false, fmt.Errorf("restore volume profile %s: %w", window, restoreErr)
+			}
+			s.makerHorizonModel.volumeProfiles[window] = profile
+		}
+	}
 	if s.MarketMaker.FastDrift.Enabled {
 		s.makerHorizonModel.fastDrift = make(map[time.Duration]*fastDriftRegression, len(checkpoint.FastDrift))
 		for _, window := range s.MarketMaker.FastModelWindows() {
@@ -436,6 +591,7 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 		}
 	}
 	s.makerHorizonModel.rebuildSideHARVarianceRisk(s.MarketMaker)
+	s.makerHorizonModel.rebuildExecutableDownside(s.MarketMaker)
 	if s.makerExecutableCrossingModel != nil {
 		s.makerExecutableCrossingModel.Rebuild(s.makerHorizonModel.points)
 	}

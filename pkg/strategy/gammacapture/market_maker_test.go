@@ -217,26 +217,111 @@ func TestOrderKeepDistanceUsesActualExecutableDistance(t *testing.T) {
 	}
 }
 
-func TestDynamicOrderKeepDecisionRoundsUpToMeasuredHorizon(t *testing.T) {
+func TestDynamicOrderKeepDecisionUsesSelectedReferenceHorizon(t *testing.T) {
 	c := MarketMakerConfig{
 		MinTradingWindow: types.Duration(10 * time.Minute),
 		MaxTradingWindow: types.Duration(30 * time.Minute),
 	}
 	decision := c.DynamicOrderKeepDecision(10*time.Minute, 15, 0.58)
-	if decision.Duration != 15*time.Minute {
-		t.Fatalf("11-minute first-passage scale should round up to 15m: %+v", decision)
+	if decision.Duration != 10*time.Minute {
+		t.Fatalf("10m crossing posterior must create a 10m lease: %+v", decision)
 	}
 	if decision.CharacteristicFirstPassageTime <= 10*time.Minute || decision.CharacteristicFirstPassageTime >= 15*time.Minute {
 		t.Fatalf("unexpected characteristic passage time: %+v", decision)
 	}
 
 	decision = c.DynamicOrderKeepDecision(10*time.Minute, 30, 0.58)
-	if decision.Duration != 30*time.Minute {
-		t.Fatalf("long passage scale should use the configured 30m cap: %+v", decision)
+	if decision.Duration != 10*time.Minute {
+		t.Fatalf("diagnostic passage time must not rewrite the selected model: %+v", decision)
 	}
 	decision = c.DynamicOrderKeepDecision(30*time.Minute, 15, 5)
 	if decision.Duration != 30*time.Minute {
 		t.Fatalf("order keep time must never be shorter than the selected statistical horizon: %+v", decision)
+	}
+}
+
+func TestHorizonModelUpdatesOnFixedFiveMinuteBuckets(t *testing.T) {
+	start := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	c := MarketMakerConfig{
+		HorizonUpdateInterval: types.Duration(5 * time.Minute),
+		MinTradingWindow:      types.Duration(10 * time.Minute),
+		MaxTradingWindow:      types.Duration(30 * time.Minute),
+	}
+	model := MarketMakerHorizonModel{
+		lastUpdate: start,
+		decision: MarketMakerHorizonDecision{
+			Horizon: 10 * time.Minute, Reason: "cached fixed bucket",
+		},
+	}
+	if got := model.UpdateForBook(start.Add(4*time.Minute+59*time.Second), c, 1, 99, 101); got.Reason != "cached fixed bucket" {
+		t.Fatalf("same fixed bucket should reuse all-window decision: %+v", got)
+	}
+	got := model.UpdateForBook(start.Add(5*time.Minute), c, 1, 99, 101)
+	if got.Reason == "cached fixed bucket" || !model.lastUpdate.Equal(start.Add(5*time.Minute)) {
+		t.Fatalf("next wall-clock bucket must recompute all windows: decision=%+v updated=%s", got, model.lastUpdate)
+	}
+}
+
+func TestExecutableDownsideIsPublishedOnlyOnModelClock(t *testing.T) {
+	start := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	model := MarketMakerHorizonModel{
+		downsideDecision: DrawdownEProcessDecision{
+			Active: true, DownEValue: 25, BidForecastBps: 40,
+		},
+		upsideDecision: DrawdownEProcessDecision{
+			Active: true, DownEValue: 30, BidForecastBps: 50,
+		},
+	}
+	model.publishExecutableDownside(start, 15*time.Minute)
+	model.downsideDecision = DrawdownEProcessDecision{Active: false}
+	model.upsideDecision = DrawdownEProcessDecision{Active: false}
+	if got := model.ExecutableDownsideDecision(15 * time.Minute); !got.Active || got.DownEValue != 25 {
+		t.Fatalf("intra-bucket raw evidence must not mutate published decision: %+v", got)
+	}
+	if got := model.ExecutableUpsideDecision(15 * time.Minute); !got.Active || got.DownEValue != 30 {
+		t.Fatalf("intra-bucket raw upside evidence must not mutate published decision: %+v", got)
+	}
+	if got := model.ExecutableDownsideDecision(30 * time.Minute); math.Abs(got.BidForecastBps-80) > 1e-12 {
+		t.Fatalf("published downside forecast must use the requested statistical horizon: %+v", got)
+	}
+	if got := model.ExecutableUpsideDecision(30 * time.Minute); math.Abs(got.BidForecastBps-100) > 1e-12 {
+		t.Fatalf("published upside forecast must use the requested statistical horizon: %+v", got)
+	}
+	model.publishExecutableDownside(start.Add(5*time.Minute), 15*time.Minute)
+	if got := model.ExecutableDownsideDecision(15 * time.Minute); got.Active {
+		t.Fatalf("next fixed model bucket should publish current evidence: %+v", got)
+	}
+	if got := model.ExecutableUpsideDecision(15 * time.Minute); got.Active {
+		t.Fatalf("next fixed model bucket should publish current upside evidence: %+v", got)
+	}
+}
+
+func TestExecutableUpsideUsesOriginalAskThroughReciprocalBBO(t *testing.T) {
+	start := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	c := MarketMakerConfig{
+		InventoryRiskZScore: .1,
+		FastWindows: []types.Duration{
+			types.Duration(10 * time.Minute), types.Duration(15 * time.Minute), types.Duration(30 * time.Minute),
+		},
+		HorizonLookback:  types.Duration(time.Hour),
+		MinTradingWindow: types.Duration(10 * time.Minute),
+		MaxTradingWindow: types.Duration(30 * time.Minute),
+	}
+	model := MarketMakerHorizonModel{}
+	for i := 0; i <= 12; i++ {
+		ask := 100.1 * math.Exp(float64(i)*.001)
+		bid := ask - .1
+		model.ObserveBookWithSizesAndGap(
+			start.Add(time.Duration(i)*time.Minute), bid, 1, ask, 1, c, false)
+	}
+	model.publishExecutableDownside(start.Add(15*time.Minute), 15*time.Minute)
+	up := model.ExecutableUpsideDecision(15 * time.Minute)
+	down := model.ExecutableDownsideDecision(15 * time.Minute)
+	if !up.Active || !(up.BidForecastBps > 0) {
+		t.Fatalf("persistent original-ask rise should activate reciprocal executable upside: %+v", up)
+	}
+	if down.Active {
+		t.Fatalf("monotone executable rise must not activate downside: %+v", down)
 	}
 }
 
@@ -271,14 +356,20 @@ func TestTradingHorizonsIncludeFiveToThirtyMinutes(t *testing.T) {
 
 func TestMakerQuoteRefreshSignalsRespectDynamicKeepDuration(t *testing.T) {
 	keep := 10 * time.Minute
-	if makerQuoteRefreshRequired(19*time.Second, 20*time.Second, keep, false, false, false, true, true, true, false, true) {
+	if makerQuoteRefreshRequired(19*time.Second, 20*time.Second, keep, false, false, false, true, true, true, false, false, true, false) {
 		t.Fatal("signals must not bypass the minimum transport resting interval")
 	}
-	if !makerQuoteRefreshRequired(20*time.Second, 20*time.Second, keep, true, false, false, false, false, false, false, false) {
+	if !makerQuoteRefreshRequired(20*time.Second, 20*time.Second, keep, true, false, false, false, false, false, false, false, false, false) {
 		t.Fatal("a crossed quote must remain a hard lifecycle transition")
 	}
-	if !makerQuoteRefreshRequired(20*time.Second, 20*time.Second, keep, false, false, false, false, false, true, false, false) {
+	if !makerQuoteRefreshRequired(20*time.Second, 20*time.Second, keep, false, false, false, false, false, true, false, false, false, false) {
 		t.Fatal("a missing or policy-mismatched side must remain actionable")
+	}
+	if makerQuoteRefreshRequired(5*time.Minute, 8*time.Minute, keep, false, false, false, false, false, false, true, false, false, false) {
+		t.Fatal("an empty book must remain idle until its explicit no-order lease expires")
+	}
+	if !makerQuoteRefreshRequired(5*time.Minute, 8*time.Minute, keep, false, true, false, false, false, false, true, false, false, false) {
+		t.Fatal("an expired no-order lease must bypass resting-order refresh and keep durations")
 	}
 	for name, signal := range map[string][4]bool{
 		"window expiry":      {true, false, false, false},
@@ -286,21 +377,53 @@ func TestMakerQuoteRefreshSignalsRespectDynamicKeepDuration(t *testing.T) {
 		"material move":      {false, false, true, false},
 		"material imbalance": {false, false, false, true},
 	} {
-		if makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, signal[0], signal[1], signal[2], signal[3], false, false, false) {
+		if makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, signal[0], signal[1], signal[2], signal[3], false, false, false, false, false) {
 			t.Fatalf("%s must not destroy queue age before the modeled keep duration", name)
 		}
-		if !makerQuoteRefreshRequired(keep, 20*time.Second, keep, false, signal[0], signal[1], signal[2], signal[3], false, false, false) {
+		if !makerQuoteRefreshRequired(keep, 20*time.Second, keep, false, signal[0], signal[1], signal[2], signal[3], false, false, false, false, false) {
 			t.Fatalf("%s should refresh once the modeled keep duration resolves", name)
 		}
 	}
-	if !makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, false, false, false, false, false, true, false) {
-		t.Fatal("a healthy fast-edge evidence lease should permit one bounded reprice before the generic keep duration")
+	if makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, false, false, false, false, false, false, true, false, false) {
+		t.Fatal("a five-minute Fast update must not cancel a quote born from a longer reference window")
 	}
-	if !makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, false, false, false, false, false, false, true) {
-		t.Fatal("a statistically significant edge improvement should re-align inside the generic keep duration")
+	if makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, false, false, false, false, false, false, false, true, false) {
+		t.Fatal("statistical realignment must wait for the order's original reference lease")
 	}
-	if makerQuoteRefreshRequired(keep, 20*time.Second, keep, false, false, false, false, false, false, false, false) {
+	if !makerQuoteRefreshRequired(keep, 20*time.Second, keep, false, false, false, false, false, false, false, true, false, false) {
+		t.Fatal("Fast edge may reprice after the reference lease resolves")
+	}
+	if makerQuoteRefreshRequired(keep, 20*time.Second, keep, false, false, false, false, false, false, false, false, false, false) {
 		t.Fatal("no refresh signal should retain the existing quote")
+	}
+	if !makerQuoteRefreshRequired(time.Minute, 20*time.Second, keep, false, false, false, false, false, false, false, false, false, true) {
+		t.Fatal("confidence-supported target-restoring one-sided replacement must not wait for the full lease")
+	}
+}
+
+func TestMakerEmptyBookRetryPendingPreservesEvidenceClockOnly(t *testing.T) {
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	retryAfter := now.Add(5 * time.Minute)
+	if !makerEmptyBookRetryPending(now, retryAfter, 0, 0, 100, 101, 100, 101, 8) {
+		t.Fatal("an empty exchange book should suppress repeated optimizer work during its no-order lease")
+	}
+	if makerEmptyBookRetryPending(retryAfter, retryAfter, 0, 0, 100, 101, 100, 101, 8) {
+		t.Fatal("the optimizer must wake exactly when the no-order lease expires")
+	}
+	if makerEmptyBookRetryPending(now, retryAfter, 1, 0, 100, 101, 100, 101, 8) {
+		t.Fatal("resting orders must retain their ordinary safety and refresh lifecycle")
+	}
+	if makerEmptyBookRetryPending(now, retryAfter, 0, 1, 100, 101, 100, 101, 8) {
+		t.Fatal("a fill-triggered inventory rebalance must bypass the no-order lease")
+	}
+	if makerEmptyBookRetryPending(now, retryAfter, 0, 0, 100, 101, 99.91, 100.91, 8) {
+		t.Fatal("a material executable-BBO move must invalidate the state-conditional no-order lease")
+	}
+	if !makerEmptyBookRetryPending(now, retryAfter, 0, 0, 100, 101, 99.93, 100.93, 8) {
+		t.Fatal("a sub-threshold BBO move must retain the no-order lease")
+	}
+	if !makerEmptyBookRetryPending(now, retryAfter, 0, 0, 0, 0, 90, 91, 8) {
+		t.Fatal("an exchange-feasibility retry without a model anchor must retain its fixed clock")
 	}
 }
 
@@ -456,6 +579,20 @@ func TestMakerQuoteNearFillProtectsETHJPYQueueAtWindowExpiry(t *testing.T) {
 	}
 	if makerQuoteNearFill(302180, 303427, 302172, 302173, plan, 26) {
 		t.Fatal("marketable/crossed bid must not be retained")
+	}
+}
+
+func TestMakerQuoteNearFillProtectsOneSidedTargetRestoringQueue(t *testing.T) {
+	plan := MarketMakerQuotePlan{
+		AllowBid: true, BidPrice: 302_158, AskPrice: 303_427,
+		BidTouchDistanceBps: 15, AskTouchDistanceBps: 15,
+	}
+	// The ask is a completion reference, not a resting order.  Supplying it to
+	// the fee-floor check must still permit retention of the approaching bid.
+	retainBid, retainAsk := makerQuoteNearFillSides(
+		302_158, plan.AskPrice, 302_172, 302_173, plan, 26)
+	if !retainBid || retainAsk {
+		t.Fatalf("unexpected one-sided retention: bid=%t ask=%t", retainBid, retainAsk)
 	}
 }
 

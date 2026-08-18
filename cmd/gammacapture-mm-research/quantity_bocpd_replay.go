@@ -75,7 +75,7 @@ func runQuantityBOCPDComparison(in quantityBOCPDComparisonInput) {
 		fatalf("invalid BOCPD comparison interval, balances, or queue multiplier")
 	}
 	barrier, intensity, cfg := loadProductionConfig(in.ConfigPath, in.Symbol)
-	warmupFrom := in.From.Add(-macroReplayWarmup(cfg))
+	warmupFrom := in.From.Add(-productionReplayWarmup(cfg))
 	books, trades, cacheHit := loadMacroReplayDataset(
 		in.DataPath, in.Symbol, warmupFrom, in.To, in.From,
 		replayConfigFingerprint(in.ConfigPath), in.ReplayCacheDir)
@@ -370,7 +370,7 @@ func runQuantityPosteriorSkillStudy(in quantityBOCPDComparisonInput) {
 		fatalf("invalid quantity posterior skill interval")
 	}
 	_, _, cfg := loadProductionConfig(in.ConfigPath, in.Symbol)
-	warmupFrom := in.From.Add(-macroReplayWarmup(cfg))
+	warmupFrom := in.From.Add(-productionReplayWarmup(cfg))
 	books, trades, cacheHit := loadMacroReplayDataset(
 		in.DataPath, in.Symbol, warmupFrom, in.To, in.From,
 		replayConfigFingerprint(in.ConfigPath), in.ReplayCacheDir)

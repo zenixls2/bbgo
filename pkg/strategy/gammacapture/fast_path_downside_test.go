@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestFastPathDownsideBuyCapRequiresBearishDirection(t *testing.T) {
+func TestFastPathDownsideBuyCapUsesTerminalPosteriorNotRawDirection(t *testing.T) {
 	for _, direction := range []float64{0, 0.8} {
 		d := FastPathDownsideBuyCap(FastPathDownsideCapInput{
 			Direction: direction, InventoryReturnMeanBps: -40,
@@ -13,8 +13,8 @@ func TestFastPathDownsideBuyCapRequiresBearishDirection(t *testing.T) {
 			ConfidenceZScore: 1.645, BuyConfidenceEquivalentJPY: -0.1,
 			MinimumBuyNotionalJPY: 100, MaximumBuyNotionalJPY: 1000,
 		})
-		if d.Applied || d.MaximumBuyNotionalJPY != 1000 {
-			t.Fatalf("non-bearish path must preserve Fast BUY capacity: %+v", d)
+		if !d.Applied || d.MaximumBuyNotionalJPY != 100 {
+			t.Fatalf("terminally bearish path must cap BUY independent of duplicate raw direction: %+v", d)
 		}
 		if d.InventoryReturnStdErrorBps <= 0 ||
 			d.InventoryReturnUpperBps == 0 {

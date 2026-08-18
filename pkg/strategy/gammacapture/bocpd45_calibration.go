@@ -87,13 +87,15 @@ type bocpd45PendingLabel struct {
 }
 
 type bocpd45Checkpoint struct {
-	LastBid, LastAsk float64                    `json:"lastBid,omitempty"`
-	Bid, Ask         bocpd45Side                `json:"bid"`
-	Samples          []bocpd45CalibrationSample `json:"samples,omitempty"`
-	Updates          int                        `json:"updates"`
-	Pending          *bocpd45PendingLabel       `json:"pending,omitempty"`
-	NextAnchor       time.Time                  `json:"nextAnchor,omitempty"`
-	Matured          int                        `json:"matured"`
+	LastBid    float64                    `json:"lastBid,omitempty"`
+	LastAsk    float64                    `json:"lastAsk,omitempty"`
+	Bid        bocpd45Side                `json:"bid"`
+	Ask        bocpd45Side                `json:"ask"`
+	Samples    []bocpd45CalibrationSample `json:"samples,omitempty"`
+	Updates    int                        `json:"updates"`
+	Pending    *bocpd45PendingLabel       `json:"pending,omitempty"`
+	NextAnchor time.Time                  `json:"nextAnchor,omitempty"`
+	Matured    int                        `json:"matured"`
 }
 
 // BOCPD45Snapshot separates the uncalibrated posterior from the probability

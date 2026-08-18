@@ -2,25 +2,36 @@ package gammacapture
 
 import (
 	"math"
+	"sort"
 	"time"
 )
 
 type jointPathPayoffMoments struct {
-	BuyMeanBps           float64
-	SellMeanBps          float64
-	InventoryMeanBps     float64
-	BuyVarBps2           float64
-	SellVarBps2          float64
-	InventoryVarBps2     float64
-	CovBps2              float64
-	InventoryBuyCovBps2  float64
-	InventorySellCovBps2 float64
+	BuyMeanBps                  float64
+	SellMeanBps                 float64
+	InventoryMeanBps            float64
+	InventoryDirectionalMeanBps float64
+	BuyVarBps2                  float64
+	SellVarBps2                 float64
+	InventoryVarBps2            float64
+	InventoryDirectionalVarBps2 float64
+	CovBps2                     float64
+	InventoryBuyCovBps2         float64
+	InventorySellCovBps2        float64
 }
 
 type JointPathPayoffStats struct {
-	EffectiveSamples float64
-	BuyDominant      jointPathPayoffMoments
-	SellDominant     jointPathPayoffMoments
+	EffectiveSamples                float64
+	BuyDominant                     jointPathPayoffMoments
+	SellDominant                    jointPathPayoffMoments
+	InventoryTarget                 jointPathPayoffMoments
+	InventoryTargetEffectiveSamples float64
+	TwoStageContinuation            bool
+	ContinuationHorizon             time.Duration
+	BuyThenSellSamples              float64
+	BuyThenSellCompletions          float64
+	SellThenBuySamples              float64
+	SellThenBuyCompletions          float64
 }
 
 type JointPathPayoffDecision struct {
@@ -28,6 +39,8 @@ type JointPathPayoffDecision struct {
 	StdErrorJPY                     float64
 	LowerPnLJPY                     float64
 	ExistingInventoryExpectedPnLJPY float64
+	TargetInventoryNotionalJPY      float64
+	RiskInventoryNotionalJPY        float64
 	BaselineVarianceJPY2            float64
 	WholePositionVarianceJPY2       float64
 	MarginalVarianceJPY2            float64
@@ -37,18 +50,41 @@ type JointPathPayoffDecision struct {
 	RiskReducing                    bool
 }
 
-type weightedJointMoments struct {
-	weight, weightSquared float64
-	buy, sell, inventory  float64
-	buySquared            float64
-	sellSquared           float64
-	inventorySquared      float64
-	buySell               float64
-	inventoryBuy          float64
-	inventorySell         float64
+type JointPathPayoffDifferenceDecision struct {
+	Evaluated        bool
+	MeanBps          float64
+	StdErrorBps      float64
+	EffectiveSamples float64
 }
 
-func (m *weightedJointMoments) add(weight, buy, sell, inventory float64) {
+// makerFillTerminalWealthBps is the one-fill change in terminal liquidatable
+// wealth relative to leaving the corresponding quote notional in its pre-fill
+// asset. Both cases mark terminal base inventory at the executable bid. A SELL
+// must not use terminal ask here: doing so inserts a hypothetical repurchase
+// that neither occurred nor paid its second fee.
+func makerFillTerminalWealthBps(buy bool, quote, terminalBid, entryCostBps float64) float64 {
+	if quote <= 0 || terminalBid <= 0 {
+		return 0
+	}
+	if buy {
+		return math.Log(terminalBid/quote)*10_000 - entryCostBps
+	}
+	return math.Log(quote/terminalBid)*10_000 - entryCostBps
+}
+
+type weightedJointMoments struct {
+	weight, weightSquared                      float64
+	buy, sell, inventory, inventoryDirectional float64
+	buySquared                                 float64
+	sellSquared                                float64
+	inventorySquared                           float64
+	inventoryDirectionalSquared                float64
+	buySell                                    float64
+	inventoryBuy                               float64
+	inventorySell                              float64
+}
+
+func (m *weightedJointMoments) add(weight, buy, sell, inventory, inventoryDirectional float64) {
 	if weight <= 0 {
 		return
 	}
@@ -57,9 +93,11 @@ func (m *weightedJointMoments) add(weight, buy, sell, inventory float64) {
 	m.buy += weight * buy
 	m.sell += weight * sell
 	m.inventory += weight * inventory
+	m.inventoryDirectional += weight * inventoryDirectional
 	m.buySquared += weight * buy * buy
 	m.sellSquared += weight * sell * sell
 	m.inventorySquared += weight * inventory * inventory
+	m.inventoryDirectionalSquared += weight * inventoryDirectional * inventoryDirectional
 	m.buySell += weight * buy * sell
 	m.inventoryBuy += weight * inventory * buy
 	m.inventorySell += weight * inventory * sell
@@ -69,7 +107,9 @@ func (m weightedJointMoments) result() (jointPathPayoffMoments, float64) {
 	if m.weight <= 0 {
 		return jointPathPayoffMoments{}, 0
 	}
-	buyMean, sellMean, inventoryMean := m.buy/m.weight, m.sell/m.weight, m.inventory/m.weight
+	buyMean, sellMean := m.buy/m.weight, m.sell/m.weight
+	inventoryMean := m.inventory / m.weight
+	inventoryDirectionalMean := m.inventoryDirectional / m.weight
 	effective := m.weight
 	if m.weightSquared > 0 {
 		effective = math.Min(effective, m.weight*m.weight/m.weightSquared)
@@ -82,15 +122,18 @@ func (m weightedJointMoments) result() (jointPathPayoffMoments, float64) {
 		varianceCorrection = effective / (effective - 1)
 	}
 	out := jointPathPayoffMoments{
-		BuyMeanBps:       buyMean,
-		SellMeanBps:      sellMean,
-		InventoryMeanBps: inventoryMean,
+		BuyMeanBps:                  buyMean,
+		SellMeanBps:                 sellMean,
+		InventoryMeanBps:            inventoryMean,
+		InventoryDirectionalMeanBps: inventoryDirectionalMean,
 		BuyVarBps2: math.Max(0,
 			(m.buySquared/m.weight-buyMean*buyMean)*varianceCorrection),
 		SellVarBps2: math.Max(0,
 			(m.sellSquared/m.weight-sellMean*sellMean)*varianceCorrection),
 		InventoryVarBps2: math.Max(0,
 			(m.inventorySquared/m.weight-inventoryMean*inventoryMean)*varianceCorrection),
+		InventoryDirectionalVarBps2: math.Max(0,
+			(m.inventoryDirectionalSquared/m.weight-inventoryDirectionalMean*inventoryDirectionalMean)*varianceCorrection),
 		CovBps2:              (m.buySell/m.weight - buyMean*sellMean) * varianceCorrection,
 		InventoryBuyCovBps2:  (m.inventoryBuy/m.weight - inventoryMean*buyMean) * varianceCorrection,
 		InventorySellCovBps2: (m.inventorySell/m.weight - inventoryMean*sellMean) * varianceCorrection,
@@ -98,11 +141,77 @@ func (m weightedJointMoments) result() (jointPathPayoffMoments, float64) {
 	return out, effective
 }
 
+func (m *MarketMakerHorizonModel) bookImbalanceAt(now time.Time) (float64, bool) {
+	if m == nil || now.IsZero() || len(m.points) == 0 {
+		return 0, false
+	}
+	index := sort.Search(len(m.points), func(index int) bool {
+		return m.points[index].At.After(now)
+	}) - 1
+	if index < 0 || !m.points[index].BookDepthReady {
+		return 0, false
+	}
+	return clampBookImbalance(m.points[index].BookImbalance), true
+}
+
+// applySideImbalancePayoffMean changes only the mean contribution of a
+// one-sided terminal payoff. The crossing probability, variance, inventory
+// target, price ladder, and quantity controller retain their existing owners.
+// The multiplier is the empirical probability of the corresponding one-sided
+// path under the same weights as the parent payoff moments.
+func applySideImbalancePayoffMean(
+	mean *float64,
+	totalWeight, oneSidedWeight float64,
+	regression sideImbalanceSufficientStats,
+	imbalance float64,
+) {
+	if mean == nil || totalWeight <= 0 || oneSidedWeight <= 0 || regression.weight <= 1 {
+		return
+	}
+	baseline, conditional := regression.predict(clampBookImbalance(imbalance))
+	*mean += math.Min(1, oneSidedWeight/totalWeight) * (conditional - baseline)
+}
+
+func sideImbalancePayoffEnabled(horizon time.Duration) bool {
+	return horizon == 15*time.Minute
+}
+
+// applyVolumeProfileSideTerminalRisk changes only the side-specific terminal
+// payoff means. Crossing probabilities, variances, inventory targets, and
+// quote distances keep their existing owners; quantity therefore responds to
+// the same unified certainty-equivalent model instead of a second hard gate.
+// The same side adjustment is applied to both dominant path mixtures because
+// either mixture can be selected by EvaluateTargetRelativePosition.
+func applyVolumeProfileSideTerminalRisk(stats *JointPathPayoffStats, state VolumeProfileState, zScore float64) {
+	if stats == nil || !state.Valid {
+		return
+	}
+	buyPenalty, buyVariance := state.SideTerminalRiskMomentsWithZScore(true, zScore)
+	sellPenalty, sellVariance := state.SideTerminalRiskMomentsWithZScore(false, zScore)
+	if buyPenalty > 0 {
+		stats.BuyDominant.BuyMeanBps -= buyPenalty
+		stats.SellDominant.BuyMeanBps -= buyPenalty
+	}
+	if buyVariance > 0 {
+		stats.BuyDominant.BuyVarBps2 += buyVariance
+		stats.SellDominant.BuyVarBps2 += buyVariance
+	}
+	if sellPenalty > 0 {
+		stats.BuyDominant.SellMeanBps -= sellPenalty
+		stats.SellDominant.SellMeanBps -= sellPenalty
+	}
+	if sellVariance > 0 {
+		stats.BuyDominant.SellVarBps2 += sellVariance
+		stats.SellDominant.SellVarBps2 += sellVariance
+	}
+}
+
 // JointPathPayoffStatistics values a completed maker window in terminal
 // executable wealth, rather than assuming that every touch earns the quoted
-// spread. A one-sided fill is marked at terminal bid/ask and charged a
-// conservative round-trip cost. When both sides touch, matched notional earns
-// the realized quote-to-quote cycle; only the unmatched residual is marked.
+// spread. A one-sided fill is compared with terminal-bid liquidatable wealth
+// and charged its one actual fill cost. When both sides touch, matched notional
+// earns the realized quote-to-quote cycle; only the unmatched residual is
+// terminal-marked.
 // This directly penalizes selling into a continued rise or buying into a
 // continued decline while retaining profitable two-sided oscillation.
 func (m *MarketMakerHorizonModel) JointPathPayoffStatistics(
@@ -111,7 +220,18 @@ func (m *MarketMakerHorizonModel) JointPathPayoffStatistics(
 	horizon time.Duration,
 	buyDistanceBps, sellDistanceBps float64,
 ) JointPathPayoffStats {
-	return m.jointPathPayoffStatistics(now, config, horizon, buyDistanceBps, sellDistanceBps, nil)
+	// Once the public-trade profile is mature, use it at the same historical
+	// path-weighting point for every Fast candidate. This keeps VP from being
+	// silently limited to the rare inward-distance branch while preserving the
+	// exact legacy path whenever the profile is disabled or still warming.
+	if config.VolumeProfile.Enabled {
+		if current := m.conditionalExecutionState(horizon); current.Valid && current.VolumeProfile.Valid {
+			return m.jointPathPayoffStatistics(
+				now, config, horizon, buyDistanceBps, sellDistanceBps, &current)
+		}
+	}
+	return m.jointPathPayoffStatistics(
+		now, config, horizon, buyDistanceBps, sellDistanceBps, nil)
 }
 
 func (m *MarketMakerHorizonModel) conditionalJointPathPayoffStatistics(
@@ -124,7 +244,8 @@ func (m *MarketMakerHorizonModel) conditionalJointPathPayoffStatistics(
 	if !current.Valid {
 		return m.JointPathPayoffStatistics(now, config, horizon, buyDistanceBps, sellDistanceBps)
 	}
-	return m.jointPathPayoffStatistics(now, config, horizon, buyDistanceBps, sellDistanceBps, &current)
+	return m.jointPathPayoffStatistics(
+		now, config, horizon, buyDistanceBps, sellDistanceBps, &current)
 }
 
 func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
@@ -139,7 +260,12 @@ func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
 		return JointPathPayoffStats{}
 	}
 	config.setDefaults()
+	completionHorizon := jointContinuationHorizon(config, horizon)
 	exposures := m.crossingExposures(horizon)
+	var bboIndex *marketMakerBBORangeIndex
+	if config.JointDistanceQuantity.TwoStageContinuation {
+		bboIndex = m.executableBBORangeIndex()
+	}
 	lookback := time.Duration(config.HorizonLookback)
 	cutoff := now.Add(-lookback)
 	// Sparse-market path payoffs are non-stationary. Use the geometric mean of
@@ -148,14 +274,24 @@ func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
 	// retaining several non-overlapping holding windows. No fitted decay
 	// coefficient or symbol-specific constant is introduced.
 	decayHalfLifeSeconds := math.Sqrt(horizon.Seconds() * lookback.Seconds())
-	var buyDominant, sellDominant weightedJointMoments
+	var buyDominant, sellDominant, inventoryTarget weightedJointMoments
+	var buyDominantBuyOnly, buyDominantSellOnly sideImbalanceSufficientStats
+	var sellDominantBuyOnly, sellDominantSellOnly sideImbalanceSufficientStats
+	var buyDominantBuyOnlyWeight, buyDominantSellOnlyWeight float64
+	var sellDominantBuyOnlyWeight, sellDominantSellOnlyWeight float64
+	var buyThenSellSamples, buyThenSellCompletions float64
+	var sellThenBuySamples, sellThenBuyCompletions float64
 	var lastExposure time.Time
 	entryCostBps := config.MakerFeeBps + config.AdverseSelectionBps
 	cycleCostBps := 2*entryCostBps + config.MinimumNetEdgeBps
 	globalCount := 0
 	if current != nil {
 		for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
-			if exposures[index].EndAt.After(now) {
+			maturity := exposures[index].EndAt
+			if config.JointDistanceQuantity.TwoStageContinuation {
+				maturity = exposures[index].At.Add(horizon + completionHorizon)
+			}
+			if maturity.After(now) {
 				break
 			}
 			globalCount++
@@ -171,7 +307,11 @@ func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
 	}
 	for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
 		exposure := exposures[index]
-		if exposure.EndAt.After(now) {
+		maturity := exposure.EndAt
+		if config.JointDistanceQuantity.TwoStageContinuation {
+			maturity = exposure.At.Add(horizon + completionHorizon)
+		}
+		if maturity.After(now) {
 			break
 		}
 		if exposure.StartBid <= 0 || exposure.StartAsk < exposure.StartBid ||
@@ -187,7 +327,7 @@ func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
 			weight = math.Min(1, exposure.At.Sub(lastExposure).Seconds()/horizon.Seconds())
 		}
 		if decayHalfLifeSeconds > 0 {
-			ageSeconds := math.Max(0, now.Sub(exposure.EndAt).Seconds())
+			ageSeconds := math.Max(0, now.Sub(maturity).Seconds())
 			weight *= math.Exp(-math.Ln2 * ageSeconds / decayHalfLifeSeconds)
 		}
 		if weight <= 0 {
@@ -199,19 +339,71 @@ func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
 		}
 		buyTouched := exposure.BuyExcursionBps >= buyDistanceBps
 		sellTouched := exposure.SellExcursionBps >= sellDistanceBps
+		// Retain the intentionally conservative start-mark-to-terminal-bid
+		// liquidation return for whole-position covariance and downside stress.
 		startMid := math.Sqrt(exposure.StartBid * exposure.StartAsk)
 		inventoryReturnBps := math.Log(exposure.TerminalBid/startMid) * 10_000
+		// Directional inventory targeting is a different estimand: compare the
+		// current depth-weighted BBO price with the time-weighted depth-weighted
+		// BBO mean over the completed future window. This neither mistakes one
+		// terminal tick for the horizon mean nor embeds the liquidation spread
+		// haircut in the target direction.
+		startWeightedPrice := exposure.StartBBOWeightedPrice
+		if startWeightedPrice <= 0 {
+			startWeightedPrice = startMid
+		}
+		windowWeightedPrice := exposure.WindowBBOWeightedPrice
+		if windowWeightedPrice <= 0 {
+			// Compatibility for synthetic unit fixtures created before completed
+			// exposures retained their BBO-weighted window mean.
+			windowWeightedPrice = math.Sqrt(exposure.TerminalBid * exposure.TerminalAsk)
+		}
+		inventoryDirectionalReturnBps := math.Log(
+			windowWeightedPrice/startWeightedPrice) * 10_000
 		bidQuote := exposure.StartAsk * math.Exp(-buyDistanceBps/10_000)
 		askQuote := exposure.StartBid * math.Exp(sellDistanceBps/10_000)
+		pathTerminalBid := exposure.TerminalBid
+		completion := false
+		if config.JointDistanceQuantity.TwoStageContinuation && buyTouched != sellTouched {
+			var valid bool
+			pathTerminalBid, completion, valid = m.twoStageCompletionOutcome(
+				bboIndex, exposure, completionHorizon, bidQuote, askQuote, buyTouched)
+			if !valid {
+				if exposure.NextMinute <= index {
+					break
+				}
+				index = exposure.NextMinute
+				continue
+			}
+			if buyTouched {
+				buyThenSellSamples += weight
+				if completion {
+					buyThenSellCompletions += weight
+					sellTouched = true
+				}
+			} else {
+				sellThenBuySamples += weight
+				if completion {
+					sellThenBuyCompletions += weight
+					buyTouched = true
+				}
+			}
+			inventoryReturnBps = math.Log(pathTerminalBid/startMid) * 10_000
+		}
 		buySingleBps, sellSingleBps := 0.0, 0.0
 		if buyTouched {
 			// Terminal executable wealth contains one completed BUY, hence one
 			// maker fee. Charging a hypothetical future exit here double-counts
 			// cost and systematically suppresses inventory carried past H.
-			buySingleBps = math.Log(exposure.TerminalBid/bidQuote)*10_000 - entryCostBps
+			buySingleBps = makerFillTerminalWealthBps(
+				true, bidQuote, pathTerminalBid, entryCostBps)
 		}
 		if sellTouched {
-			sellSingleBps = math.Log(askQuote/exposure.TerminalAsk)*10_000 - entryCostBps
+			// The unfilled counterfactual still owns base and can liquidate only
+			// at terminal bid. Terminal ask belongs solely to an explicitly
+			// modeled future repurchase cycle.
+			sellSingleBps = makerFillTerminalWealthBps(
+				false, askQuote, pathTerminalBid, entryCostBps)
 		}
 		buyDomBuy, buyDomSell := 0.0, 0.0
 		sellDomBuy, sellDomSell := 0.0, 0.0
@@ -229,13 +421,37 @@ func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
 		case sellTouched:
 			buyDomSell, sellDomSell = sellSingleBps, sellSingleBps
 		}
-		buyWeight, sellWeight := weight, weight
+		buyWeight, sellWeight, targetWeight := weight, weight, weight
 		if current != nil {
-			buyWeight *= (priorPerPath + conditionalExecutionKernel(*current, exposure.ConditionalState, true, horizon)) / (1 + priorPerPath)
-			sellWeight *= (priorPerPath + conditionalExecutionKernel(*current, exposure.ConditionalState, false, horizon)) / (1 + priorPerPath)
+			buyKernel := conditionalExecutionKernel(
+				*current, exposure.ConditionalState, true, horizon)
+			sellKernel := conditionalExecutionKernel(
+				*current, exposure.ConditionalState, false, horizon)
+			jointKernel := math.Sqrt(buyKernel * sellKernel)
+			targetWeight *= (priorPerPath + jointKernel) / (1 + priorPerPath)
+			buyWeight *= (priorPerPath + buyKernel) / (1 + priorPerPath)
+			sellWeight *= (priorPerPath + sellKernel) / (1 + priorPerPath)
 		}
-		buyDominant.add(buyWeight, buyDomBuy, buyDomSell, inventoryReturnBps)
-		sellDominant.add(sellWeight, sellDomBuy, sellDomSell, inventoryReturnBps)
+		switch {
+		case buyTouched && !sellTouched:
+			buyDominantBuyOnlyWeight += buyWeight
+			sellDominantBuyOnlyWeight += sellWeight
+			if exposure.StartBookDepthReady {
+				buyDominantBuyOnly.add(exposure.StartBookImbalance, buySingleBps, buyWeight)
+				sellDominantBuyOnly.add(exposure.StartBookImbalance, buySingleBps, sellWeight)
+			}
+		case sellTouched && !buyTouched:
+			buyDominantSellOnlyWeight += buyWeight
+			sellDominantSellOnlyWeight += sellWeight
+			if exposure.StartBookDepthReady {
+				reflected := -exposure.StartBookImbalance
+				buyDominantSellOnly.add(reflected, sellSingleBps, buyWeight)
+				sellDominantSellOnly.add(reflected, sellSingleBps, sellWeight)
+			}
+		}
+		buyDominant.add(buyWeight, buyDomBuy, buyDomSell, inventoryReturnBps, inventoryDirectionalReturnBps)
+		sellDominant.add(sellWeight, sellDomBuy, sellDomSell, inventoryReturnBps, inventoryDirectionalReturnBps)
+		inventoryTarget.add(targetWeight, 0, 0, inventoryReturnBps, inventoryDirectionalReturnBps)
 		lastExposure = exposure.At
 		if exposure.NextMinute <= index {
 			break
@@ -244,11 +460,272 @@ func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
 	}
 	buyMoments, buyN := buyDominant.result()
 	sellMoments, sellN := sellDominant.result()
-	return JointPathPayoffStats{
-		EffectiveSamples: math.Min(buyN, sellN),
-		BuyDominant:      buyMoments,
-		SellDominant:     sellMoments,
+	targetMoments, targetN := inventoryTarget.result()
+	// The causal study promoted the predeclared 15m primary only. Its 30m
+	// sensitivity failed the simultaneous lower bound and 10m was not tested;
+	// do not leak the accepted coefficient across statistical clocks.
+	if imbalance, ready := m.bookImbalanceAt(now); ready && sideImbalancePayoffEnabled(horizon) {
+		applySideImbalancePayoffMean(&buyMoments.BuyMeanBps,
+			buyDominant.weight, buyDominantBuyOnlyWeight,
+			buyDominantBuyOnly, imbalance)
+		applySideImbalancePayoffMean(&buyMoments.SellMeanBps,
+			buyDominant.weight, buyDominantSellOnlyWeight,
+			buyDominantSellOnly, -imbalance)
+		applySideImbalancePayoffMean(&sellMoments.BuyMeanBps,
+			sellDominant.weight, sellDominantBuyOnlyWeight,
+			sellDominantBuyOnly, imbalance)
+		applySideImbalancePayoffMean(&sellMoments.SellMeanBps,
+			sellDominant.weight, sellDominantSellOnlyWeight,
+			sellDominantSellOnly, -imbalance)
 	}
+	stats := JointPathPayoffStats{
+		EffectiveSamples:                math.Min(buyN, sellN),
+		BuyDominant:                     buyMoments,
+		SellDominant:                    sellMoments,
+		InventoryTarget:                 targetMoments,
+		InventoryTargetEffectiveSamples: targetN,
+		TwoStageContinuation:            config.JointDistanceQuantity.TwoStageContinuation,
+		ContinuationHorizon:             completionHorizon,
+		BuyThenSellSamples:              buyThenSellSamples,
+		BuyThenSellCompletions:          buyThenSellCompletions,
+		SellThenBuySamples:              sellThenBuySamples,
+		SellThenBuyCompletions:          sellThenBuyCompletions,
+	}
+	if config.VolumeProfile.Enabled && config.VolumeProfile.AsymmetricPOCRisk &&
+		current != nil {
+		applyVolumeProfileSideTerminalRisk(&stats, current.VolumeProfile, config.InventoryRiskZScore)
+	}
+	return stats
+}
+
+func jointContinuationHorizon(config MarketMakerConfig, openingHorizon time.Duration) time.Duration {
+	if openingHorizon <= 0 || !config.JointDistanceQuantity.TwoStageContinuation ||
+		!config.JointDistanceQuantity.CrossHorizonContinuation {
+		return openingHorizon
+	}
+	completion := openingHorizon
+	for _, candidate := range config.FastModelWindows() {
+		if candidate > completion {
+			completion = candidate
+		}
+	}
+	return completion
+}
+
+// JointContinuationHorizon exposes the completion lease implied by the Fast
+// configuration so live execution and deterministic replay can honor the same
+// contract that JointPathPayoffStatistics values.
+func (c MarketMakerConfig) JointContinuationHorizon(openingHorizon time.Duration) time.Duration {
+	c.setDefaults()
+	return jointContinuationHorizon(c, openingHorizon)
+}
+
+// twoStageCompletionOutcome follows an opening fill that occurred inside its
+// selected Fast horizon. The completion side then receives completionHorizon,
+// matching the independently re-evaluated post-fill lease. Quotes stay at
+// their initially evaluated executable prices here; any later live
+// re-optimization is additional option value and is not assumed by this
+// conservative admission estimator.
+func (m *MarketMakerHorizonModel) twoStageCompletionOutcome(
+	index *marketMakerBBORangeIndex,
+	exposure marketMakerHorizonExposure,
+	completionHorizon time.Duration,
+	bidQuote, askQuote float64,
+	openingBuy bool,
+) (terminalBid float64, completed, valid bool) {
+	if m == nil || index == nil || completionHorizon <= 0 || bidQuote <= 0 || askQuote <= bidQuote {
+		return 0, false, false
+	}
+	start := pointIndexAtOrAfter(m.points, exposure.At)
+	initialRight := pointIndexAtOrAfter(m.points, exposure.EndAt)
+	if start >= len(m.points) || initialRight <= start+1 || !m.points[start].At.Equal(exposure.At) {
+		return 0, false, false
+	}
+	firstTouch := -1
+	if openingBuy {
+		firstTouch = index.firstAskAtOrBelow(start+1, initialRight, bidQuote)
+	} else {
+		firstTouch = index.firstBidAtOrAbove(start+1, initialRight, askQuote)
+	}
+	if firstTouch < 0 {
+		return 0, false, false
+	}
+	completionRight := pointIndexAtOrAfter(m.points, m.points[firstTouch].At.Add(completionHorizon))
+	if completionRight <= firstTouch+1 || completionRight > len(m.points) ||
+		!index.validRange(firstTouch+1, completionRight) {
+		return 0, false, false
+	}
+	terminalBid = m.points[completionRight-1].bidPrice()
+	if terminalBid <= 0 {
+		return 0, false, false
+	}
+	if openingBuy {
+		completed = index.firstBidAtOrAbove(firstTouch+1, completionRight, askQuote) >= 0
+	} else {
+		completed = index.firstAskAtOrBelow(firstTouch+1, completionRight, bidQuote) >= 0
+	}
+	return terminalBid, completed, true
+}
+
+// jointBalancedPathPayoffDifference compares an outward candidate with the
+// ordinary Fast quote path by path. Pairing removes common terminal moves and
+// makes the test about the actual distance concession: extra edge on paths
+// where both levels fill versus lost fills where only the base level fills.
+// It deliberately uses one balanced unit, leaving inventory and quantity to
+// the unified whole-position optimizer after the price has been identified.
+func (m *MarketMakerHorizonModel) jointBalancedPathPayoffDifference(
+	now time.Time,
+	config MarketMakerConfig,
+	horizon time.Duration,
+	baseBuyDistanceBps, baseSellDistanceBps,
+	candidateBuyDistanceBps, candidateSellDistanceBps float64,
+	current conditionalExecutionState,
+) JointPathPayoffDifferenceDecision {
+	d := JointPathPayoffDifferenceDecision{}
+	if m == nil || now.IsZero() || horizon <= 0 ||
+		baseBuyDistanceBps <= 0 || baseSellDistanceBps <= 0 ||
+		candidateBuyDistanceBps < baseBuyDistanceBps ||
+		candidateSellDistanceBps < baseSellDistanceBps {
+		return d
+	}
+	config.setDefaults()
+	completionHorizon := jointContinuationHorizon(config, horizon)
+	exposures := m.crossingExposures(horizon)
+	lookback := time.Duration(config.HorizonLookback)
+	cutoff := now.Add(-lookback)
+	decayHalfLifeSeconds := math.Sqrt(horizon.Seconds() * lookback.Seconds())
+	entryCostBps := config.MakerFeeBps + config.AdverseSelectionBps
+	cycleCostBps := 2*entryCostBps + config.MinimumNetEdgeBps
+	var bboIndex *marketMakerBBORangeIndex
+	if config.JointDistanceQuantity.TwoStageContinuation {
+		bboIndex = m.executableBBORangeIndex()
+	}
+	globalCount := 0
+	for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
+		maturity := exposures[index].EndAt
+		if config.JointDistanceQuantity.TwoStageContinuation {
+			maturity = exposures[index].At.Add(horizon + completionHorizon)
+		}
+		if maturity.After(now) {
+			break
+		}
+		globalCount++
+		if exposures[index].NextMinute <= index {
+			break
+		}
+		index = exposures[index].NextMinute
+	}
+	priorPerPath := 0.0
+	if current.Valid && globalCount > 0 {
+		priorPerPath = 1 / math.Sqrt(float64(globalCount))
+	}
+	var differences weightedScalarMoments
+	var lastExposure time.Time
+	for index := firstHorizonExposureAtOrAfter(exposures, cutoff); index < len(exposures); {
+		exposure := exposures[index]
+		maturity := exposure.EndAt
+		if config.JointDistanceQuantity.TwoStageContinuation {
+			maturity = exposure.At.Add(horizon + completionHorizon)
+		}
+		if maturity.After(now) {
+			break
+		}
+		weight := 1.0
+		if !lastExposure.IsZero() {
+			weight = math.Min(1, exposure.At.Sub(lastExposure).Seconds()/horizon.Seconds())
+		}
+		if decayHalfLifeSeconds > 0 {
+			weight *= math.Exp(-math.Ln2 * math.Max(0, now.Sub(maturity).Seconds()) /
+				decayHalfLifeSeconds)
+		}
+		if current.Valid {
+			buyKernel := conditionalExecutionKernel(current, exposure.ConditionalState, true, horizon)
+			sellKernel := conditionalExecutionKernel(current, exposure.ConditionalState, false, horizon)
+			weight *= (priorPerPath + math.Sqrt(buyKernel*sellKernel)) / (1 + priorPerPath)
+		}
+		base, baseValid := m.balancedPathPayoffBps(
+			bboIndex, exposure, completionHorizon,
+			baseBuyDistanceBps, baseSellDistanceBps,
+			entryCostBps, cycleCostBps,
+			config.JointDistanceQuantity.TwoStageContinuation)
+		candidate, candidateValid := m.balancedPathPayoffBps(
+			bboIndex, exposure, completionHorizon,
+			candidateBuyDistanceBps, candidateSellDistanceBps,
+			entryCostBps, cycleCostBps,
+			config.JointDistanceQuantity.TwoStageContinuation)
+		if weight > 0 && baseValid && candidateValid {
+			differences.add(weight, candidate-base)
+			lastExposure = exposure.At
+		}
+		if exposure.NextMinute <= index {
+			break
+		}
+		index = exposure.NextMinute
+	}
+	mean, variance, effective := differences.result()
+	if effective <= 1 {
+		return d
+	}
+	d.Evaluated = true
+	d.MeanBps = mean
+	d.EffectiveSamples = effective
+	d.StdErrorBps = math.Sqrt(math.Max(0, variance) / effective)
+	return d
+}
+
+func (m *MarketMakerHorizonModel) balancedPathPayoffBps(
+	index *marketMakerBBORangeIndex,
+	exposure marketMakerHorizonExposure,
+	completionHorizon time.Duration,
+	buyDistanceBps, sellDistanceBps,
+	entryCostBps, cycleCostBps float64,
+	twoStage bool,
+) (float64, bool) {
+	if exposure.StartBid <= 0 || exposure.StartAsk < exposure.StartBid ||
+		exposure.TerminalBid <= 0 || buyDistanceBps <= 0 || sellDistanceBps <= 0 {
+		return 0, false
+	}
+	buyTouched := exposure.BuyExcursionBps >= buyDistanceBps
+	sellTouched := exposure.SellExcursionBps >= sellDistanceBps
+	bidQuote := exposure.StartAsk * math.Exp(-buyDistanceBps/10_000)
+	askQuote := exposure.StartBid * math.Exp(sellDistanceBps/10_000)
+	terminalBid := exposure.TerminalBid
+	if twoStage && buyTouched != sellTouched {
+		var completed, valid bool
+		terminalBid, completed, valid = m.twoStageCompletionOutcome(
+			index, exposure, completionHorizon, bidQuote, askQuote, buyTouched)
+		if !valid {
+			return 0, false
+		}
+		if completed {
+			buyTouched, sellTouched = true, true
+		}
+	}
+	switch {
+	case buyTouched && sellTouched:
+		return math.Log(askQuote/bidQuote)*10_000 - cycleCostBps, true
+	case buyTouched:
+		return makerFillTerminalWealthBps(
+			true, bidQuote, terminalBid, entryCostBps), true
+	case sellTouched:
+		return makerFillTerminalWealthBps(
+			false, askQuote, terminalBid, entryCostBps), true
+	default:
+		return 0, true
+	}
+}
+
+func simultaneousOneSidedZ(baseZ float64, comparisons int) float64 {
+	if baseZ <= 0 {
+		baseZ = 1.645
+	}
+	if comparisons <= 1 {
+		return baseZ
+	}
+	alpha := 0.5 * math.Erfc(baseZ/math.Sqrt2)
+	adjustedAlpha := math.Max(
+		math.SmallestNonzeroFloat64, alpha/float64(comparisons))
+	return math.Sqrt2 * math.Erfinv(1-2*adjustedAlpha)
 }
 
 // Evaluate preserves the incremental-order API for callers that do not own inventory.
@@ -261,20 +738,38 @@ func (s JointPathPayoffStats) Evaluate(
 }
 
 // EvaluateWholePosition compares a candidate quote with leaving the current
-// inventory unchanged over the same completed terminal paths. Existing PnL is
-// common to both choices and is not counted as new alpha, but its covariance
-// with the candidate is decision-relevant:
-//
-//	Delta Var(W) = Var(Delta W) + 2 Cov(W_inventory, Delta W).
-//
-// A risk-reducing SELL may therefore receive a negative Kelly penalty, while
-// a BUY that compounds downside exposure is restrained. Average cost is
-// intentionally absent: it is an accounting state, not a return forecast.
+// inventory unchanged over the same completed terminal paths, using zero risky
+// inventory as the legacy risk anchor. New strategy code should call
+// EvaluateTargetRelativePosition with the same-horizon inventory target.
 func (s JointPathPayoffStats) EvaluateWholePosition(
 	currentInventoryNotionalJPY, buyNotionalJPY, sellNotionalJPY,
 	pairEquityJPY, riskAversion, zScore float64,
 ) JointPathPayoffDecision {
-	if currentInventoryNotionalJPY < 0 || buyNotionalJPY < 0 || sellNotionalJPY < 0 ||
+	return s.EvaluateTargetRelativePosition(
+		currentInventoryNotionalJPY, 0,
+		buyNotionalJPY, sellNotionalJPY,
+		pairEquityJPY, riskAversion, zScore)
+}
+
+// EvaluateTargetRelativePosition compares a candidate quote with submitting no
+// new order on the same completed executable-BBO paths. Existing PnL is common
+// to both choices and is not counted as new alpha, but the covariance of the
+// order payoff with the inventory deviation from the same-horizon target is
+// decision-relevant:
+//
+//	Delta R = Var(Delta W) + 2 Cov(W_inventory-target, Delta W).
+//
+// A BUY below target (or SELL above target) may therefore receive a negative
+// Kelly penalty when it reduces target-relative terminal risk. Crossing the
+// target reverses that credit automatically. Average cost is intentionally
+// absent: it is an accounting state, not a return forecast.
+func (s JointPathPayoffStats) EvaluateTargetRelativePosition(
+	currentInventoryNotionalJPY, targetInventoryNotionalJPY,
+	buyNotionalJPY, sellNotionalJPY,
+	pairEquityJPY, riskAversion, zScore float64,
+) JointPathPayoffDecision {
+	if currentInventoryNotionalJPY < 0 || targetInventoryNotionalJPY < 0 ||
+		buyNotionalJPY < 0 || sellNotionalJPY < 0 ||
 		pairEquityJPY <= 0 || s.EffectiveSamples <= 0 {
 		return JointPathPayoffDecision{}
 	}
@@ -288,9 +783,10 @@ func (s JointPathPayoffStats) EvaluateWholePosition(
 		sellNotionalJPY*sellNotionalJPY*moments.SellVarBps2 +
 		2*buyNotionalJPY*sellNotionalJPY*moments.CovBps2) / 100_000_000
 	incrementalVarianceJPY2 = math.Max(0, incrementalVarianceJPY2)
-	baselineVarianceJPY2 := currentInventoryNotionalJPY * currentInventoryNotionalJPY *
+	riskInventoryNotionalJPY := currentInventoryNotionalJPY - targetInventoryNotionalJPY
+	baselineVarianceJPY2 := riskInventoryNotionalJPY * riskInventoryNotionalJPY *
 		moments.InventoryVarBps2 / 100_000_000
-	inventoryOrderCovarianceJPY2 := currentInventoryNotionalJPY *
+	inventoryOrderCovarianceJPY2 := riskInventoryNotionalJPY *
 		(buyNotionalJPY*moments.InventoryBuyCovBps2 +
 			sellNotionalJPY*moments.InventorySellCovBps2) / 100_000_000
 	wholeVarianceJPY2 := math.Max(0, baselineVarianceJPY2+incrementalVarianceJPY2+
@@ -304,6 +800,8 @@ func (s JointPathPayoffStats) EvaluateWholePosition(
 		StdErrorJPY:                     standardErrorJPY,
 		LowerPnLJPY:                     lower,
 		ExistingInventoryExpectedPnLJPY: currentInventoryNotionalJPY * moments.InventoryMeanBps / 10_000,
+		TargetInventoryNotionalJPY:      targetInventoryNotionalJPY,
+		RiskInventoryNotionalJPY:        riskInventoryNotionalJPY,
 		BaselineVarianceJPY2:            baselineVarianceJPY2,
 		WholePositionVarianceJPY2:       wholeVarianceJPY2,
 		MarginalVarianceJPY2:            marginalVarianceJPY2,

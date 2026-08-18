@@ -1,0 +1,41 @@
+{
+  "name": "volume-profile-rising-conditioned-terminal-target",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 774,
+  "minimum_effective_samples": 24,
+  "incremental_mean_bps": -0.6269132623,
+  "incremental_standard_error_bps": 0.2705782058,
+  "incremental_cost_bps": 0,
+  "risk_penalty_bps": 0,
+  "candidate_tests": 2,
+  "alpha": 0.05,
+  "positive_blocks": 2,
+  "total_blocks": 8,
+  "minimum_positive_blocks": 5,
+  "primary_horizon": "15m",
+  "sensitivity_horizon": "30m",
+  "baseline_mae_bps": 9.1706803508,
+  "candidate_mae_bps": 9.7093555745,
+  "simultaneous_lower_bound_bps": -1.1572368006,
+  "response_fee_net": true,
+  "sensitivity": {
+    "horizon": "30m",
+    "effective_samples": 558,
+    "baseline_mae_bps": 12.0957067618,
+    "candidate_mae_bps": 12.3451890858,
+    "incremental_mean_bps": -0.1811379749,
+    "simultaneous_lower_bound_bps": -0.3762363830,
+    "positive_blocks": 2,
+    "total_blocks": 8
+  },
+  "canonical_diagnostic": {
+    "warning": "These regimes were previously inspected and are not promotion evidence.",
+    "decline": {"terminal_excess_vs_hold_jpy": 2.4684583547, "always_vp_excess_vs_hold_jpy": -35.3495151137, "rising_vp_excess_vs_hold_jpy": -35.3495151137, "rising_application_rate": 0.3550017071},
+    "rise": {"terminal_excess_vs_hold_jpy": 3.5469842854, "always_vp_excess_vs_hold_jpy": 23.0119401370, "rising_vp_excess_vs_hold_jpy": 23.0119401370, "rising_application_rate": 0.9574410895},
+    "range": {"terminal_excess_vs_hold_jpy": 0, "always_vp_excess_vs_hold_jpy": 0, "rising_vp_excess_vs_hold_jpy": 0, "rising_application_rate": 1},
+    "mixed": {"terminal_excess_vs_hold_jpy": -2.4316516931, "always_vp_excess_vs_hold_jpy": -2.4316516931, "rising_vp_excess_vs_hold_jpy": -2.4316516931, "rising_application_rate": 0},
+    "aggregate": {"terminal_excess_vs_hold_jpy": 3.5837909470, "always_vp_excess_vs_hold_jpy": -14.7692266698, "rising_vp_excess_vs_hold_jpy": -14.7692266698, "rising_vp_fills": 10}
+  },
+  "decision": "REJECT_UNSTABLE"
+}

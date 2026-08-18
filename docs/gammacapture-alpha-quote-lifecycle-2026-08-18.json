@@ -1,0 +1,71 @@
+{
+  "name": "quote-lifecycle-bellman-single-leg-screen",
+  "primary_type": "maker/IOC execution",
+  "mechanism": "At a review boundary choose KEEP, REPLACE, or CANCEL by a one-step Bellman action value with a no-fill continuation term.",
+  "null": "Continuation-aware cancel/replace has no incremental fee-net value over always replacing at the same passive distance.",
+  "existing_baseline": "Always replace the passive quote every selected 15-minute window.",
+  "single_integration_point": "One lifecycle action scalar before cancel/replace; no price or quantity control.",
+  "prediction_time": "each non-overlapping ETHJPY BBO anchor",
+  "horizon": "15m",
+  "label_maturity": "anchor + 15m",
+  "update_order": "predict, store quote markout label, mature, then update distance-bucket posterior",
+  "executable_outcome": "one-fill terminal markout using future executable bid; public BBO touch is only a fill proxy",
+  "fees": "10 bps maker fee plus 2 bps adverse-selection allowance for the one-sided screen",
+  "data": {
+    "symbol": "ETHJPY",
+    "from": "2026-08-03T00:00:00Z",
+    "to": "2026-08-11T00:00:00Z",
+    "bbo_source": "data/gammacapture/ETHJPY",
+    "private_fills_available": false,
+    "replacement_cost_bps": 0,
+    "variants": [
+      {"horizon": "15m", "distance_bps": 15},
+      {"horizon": "15m", "distance_bps": 5}
+    ]
+  },
+  "results": [
+    {
+      "distance_bps": 15,
+      "eligible_samples": 1530,
+      "effective_samples": 1530.0,
+      "keep_actions": 0,
+      "replace_actions": 0,
+      "cancel_actions": 1530,
+      "incremental_mean_bps": 3.03892565753736,
+      "incremental_standard_error_bps": 0.540747471718433,
+      "incremental_lower_bound_bps": 1.97908008823814,
+      "positive_blocks": 8,
+      "total_blocks": 8,
+      "gate": "INCONCLUSIVE_NO_ACTION_DIVERSITY"
+    },
+    {
+      "distance_bps": 5,
+      "eligible_samples": 1530,
+      "effective_samples": 1530.0,
+      "keep_actions": 1,
+      "replace_actions": 9,
+      "cancel_actions": 1520,
+      "incremental_mean_bps": 7.555402373842748,
+      "incremental_standard_error_bps": 0.806631702886365,
+      "incremental_lower_bound_bps": 5.974433287397258,
+      "positive_blocks": 8,
+      "total_blocks": 8,
+      "gate": "INCONCLUSIVE_NO_ACTION_DIVERSITY"
+    }
+  ],
+  "candidate_tests": 2,
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 10.0,
+  "minimum_effective_samples": 24.0,
+  "incremental_mean_bps": 7.555402373842748,
+  "incremental_standard_error_bps": 0.806631702886365,
+  "incremental_cost_bps": 0.0,
+  "risk_penalty_bps": 0.0,
+  "alpha": 0.05,
+  "positive_blocks": 8,
+  "total_blocks": 8,
+  "minimum_positive_blocks": 5,
+  "decision": "INCONCLUSIVE_NO_ACTION_DIVERSITY",
+  "reason": "The apparent gain is cancellation of almost every isolated fee-negative leg, not evidence for a completed two-leg continuation policy. A pair-cycle/post-fill continuation replay is required before integration."
+}

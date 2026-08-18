@@ -340,6 +340,10 @@ type ProbabilityCenteredQuoteDecision struct {
 	ProjectedGrossNotionalJPY float64
 	BuyNotionalJPY            float64
 	SellNotionalJPY           float64
+	CycleBuyNotionalJPY       float64
+	CycleSellNotionalJPY      float64
+	TargetRestoringBuyJPY     float64
+	TargetRestoringSellJPY    float64
 
 	ExpectedInventoryNotionalJPY float64
 	InventoryVarianceJPY2        float64
@@ -501,9 +505,11 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 			c.Reason = "exchange minimums exceed gross capacity"
 			return c
 		}
-		desiredBuy := (d.DesiredInventoryNotionalJPY - in.CurrentInventoryNotionalJPY + pSell*gross) / (pBuy + pSell)
-		buy := math.Max(minimumBuy, math.Min(maximumBuy, desiredBuy))
-		sell := gross - buy
+		allocation := inventoryNeutralCycleAllocation(
+			gross,
+			d.DesiredInventoryNotionalJPY-in.CurrentInventoryNotionalJPY,
+			pBuy, pSell, minimumBuy, maximumBuy)
+		buy, sell := allocation.BuyNotionalJPY, allocation.SellNotionalJPY
 		expected := in.CurrentInventoryNotionalJPY + pBuy*buy - pSell*sell
 		variance := pBuy*(1-pBuy)*buy*buy + pSell*(1-pSell)*sell*sell -
 			2*d.FillCovariance*buy*sell
@@ -512,6 +518,10 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 		c.ProjectedGrossNotionalJPY = gross
 		c.BuyNotionalJPY = buy
 		c.SellNotionalJPY = sell
+		c.CycleBuyNotionalJPY = allocation.CycleBuyNotionalJPY
+		c.CycleSellNotionalJPY = allocation.CycleSellNotionalJPY
+		c.TargetRestoringBuyJPY = allocation.TargetRestoringBuyJPY
+		c.TargetRestoringSellJPY = allocation.TargetRestoringSellJPY
 		c.ExpectedInventoryNotionalJPY = expected
 		c.InventoryVarianceJPY2 = variance
 		c.InventoryStdDevJPY = stddev
@@ -578,6 +588,12 @@ func ProbabilityCenteredQuoteNotionals(in ProbabilityCenteredQuoteInput) Probabi
 			c.SellNotionalJPY = minSell
 		}
 		c.ProjectedGrossNotionalJPY = c.BuyNotionalJPY + c.SellNotionalJPY
+		allocation := decomposeInventoryNeutralCycle(
+			c.BuyNotionalJPY, c.SellNotionalJPY, pBuy, pSell)
+		c.CycleBuyNotionalJPY = allocation.CycleBuyNotionalJPY
+		c.CycleSellNotionalJPY = allocation.CycleSellNotionalJPY
+		c.TargetRestoringBuyJPY = allocation.TargetRestoringBuyJPY
+		c.TargetRestoringSellJPY = allocation.TargetRestoringSellJPY
 		expected := in.CurrentInventoryNotionalJPY +
 			pBuy*c.BuyNotionalJPY - pSell*c.SellNotionalJPY
 		variance := pBuy*(1-pBuy)*c.BuyNotionalJPY*c.BuyNotionalJPY +

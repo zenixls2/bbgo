@@ -17,13 +17,15 @@ func trainSyntheticFastDrift(t *testing.T, invertLabels bool) (*MarketMakerHoriz
 		features[index] = FastDriftFeatures{
 			Direction:     []float64{-0.8, -0.2, 0.3, 0.9}[index%4],
 			BookImbalance: []float64{-0.7, 0.4, 0.8, -0.1}[(index/2)%4],
+			BBOStateTag:   []float64{-0.9, 0.6, -0.2, 0.8}[(index/3)%4],
 		}
 	}
 	model.ObserveFastDrift(start, price-1, price+1, horizon, 24*time.Hour, features[0], false)
 	for index := 1; index < len(features); index++ {
 		previous := features[index-1]
 		noise := []float64{-0.25, 0.15, 0.30, -0.20, 0.05}[index%5]
-		returnBps := 2 + 7*previous.Direction + 3*previous.BookImbalance + noise
+		returnBps := 2 + 7*previous.Direction + 3*previous.BookImbalance +
+			5*previous.BBOStateTag + noise
 		if invertLabels && index > 16 {
 			returnBps = -returnBps
 		}
@@ -41,7 +43,7 @@ func TestFastDriftLearnsMaturedExecutableSideReturns(t *testing.T) {
 	if !decision.Fitted || !decision.Healthy || !decision.Enabled {
 		t.Fatalf("expected validated online drift, got %+v", decision)
 	}
-	want := 2 + 7*features.Direction + 3*features.BookImbalance
+	want := 2 + 7*features.Direction + 3*features.BookImbalance + 5*features.BBOStateTag
 	if math.Abs(decision.CenterMeanBps-want) > 0.15 {
 		t.Fatalf("unexpected center prediction: got %.6f want %.6f", decision.CenterMeanBps, want)
 	}
@@ -50,6 +52,75 @@ func TestFastDriftLearnsMaturedExecutableSideReturns(t *testing.T) {
 	}
 	if decision.Samples != 31 || decision.ValidationSamples < fastDriftFeatureCount || decision.PrequentialSkill <= 0 {
 		t.Fatalf("unexpected causal support: %+v", decision)
+	}
+}
+
+func TestFastDriftBBOStateTagIsBoundedAndSideSymmetric(t *testing.T) {
+	model := &MarketMakerHorizonModel{}
+	horizon := time.Minute
+	start := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+	for second := 0; second <= 90; second++ {
+		price := 100.0
+		switch {
+		case second < 45:
+			price -= float64(second) * 0.01
+		default:
+			price -= 0.45
+			price += float64(second-45) * 0.02
+		}
+		model.ObserveBookWithSizes(
+			start.Add(time.Duration(second)*time.Second),
+			price-0.01, 1, price+0.01, 1, MarketMakerConfig{})
+	}
+	tag, ok := model.FastDriftBBOStateTag(horizon)
+	if !ok || tag <= 0 || tag > 1 {
+		t.Fatalf("rebound state should produce bounded positive tag: tag=%v ok=%v", tag, ok)
+	}
+	state := model.conditionalExecutionState(horizon)
+	reflected := conditionalExecutionState{
+		Valid:          true,
+		BuyDrawdownBps: state.SellRunupBps, BuyRebound30Bps: state.SellReversal30Bps,
+		BuyQVBps: state.SellQVBps, SellRunupBps: state.BuyDrawdownBps,
+		SellReversal30Bps: state.BuyRebound30Bps, SellQVBps: state.BuyQVBps,
+		SpreadBps: state.SpreadBps,
+	}
+	reflectedTag, reflectedOK := fastDriftBBOStateTagFromState(reflected, horizon)
+	if !reflectedOK {
+		t.Fatal("reflected valid state did not produce a tag")
+	}
+	if math.Abs(tag+reflectedTag) > 1e-12 {
+		t.Fatalf("side reflection must negate BBO tag: tag=%v reflected=%v", tag, reflectedTag)
+	}
+}
+
+func TestFastDriftBBOStateTagIsFilteredOncePerMinute(t *testing.T) {
+	model := &MarketMakerHorizonModel{}
+	config := MarketMakerConfig{}
+	start := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+	for second := 0; second <= 70; second++ {
+		price := 100 + 0.01*float64(second)
+		model.ObserveBookWithSizes(start.Add(time.Duration(second)*time.Second),
+			price-0.01, 1, price+0.01, 1, config)
+	}
+	first, ok := model.FastDriftBBOStateTag(time.Minute)
+	if !ok {
+		t.Fatal("expected valid cached BBO state tag")
+	}
+	// An extreme same-minute event must not become a second trading signal.
+	model.ObserveBookWithSizes(start.Add(71*time.Second), 89.99, 1, 90.01, 1, config)
+	second, ok := model.FastDriftBBOStateTag(time.Minute)
+	if !ok || second != first {
+		t.Fatalf("same-minute BBO tag was not filtered: first=%v second=%v", first, second)
+	}
+	if got := model.fastDriftBBOStateTags[time.Minute].Bucket; !got.Equal(start.Add(time.Minute)) {
+		t.Fatalf("unexpected cache bucket: %v", got)
+	}
+	model.ObserveBookWithSizes(start.Add(2*time.Minute), 89.98, 1, 90, 1, config)
+	if _, ok := model.FastDriftBBOStateTag(time.Minute); !ok {
+		t.Fatal("next-minute BBO state tag did not refresh")
+	}
+	if got := model.fastDriftBBOStateTags[time.Minute].Bucket; !got.Equal(start.Add(2 * time.Minute)) {
+		t.Fatalf("BBO tag cache did not advance: %v", got)
 	}
 }
 

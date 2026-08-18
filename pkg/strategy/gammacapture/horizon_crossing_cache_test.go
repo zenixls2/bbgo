@@ -179,3 +179,92 @@ func TestCrossingExposureCacheDefersSameSecondReplacement(t *testing.T) {
 		t.Fatalf("new-second cache rebuild mismatch\n got: %+v\nwant: %+v", got, want)
 	}
 }
+
+func TestIncrementalExposureBatchMatchesFreshExactBuild(t *testing.T) {
+	rng := rand.New(rand.NewSource(15082026))
+	start := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	horizon := 2 * time.Minute
+	all := make([]MarketMakerHorizonPoint, 0, 12*60)
+	mid := 300_000.0
+	for second := 0; second < 12*60; second++ {
+		mid *= math.Exp(rng.NormFloat64() * 0.00005)
+		spread := 1 + 8*rng.Float64()
+		all = append(all, MarketMakerHorizonPoint{
+			At:               start.Add(time.Duration(second) * time.Second),
+			Bid:              mid * math.Exp(-spread/20_000),
+			Ask:              mid * math.Exp(spread/20_000),
+			BBOWeightedPrice: mid * math.Exp(rng.NormFloat64()*0.00001),
+			BookImbalance:    rng.Float64()*2 - 1,
+			BookDepthReady:   true,
+			GapBefore:        second == 9*60+17,
+		})
+	}
+	incremental := MarketMakerHorizonModel{points: append([]MarketMakerHorizonPoint(nil), all[:8*60]...)}
+	_ = incremental.crossingExposures(horizon)
+	incremental.points = append(incremental.points, all[8*60:]...)
+	got := incremental.crossingExposures(horizon)
+	fresh := MarketMakerHorizonModel{points: append([]MarketMakerHorizonPoint(nil), all...)}
+	want := fresh.crossingExposures(horizon)
+	equalExposure := func(a, b marketMakerHorizonExposure) bool {
+		if !a.At.Equal(b.At) || !a.EndAt.Equal(b.EndAt) || a.NextMinute != b.NextMinute ||
+			a.StartBookDepthReady != b.StartBookDepthReady ||
+			a.ConditionalState.Valid != b.ConditionalState.Valid {
+			return false
+		}
+		av := []float64{
+			a.StartBid, a.StartAsk, a.StartBBOWeightedPrice, a.WindowBBOWeightedPrice,
+			a.StartBookImbalance,
+			a.TerminalBid, a.TerminalAsk, a.BuyExcursionBps, a.SellExcursionBps,
+			a.ConditionalState.BuyDrawdownBps, a.ConditionalState.BuyRebound30Bps,
+			a.ConditionalState.BuyQVBps, a.ConditionalState.SellRunupBps,
+			a.ConditionalState.SellReversal30Bps, a.ConditionalState.SellQVBps,
+			a.ConditionalState.SpreadBps,
+		}
+		bv := []float64{
+			b.StartBid, b.StartAsk, b.StartBBOWeightedPrice, b.WindowBBOWeightedPrice,
+			b.StartBookImbalance,
+			b.TerminalBid, b.TerminalAsk, b.BuyExcursionBps, b.SellExcursionBps,
+			b.ConditionalState.BuyDrawdownBps, b.ConditionalState.BuyRebound30Bps,
+			b.ConditionalState.BuyQVBps, b.ConditionalState.SellRunupBps,
+			b.ConditionalState.SellReversal30Bps, b.ConditionalState.SellQVBps,
+			b.ConditionalState.SpreadBps,
+		}
+		for index := range av {
+			if math.Abs(av[index]-bv[index]) > 1e-8 {
+				return false
+			}
+		}
+		return true
+	}
+	if len(got) != len(want) {
+		t.Fatalf("incremental batch length differs: got=%d want=%d", len(got), len(want))
+	}
+	for index := range got {
+		if !equalExposure(got[index], want[index]) {
+			t.Fatalf("incremental batch differs at %d:\n got=%+v\nwant=%+v", index, got[index], want[index])
+		}
+	}
+}
+
+func TestHorizonExposureUsesTimeWeightedDepthWeightedBBOPrice(t *testing.T) {
+	config := MarketMakerConfig{HorizonLookback: types.Duration(time.Minute)}
+	model := MarketMakerHorizonModel{}
+	start := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+	model.ObserveBookWithSizesAndGap(start, 99, 1, 101, 1, config, false)
+	// Microprice = (103*3 + 99*1)/(3+1) = 102. The first BBO is
+	// valid for two seconds and this one for the remaining eight seconds.
+	model.ObserveBookWithSizesAndGap(start.Add(2*time.Second), 99, 3, 103, 1, config, false)
+	model.ObserveBookWithSizesAndGap(start.Add(10*time.Second), 100, 1, 102, 1, config, false)
+
+	exposures := model.crossingExposures(10 * time.Second)
+	if len(exposures) == 0 {
+		t.Fatal("expected one completed BBO window")
+	}
+	got := exposures[0]
+	if math.Abs(got.StartBBOWeightedPrice-100) > 1e-12 {
+		t.Fatalf("unexpected starting BBO-weighted price: %+v", got)
+	}
+	if want := (100*2 + 102*8) / 10.0; math.Abs(got.WindowBBOWeightedPrice-want) > 1e-12 {
+		t.Fatalf("event frequency must not replace time weighting: got=%v want=%v", got.WindowBBOWeightedPrice, want)
+	}
+}

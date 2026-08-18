@@ -154,7 +154,7 @@ exchangeStrategies:
         minTradingWindow: 10m
         maxTradingWindow: 10m
         horizonLookback: 6h
-        horizonUpdateInterval: 1m
+        horizonUpdateInterval: 5m
         horizonMinSamples: 6
         # Horizon distances are estimated directly from side-specific BBO
         # history; the retired online-arrival learner is intentionally omitted.

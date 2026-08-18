@@ -142,10 +142,67 @@ exchangeStrategies:
         inventoryRiskBudgetJPY: 10
         inventoryRiskBudgetRatio: 0.0025
         inventoryRiskZScore: 1.282
-        # Center Fast quantity on the posterior expectation between the
-        # persisted session base anchor and the 50% policy target. Falling
-        # prices no longer create an unconditional constant-mix BUY demand.
+        # Center Fast quantity and terminal inventory risk on one same-horizon
+        # executable-BBO posterior. Neutral evidence retains the 50% strategic
+        # target; supported upside/downside moves the bounded aim toward the
+        # configured hard capital limits. Price drift does not disable it.
         posteriorInventoryTarget: true
+        # Unified fee/risk-gated inventory aim. This is the single production
+        # inventory-target actuator; it does not add a price or side gate.
+        # Evidence is admitted by the predictive fee-adjusted bound rather
+        # than by a fixed raw path-count threshold.
+        dynamicInventoryAim:
+          enabled: true
+          shadowOnly: false
+          # Compatibility field only; the runtime evidence gate requires
+          # effectiveSamples > 1, then the confidence-adjusted fee bound
+          # decides economic admissibility.
+          minimumSamples: 2
+          evidencePriorSamples: 1
+          confidenceZScore: 1.645
+        # The BBO-state tag is fitted only on matured, non-overlapping windows.
+        # Prequential gain versus zero drift determines its model weight; weak
+        # or decayed ML evidence therefore remains diagnostic and contributes
+        # no independent price/quantity multiplier.
+        fastDrift:
+          enabled: true
+          shadowOnly: false
+        # Asymmetric oscillation risk changes only the unified risk-aversion
+        # coefficient: upward oscillations reduce carrying aversion and
+        # downward oscillations increase it. It never creates a side or gate.
+        # The model is online and strictly prequential on executable BBO bids.
+        asymmetricOscillationRisk:
+          enabled: true
+          shadowOnly: false
+          directionStrength: 0.6
+          asymmetryWeight: 0.5
+          minMultiplier: 0.65
+          maxMultiplier: 1.75
+          ewmaAlpha: 0.1
+          priorVarianceBps2: 25
+          minSamples: 12
+        # Retain the previous quoted Fast target unless the new target's
+        # same-horizon certainty-equivalent improvement pays its proportional
+        # maker fee plus adverse-selection switching cost.
+        fastTargetSwitching:
+          enabled: true
+          # Target changes are free; only fills move actual inventory. The
+          # impulse controller therefore charges |selected-current inventory|,
+          # not |selected-previous unfilled target|, and may choose an exact
+          # partial target on the posterior segment. Fixed-regime replay keeps
+          # this live because it improves mixed/downside behavior without
+          # creating range IOC turnover.
+          shadowOnly: false
+        # Same-horizon Fast active execution. The empirical maker-touch
+        # probability (with its calibration error) and the terminal inventory
+        # posterior decide whether expected waiting loss exceeds the exact
+        # maker-to-IOC cost. No fixed BPS trigger or Poisson arrival assumption
+        # is used. If a valid maker quote exists, IOC quantity retains its
+        # empirical miss/edge weighting. If the terminal model rejects maker,
+        # the target controller's already cost-optimal gap is executed once
+        # without a second edge/cost shrink, capped by L1 depth and balances.
+        fastTargetExecution:
+          enabled: true
         # Same-symbol 45-second executable-BBO direction auxiliary. Its raw
         # BOCPD probability is mapped by rolling Platt calibration only after
         # each future label matures; no offline artifact or future label is
@@ -171,6 +228,23 @@ exchangeStrategies:
         # the old soft-band/6 fixed tranche cap is not applied a second time.
         jointDistanceQuantity:
           enabled: true
+          # Request a bounded maker bid and ask when terminal-path CE rejects
+          # both sides.  This is a conditional continuity floor, not a
+          # profitability override: crossing edge, hard inventory headroom,
+          # and exchange minimums still gate it.
+          preserveTwoSidedQuotes: true
+          # The preliminary Fast selector compares complete horizon-specific
+          # evidence bundles over 10m/15m/30m. The joint optimizer then chooses
+          # executable distance and quantity at that one selected horizon.
+          # Cross-horizon joint search is disabled because merely substituting H
+          # would reuse volatility, drift, target, caps and base plan computed
+          # for a different window and invalidate the posterior objective.
+          jointHorizonSelection: false
+          # An outward level may replace the ordinary Fast quote only when its
+          # paired completed-path payoff improvement survives the simultaneous
+          # confidence bound across the searched ladder. This prevents a remote
+          # low-arrival level from winning merely as the maximum noisy estimate.
+          pairedDistanceImprovement: true
           # Fast has sole ownership of final quantity. The one-sided terminal-return
           # posterior uses fractional Kelly inside live risk/headroom/balance
           # capacity. For a non-positive marginal BUY, the selected-window Beta
@@ -188,6 +262,18 @@ exchangeStrategies:
         # terminal-wealth optimizer; it has no fitted coefficients or artifact.
         conditionalExecution:
           enabled: true
+        # Causal public-trade volume profile. It conditions the existing Fast
+        # terminal-payoff kernel only; it is not an independent quote,
+        # quantity, or hard-gate controller. shadowOnly is the explicit switch
+        # for diagnostic-only operation.
+        volumeProfile:
+          enabled: true
+          shadowOnly: false
+          halfLife: 45m
+          binWidthBps: 1
+          maxBins: 512
+          kernelWeight: 1
+          minEffectiveTrades: 8
         # After a private fill, compare inward opposite-side prices against the
         # ordinary quote on paired completed BBO paths. The model may spend
         # cycle edge during a statistically supported continuation or risk
@@ -281,7 +367,10 @@ exchangeStrategies:
         minTradingWindow: 10m
         maxTradingWindow: 30m
         horizonLookback: 6h
-        horizonUpdateInterval: 1m
+        # Re-estimate every selectable 10/15/30m model on a common causal 5m
+        # clock. Existing orders retain the reference-window lease they were
+        # born with; this update alone never cancels or extends them.
+        horizonUpdateInterval: 5m
         # Effective exposure is overlap-adjusted. Posterior uncertainty,
         # rather than non-zero touches on both sides, gates realignment.
         horizonMinSamples: 6

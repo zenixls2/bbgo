@@ -14,42 +14,14 @@ type FastSideAdmissionDecision struct {
 	UtilityBoundJPY    float64
 }
 
-// FastDirectionScaledBuyAdmission converts the selected-window Beta posterior
-// direction into a continuous exchange-lattice cap when a BUY's confidence-
-// adjusted marginal utility is not yet positive.  Direction is already
-// 2*P(up)-1, hence max(0,direction) is the posterior advantage over a neutral
-// coin.  It controls only the additional target-acquisition cells; one minimum
-// executable cell remains available to keep Fast sampling alive.
-func FastDirectionScaledBuyAdmission(
-	d FastSideAdmissionDecision,
-	direction, minimumNotionalJPY, requestedNotionalJPY float64,
-) FastSideAdmissionDecision {
-	finite := func(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
-	if !d.Evaluated || d.UtilityBoundJPY > 0 ||
-		!finite(direction) || !finite(minimumNotionalJPY) || !finite(requestedNotionalJPY) ||
-		minimumNotionalJPY <= 0 || requestedNotionalJPY <= 0 ||
-		d.MaximumNotionalJPY <= minimumNotionalJPY {
-		return d
-	}
-	advantage := math.Max(0, math.Min(1, direction))
-	maximum := minimumNotionalJPY +
-		advantage*(d.MaximumNotionalJPY-minimumNotionalJPY)
-	maximum = math.Min(requestedNotionalJPY, maximum)
-	d.MaximumNotionalJPY = maximum
-	d.Applied = maximum+1e-9 < requestedNotionalJPY
-	d.Reason = "non-positive BUY utility scales extra target cells by Fast posterior advantage"
-	return d
-}
-
 // FastTargetAwareSideAdmission is the exchange-lattice boundary condition for
-// either Fast side. Its caller supplies the decision-relevant utility bound:
-// a lower confidence bound for risk-increasing BUY and an upper confidence
-// bound for risk-reducing SELL. A positive bound preserves the optimizer's
-// quantity. A non-positive bound may still restore inventory to the posterior
-// target. The separate FastPathDownsideBuyCap owns the one-cell boundary for
-// a bearish terminal path; applying it here as well would double-count the
-// same risk evidence and suppress statistically supported target acquisition.
-// Missing evidence fails open.
+// either Fast side. Its caller supplies the side's incremental, fee-net,
+// whole-position certainty equivalent after posterior downside regret. A
+// positive value preserves the optimizer's quantity; a non-positive value
+// removes the side. Target restoration is already valued through the covariance
+// term in that certainty equivalent, so granting an additional target-gap
+// exception would spend the same inventory benefit twice. Missing evidence
+// fails open.
 func FastTargetAwareSideAdmission(
 	side types.SideType,
 	marginalUtilityEvaluated bool,
@@ -70,32 +42,13 @@ func FastTargetAwareSideAdmission(
 		return d
 	}
 	d.Evaluated = true
-	// BUY increases long-only risky exposure and therefore needs strictly
-	// positive lower-bound evidence. SELL reduces exposure and is restrained
-	// only with strictly negative upper-bound evidence; an exact zero is absence
-	// of evidence, not evidence of harm.
-	if utilityBoundJPY > 0 || (side == types.SideTypeSell && utilityBoundJPY == 0) {
+	if utilityBoundJPY > 0 {
 		d.Reason = "minimum side utility bound is positive"
-		if side == types.SideTypeSell && utilityBoundJPY == 0 {
-			d.Reason = "SELL utility upper bound is not negative"
-		}
 		return d
 	}
-	maximum := math.Max(0, currentInventoryJPY-targetInventoryJPY)
-	if side == types.SideTypeBuy {
-		maximum = math.Max(0, targetInventoryJPY-currentInventoryJPY)
-	}
-	maximum = math.Min(requestedNotionalJPY, maximum)
-	if maximum+1e-9 < minimumNotionalJPY {
-		maximum = 0
-	}
-	d.MaximumNotionalJPY = maximum
-	d.Applied = maximum+1e-9 < requestedNotionalJPY
-	if side == types.SideTypeBuy {
-		d.Reason = "non-positive BUY marginal utility restricts acquisition to target deficit"
-	} else {
-		d.Reason = "non-positive SELL marginal utility restricts reduction to target excess"
-	}
+	d.MaximumNotionalJPY = 0
+	d.Applied = requestedNotionalJPY > 0
+	d.Reason = "non-positive fee-net side certainty equivalent removes Fast order"
 	return d
 }
 
@@ -125,16 +78,15 @@ type FastPathDownsideCapDecision struct {
 
 // FastPathDownsideBuyCap protects the probability-only Fast baseline from
 // averaging down when completed terminal executable-bid paths contradict a
-// new BUY. A BUY is capped at one exchange cell only when both conditions hold:
-//
-//  1. the live Fast crossing direction is bearish; and
-//
-//  2. the exchange-cell BUY has non-positive confidence-adjusted marginal
-//     whole-position terminal wealth.
+// new BUY. A BUY is capped at one exchange cell only when both the terminal
+// executable-inventory return and the exchange-cell marginal whole-position
+// wealth are non-positive. The raw Fast direction is diagnostic only: using it
+// as another prerequisite would apply the same directional evidence once in
+// quote preprocessing and again after the terminal distribution is estimated.
 //
 // Thus the cap is a confidence test in terminal wealth, not a rolling-return
 // stop or a fitted BPS threshold. It never removes the bid, changes quote price,
-// or constrains bullish/neutral/uncertain paths. SELL promotion remains owned
+// or constrains terminally bullish/uncertain paths. SELL promotion remains owned
 // by the same marginal whole-position utility optimizer. The terminal return
 // confidence interval is reported as a diagnostic, not used as a second gate.
 func FastPathDownsideBuyCap(in FastPathDownsideCapInput) FastPathDownsideCapDecision {
@@ -160,10 +112,6 @@ func FastPathDownsideBuyCap(in FastPathDownsideCapInput) FastPathDownsideCapDeci
 	d.InventoryReturnStdErrorBps = math.Sqrt(in.InventoryReturnVarianceBps2 / in.EffectiveSamples)
 	z := math.Max(0, in.ConfidenceZScore)
 	d.InventoryReturnUpperBps = in.InventoryReturnMeanBps + z*d.InventoryReturnStdErrorBps
-	if in.Direction >= 0 {
-		d.Reason = "Fast direction is not bearish"
-		return d
-	}
 	if in.InventoryReturnMeanBps >= 0 {
 		d.Reason = "terminal executable inventory return is not bearish"
 		return d
@@ -173,7 +121,7 @@ func FastPathDownsideBuyCap(in FastPathDownsideCapInput) FastPathDownsideCapDeci
 		return d
 	}
 	d.Applied = true
-	d.Reason = "bearish Fast path rejects multi-cell BUY terminal wealth"
+	d.Reason = "terminally bearish path rejects multi-cell BUY terminal wealth"
 	d.MaximumBuyNotionalJPY = in.MinimumBuyNotionalJPY
 	return d
 }

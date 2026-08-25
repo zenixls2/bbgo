@@ -111,6 +111,12 @@ exchangeStrategies:
         enabled: false
         path: data/gammacapture
         livePath: data/gammacapture/live
+        # The maker startup replay still consumes Binance bookticker at its
+        # one-second causal accumulator; the 5-minute BBO reduction is a
+        # research CLI option only. Keep the bounded history explicit.
+        lookback: 6h
+        maxAge: 72h
+        requireHealthy: false
         # These paths are also the local collector roots used by the BBO/trade
         # startup replay even though legacy aggregate-trade warmup is disabled.
       # Fee-aware maker quote path. Start with a small notional while live BBO,
@@ -151,19 +157,45 @@ exchangeStrategies:
         # target; supported upside/downside moves the bounded aim toward the
         # configured hard capital limits. Price drift does not disable it.
         posteriorInventoryTarget: true
-        # Unified fee/risk-gated inventory aim. This is the single production
-        # inventory-target actuator; it does not add a price or side gate.
-        # Evidence is admitted by the predictive fee-adjusted bound rather
-        # than by a fixed raw path-count threshold.
+        # Retained for YAML/checkpoint compatibility and isolated research;
+        # the DynamicInventoryAim production actuator has been retired after
+        # negative next-pivot PnL identification. PosteriorInventoryTarget is
+        # now the sole same-horizon target source in the live quote path.
         dynamicInventoryAim:
-          enabled: true
+          enabled: false
           shadowOnly: false
-          # Compatibility field only; the runtime evidence gate requires
-          # effectiveSamples > 1, then the confidence-adjusted fee bound
-          # decides economic admissibility.
+          # Compatibility fields only; the production quote path does not
+          # evaluate this component or its confidence/fee gate.
           minimumSamples: 2
           evidencePriorSamples: 1
           confidenceZScore: 1.645
+          # Research-only marked-inventory beta cap. Keep unset/zero in the
+          # live profile until an untouched same-symbol walk-forward confirms
+          # the P&L/correlation trade-off.
+          # priceBetaTarget: 0.35
+          # Research-only single regime-conditioned target shift. The causal
+          # Keep disabled in production: the original replay compared an
+          # implicitly disabled candidate arm, and the corrected paired replay
+          # still failed private-fill calibration and worsened drawdown. The
+          # retained implementation uses terminal side-BBO drift only after
+          # the fee/risk confidence bound; crossing arrival rates never enter
+          # the inventory target.
+          regimeConditionedTarget:
+            enabled: false
+            kappa: 0.20
+            maxShiftRatio: 0.20
+            priorEffectiveSamples: 8
+          # Pivot-first causal directional-change target. The code path is
+          # integrated and replay-testable, but remains disabled until private
+          # fill/queue calibration demonstrates positive active-leg value.
+          pivotRegimeTarget:
+            enabled: false
+            reversalBps: 26
+            maxGap: 15m
+            minLegSamples: 2
+            priorLegSamples: 2
+            maxShiftRatio: 0.20
+            riskPenaltyBps: 0
         # The BBO-state tag is fitted only on matured, non-overlapping windows.
         # Prequential gain versus zero drift determines its model weight; weak
         # or decayed ML evidence therefore remains diagnostic and contributes
@@ -171,12 +203,30 @@ exchangeStrategies:
         fastDrift:
           enabled: true
           shadowOnly: false
-        # Asymmetric oscillation risk changes only the unified risk-aversion
-        # coefficient: upward oscillations reduce carrying aversion and
-        # downward oscillations increase it. It never creates a side or gate.
-        # The model is online and strictly prequential on executable BBO bids.
-        asymmetricOscillationRisk:
+        # Same-symbol Relative-Hold canary. These are the exact parameters
+        # used by the five-day causal replay; it contributes one scalar to the
+        # Fast joint utility only after matured strategy-vs-Hold labels.
+        # The replay gate was inconclusive, so keep this as an observable
+        # canary rather than treating it as a proven incremental alpha.
+        relativeHoldRisk:
           enabled: true
+          shadowOnly: false
+          horizon: 1h
+          halfLife: 6h
+          minimumEffectiveSamples: 4
+          minimumDownsideEffectiveSamples: 4
+          priorEffectiveSamples: 4
+          targetDownsideBeta: 1
+          confidenceZ: 1.645
+          tailQuantile: 0.95
+          maxTailSamples: 256
+          trackingErrorAversion: 1
+          downsideBetaAversion: 1
+        # Asymmetric oscillation risk is retained for shadow/offline research;
+        # it is disabled in production until fixed-horizon, fee-net evidence
+        # shows an incremental benefit without reducing fill opportunity.
+        asymmetricOscillationRisk:
+          enabled: false
           shadowOnly: false
           directionStrength: 0.6
           asymmetryWeight: 0.5
@@ -221,6 +271,16 @@ exchangeStrategies:
           maximumStates: 128
           refitEvery: 8
           priorStrength: 8
+        # One-minute jump/noise-robust transition posterior. It is a
+        # fallback only while BOCPD45 is not ready; keep disabled in the live
+        # canary until a same-symbol replay shows positive incremental action
+        # diversity. It never owns a second quantity or admission gate.
+        multiscaleRegime:
+          enabled: false
+          hazardMean: 3h
+          maximumRunLength: 360
+          volatilityWindow: 30
+          minimumSamples: 30
         probabilityCenteredQuantity:
           enabled: true
           # Live canary enabled after paired-replay review; retain quantityProjection diagnostics.
@@ -249,6 +309,13 @@ exchangeStrategies:
           # confidence bound across the searched ladder. This prevents a remote
           # low-arrival level from winning merely as the maximum noisy estimate.
           pairedDistanceImprovement: true
+          # Estimate the path decay factor from matured executable-BBO
+          # persistence and track the current Neff against its causal EWMA.
+          adaptivePathDecay: true
+          # Mature only when the one-sided 95% terminal-path confidence
+          # half-width is no larger than one economic scale. This replaces the
+          # unreachable fixed six-effective-sample gate.
+          pathMaturityMaxRelativeHalfWidth: 1
           # Fast has sole ownership of final quantity. The one-sided terminal-return
           # posterior uses fractional Kelly inside live risk/headroom/balance
           # capacity. For a non-positive marginal BUY, the selected-window Beta
@@ -403,6 +470,15 @@ exchangeStrategies:
           minOFI: 0.10
           minVolume: 0.10
           suppressOnDisagreement: true
+        # Research candidate: repair the ordinary-flow blind spot when the
+        # high-volume VolumeBalance shock path is inactive. Keep disabled
+        # until the paired same-symbol replay clears its fee/queue gate.
+        normalFlowPressure:
+          enabled: false
+          minAbsImbalance: 0.10
+          minTrades: 20
+          priorTrades: 20
+          maximumSignalWeight: 0.35
         acquisitionQuote:
           # Shadow-only first-passage accommodation; it reports a dynamic
           # confidence-bounded bid delta without changing live orders.

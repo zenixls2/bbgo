@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -52,8 +53,30 @@ func TestLiveETHJPYConfigDecodesInventoryControllers(t *testing.T) {
 	if !strategy.MarketMaker.PosteriorInventoryTarget {
 		t.Fatal("live ETHJPY config must enable posterior inventory targeting")
 	}
+	if strategy.MarketMaker.DynamicInventoryAim.Enabled || strategy.MarketMaker.DynamicInventoryAim.ShadowOnly {
+		t.Fatalf("live ETHJPY config must keep the retired DynamicInventoryAim inactive: %+v", strategy.MarketMaker.DynamicInventoryAim)
+	}
+	if strategy.MarketMaker.DynamicInventoryAim.RegimeConditionedTarget.Enabled ||
+		math.Abs(strategy.MarketMaker.DynamicInventoryAim.RegimeConditionedTarget.Kappa-0.20) > 1e-12 ||
+		math.Abs(strategy.MarketMaker.DynamicInventoryAim.RegimeConditionedTarget.MaxShiftRatio-0.20) > 1e-12 {
+		t.Fatalf("live ETHJPY config must retain but disable the rejected regime-conditioned target: %+v", strategy.MarketMaker.DynamicInventoryAim.RegimeConditionedTarget)
+	}
+	pivotTarget := strategy.MarketMaker.DynamicInventoryAim.PivotRegimeTarget
+	if pivotTarget.Enabled || math.Abs(pivotTarget.ReversalBps-26) > 1e-12 ||
+		time.Duration(pivotTarget.MaxGap) != 15*time.Minute || pivotTarget.MinLegSamples != 2 ||
+		math.Abs(pivotTarget.PriorLegSamples-2) > 1e-12 || math.Abs(pivotTarget.MaxShiftRatio-0.20) > 1e-12 {
+		t.Fatalf("live ETHJPY config must retain but disable the pivot-first target pending private-fill calibration: %+v", pivotTarget)
+	}
 	if !strategy.MarketMaker.BOCPD45.Enabled || strategy.MarketMaker.BOCPD45.Calibration != "platt" {
 		t.Fatalf("live ETHJPY config must enable strictly-prequential Platt BOCPD45: %+v", strategy.MarketMaker.BOCPD45)
+	}
+	if !strategy.MarketMaker.RelativeHoldRisk.Enabled || strategy.MarketMaker.RelativeHoldRisk.ShadowOnly {
+		t.Fatalf("live ETHJPY config must enable the Relative-Hold canary as an active Fast utility scalar: %+v", strategy.MarketMaker.RelativeHoldRisk)
+	}
+	if strategy.MarketMaker.RelativeHoldRisk.Horizon != time.Hour ||
+		strategy.MarketMaker.RelativeHoldRisk.HalfLife != 6*time.Hour ||
+		strategy.MarketMaker.RelativeHoldRisk.MinimumEffectiveSamples != 4 {
+		t.Fatalf("live Relative-Hold canary must match the five-day replay parameters: %+v", strategy.MarketMaker.RelativeHoldRisk)
 	}
 	if got := strategy.MarketMaker.EffectiveInventoryTargetRatio(); math.Abs(got-0.5) > 1e-12 {
 		t.Fatalf("Fast strategic inventory prior must remain 50%%, got %v", got)

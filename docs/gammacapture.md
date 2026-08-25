@@ -5916,6 +5916,16 @@ excess under a sufficiently long, same-symbol holdout.
 
 ## Dynamic inventory aim and partial adjustment (2026-08-18)
 
+### Production retirement (2026-08-25)
+
+The production target actuator was removed after the causal next-confirmed-pivot
+diagnostic produced negative target-action PnL: 475 gated actions had a 40.0%
+positive-PnL rate and mean gross mark-to-pivot PnL of -5.204 bps on the
+2026-08-23 ETHJPY replay. `DynamicInventoryAim` remains only for compatibility,
+unit tests, and isolated research replay. Live target selection now falls back
+to `PosteriorInventoryRiskTarget`, followed by `FastTargetSwitching` and
+`FastTargetExecution`.
+
 `DynamicInventoryAim` is an isolated inventory/quantity component based on the
 moving-aim and partial-adjustment structure of Gârleanu--Pedersen. It accepts
 only the same-symbol, executable-BBO inventory-return posterior and the
@@ -5942,13 +5952,12 @@ interval. When evidence is insufficient or the net return is inside the fee
 no-trade region, the component retains the strategic target rather than
 falling back to the current inventory or deleting one side.
 
-`FastTargetSwitching` is skipped only after `DynamicInventoryAim` has passed
-its evidence and fee gates (and is not shadow-only), so an immature or
-fee-negative dynamic estimate cannot accidentally strand the old target
-switcher. The component is available in live/replay config but remains
-disabled until a same-symbol component replay passes the alpha-screening
-gate. The research override is `--dynamic-inventory-aim`; no live YAML or
-service restart is performed by the screening implementation.
+Historically, `FastTargetSwitching` was skipped only after
+`DynamicInventoryAim` passed its evidence and fee gates. The production path
+now evaluates the target switcher directly after `PosteriorInventoryRiskTarget`;
+the dynamic confidence/fee gate is no longer part of live quoting. The
+component remains available in compatibility/research config under the
+`--dynamic-inventory-aim` replay override, but is disabled in live YAML.
 
 The first paired ETHJPY component replay used the exact same compacted
 market-data stream for both arms. On `2026-08-09 08:00--2026-08-10 00:00 UTC`

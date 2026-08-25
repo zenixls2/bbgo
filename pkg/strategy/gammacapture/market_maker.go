@@ -64,6 +64,21 @@ type JointDistanceQuantityConfig struct {
 	// must improve balanced Fast-cycle payoff over the ordinary quote on the
 	// same completed paths, under a simultaneous confidence bound.
 	PairedDistanceImprovement bool `json:"pairedDistanceImprovement" yaml:"pairedDistanceImprovement"`
+	// PathMaturityMaxRelativeHalfWidth is the largest allowed posterior
+	// confidence half-width relative to the larger of the fee/edge scale and
+	// the observed terminal-payoff mean.  It is a precision condition, not a
+	// fixed raw-sample gate: overlapping path windows are counted through their
+	// effective sample size and their weighted variance.
+	PathMaturityMaxRelativeHalfWidth float64 `json:"pathMaturityMaxRelativeHalfWidth" yaml:"pathMaturityMaxRelativeHalfWidth"`
+	// AdaptivePathDecay estimates the path-persistence decay factor from
+	// matured same-symbol executable-BBO paths.  When absent it defaults on;
+	// the old sqrt(horizon*lookback) scale is retained only as a cold-start
+	// prior until enough lagged path observations exist.
+	AdaptivePathDecay bool `json:"adaptivePathDecay" yaml:"adaptivePathDecay"`
+	// LegacyStackedTargetContinuation is an in-memory research control for
+	// paired replay of the retired behavior. It is intentionally excluded from
+	// JSON/YAML so production configuration cannot re-enable target stacking.
+	LegacyStackedTargetContinuation bool `json:"-" yaml:"-"`
 }
 
 // PostFillUtilityConfig controls causal opposite-side repricing immediately
@@ -115,15 +130,20 @@ type MarketMakerConfig struct {
 	// Fast quote sizing, target switching, or IOC decisions.
 	FastRiskAversion         float64 `json:"fastRiskAversion" yaml:"fastRiskAversion"`
 	PosteriorInventoryTarget bool    `json:"posteriorInventoryTarget" yaml:"posteriorInventoryTarget"`
-	// DynamicInventoryAim is the single target/speed controller.  It may
-	// influence the Fast inventory target only; price, arrival, and order
-	// lifecycle gates remain owned by their existing models.
+	// DynamicInventoryAim is retained for YAML/checkpoint compatibility and
+	// isolated research. Production quoting no longer evaluates this actuator;
+	// PosteriorInventoryTarget owns the live same-horizon target.
 	DynamicInventoryAim       DynamicInventoryAimConfig       `json:"dynamicInventoryAim" yaml:"dynamicInventoryAim"`
 	FastTargetExecution       FastTargetExecutionConfig       `json:"fastTargetExecution" yaml:"fastTargetExecution"`
 	FastTargetSwitching       FastTargetSwitchingConfig       `json:"fastTargetSwitching" yaml:"fastTargetSwitching"`
 	FastDrift                 FastDriftConfig                 `json:"fastDrift" yaml:"fastDrift"`
 	AsymmetricOscillationRisk AsymmetricOscillationRiskConfig `json:"asymmetricOscillationRisk" yaml:"asymmetricOscillationRisk"`
 	BOCPD45                   BOCPD45Config                   `json:"bocpd45" yaml:"bocpd45"`
+	// MultiscaleRegime is a one-minute, jump/noise-robust transition posterior.
+	// It is a direction fallback only: a ready calibrated BOCPD45 posterior
+	// remains authoritative, so the same change-point evidence is not counted
+	// twice in price, quantity, and admission gates.
+	MultiscaleRegime MultiscaleRegimeConfig `json:"multiscaleRegime" yaml:"multiscaleRegime"`
 	// VolumeProfile is used only as a causal conditioning feature of the
 	// unified Fast terminal-payoff model. It is intentionally not an
 	// independent quote, quantity, or hard-gate controller.
@@ -139,8 +159,12 @@ type MarketMakerConfig struct {
 	MacroInventory              MacroInventoryConfig              `json:"macroInventory" yaml:"macroInventory"`
 	ProbabilityCenteredQuantity ProbabilityCenteredQuantityConfig `json:"probabilityCenteredQuantity" yaml:"probabilityCenteredQuantity"`
 	JointDistanceQuantity       JointDistanceQuantityConfig       `json:"jointDistanceQuantity" yaml:"jointDistanceQuantity"`
-	ConditionalExecution        ConditionalExecutionConfig        `json:"conditionalExecution" yaml:"conditionalExecution"`
-	PostFillUtility             PostFillUtilityConfig             `json:"postFillUtility" yaml:"postFillUtility"`
+	// RelativeHoldRisk is a single scalar utility adjustment inside the Fast
+	// joint distance/quantity optimizer. It remains disabled unless a same-
+	// symbol matured replay explicitly enables it; it is never a side gate.
+	RelativeHoldRisk     RelativeHoldRiskConfig     `json:"relativeHoldRisk" yaml:"relativeHoldRisk"`
+	ConditionalExecution ConditionalExecutionConfig `json:"conditionalExecution" yaml:"conditionalExecution"`
+	PostFillUtility      PostFillUtilityConfig      `json:"postFillUtility" yaml:"postFillUtility"`
 	// QuoteLifecycleAction is a Bellman KEEP/REPLACE/CANCEL review at the
 	// modeled window boundary. It is disabled by default until a paired-cycle
 	// replay has sufficient action diversity and confidence.
@@ -183,7 +207,10 @@ type MarketMakerConfig struct {
 	FastEvidenceMinTrades     int                      `json:"fastEvidenceMinTrades" yaml:"fastEvidenceMinTrades"`
 	FastEvidenceMinBBOUpdates int                      `json:"fastEvidenceMinBBOUpdates" yaml:"fastEvidenceMinBBOUpdates"`
 	OFIVolumeAgreement        OFIVolumeAgreementConfig `json:"ofiVolumeAgreement" yaml:"ofiVolumeAgreement"`
-	AcquisitionQuote          AcquisitionQuoteConfig   `json:"acquisitionQuote" yaml:"acquisitionQuote"`
+	// NormalFlowPressure is a bounded fallback for ordinary signed public flow
+	// when the high-volume VolumeBalance shock path is inactive.
+	NormalFlowPressure NormalFlowPressureConfig `json:"normalFlowPressure" yaml:"normalFlowPressure"`
+	AcquisitionQuote   AcquisitionQuoteConfig   `json:"acquisitionQuote" yaml:"acquisitionQuote"`
 	// The following fields remain decode-compatible with older YAML files. The
 	// active price policy derives soft effects once through joint evidence/hazard
 	// pressure; final quantity uses the probability-centered Macro projection.
@@ -376,6 +403,15 @@ func (c *MarketMakerConfig) setDefaults() {
 	if c.JointDistanceQuantity.CandidateCount <= 0 {
 		c.JointDistanceQuantity.CandidateCount = 5
 	}
+	if c.JointDistanceQuantity.PathMaturityMaxRelativeHalfWidth <= 0 ||
+		math.IsNaN(c.JointDistanceQuantity.PathMaturityMaxRelativeHalfWidth) ||
+		math.IsInf(c.JointDistanceQuantity.PathMaturityMaxRelativeHalfWidth, 0) {
+		// A one-sided 95% interval may be at most one economic scale wide on
+		// either side before a path is considered identified.  This avoids the
+		// old fixed-six gate while still rejecting a noisy 2-3 effective-sample
+		// estimate whose sign/variance cannot support an action.
+		c.JointDistanceQuantity.PathMaturityMaxRelativeHalfWidth = 1
+	}
 	if c.PostFillUtility.CandidateCount <= 0 {
 		c.PostFillUtility.CandidateCount = 8
 	}
@@ -390,6 +426,7 @@ func (c *MarketMakerConfig) setDefaults() {
 	}
 	c.MacroInventory.setDefaults()
 	c.BOCPD45.setDefaults()
+	c.MultiscaleRegime = c.MultiscaleRegime.withDefaults()
 	c.AcquisitionQuote.setDefaults()
 	if c.InventoryCapitalMinRatio < 0 || c.InventoryCapitalMinRatio >= c.InventoryCapitalTargetRatio {
 		c.InventoryCapitalMinRatio = math.Max(0, 2*c.InventoryCapitalTargetRatio-c.InventoryCapitalMaxRatio)
@@ -792,9 +829,40 @@ type MarketMakerHorizonDecision struct {
 	PathUtilitySellNotionalJPY        float64
 	PathUtilityCertaintyEquivalentJPY float64
 	PathUtilityBpsPerHour             float64
+	HorizonUncertaintyPenaltyBpsHour  float64
+	HorizonReplacementCostBpsHour     float64
 	DistanceOptimized                 bool
 	UpdatedAt                         time.Time
 	Reason                            string
+}
+
+// applyLifecycleAwareHorizonUtility turns a horizon's fee-net score into the
+// single lifecycle objective used for selection:
+//
+//	U_H = S_H - z*SE(S_H) - C_replace/H.
+//
+// S_H remains the existing crossing/path utility. The uncertainty term is a
+// confidence penalty, while replacement cost is queue/opportunity loss only;
+// maker fees are already included in S_H and are never charged twice here.
+func applyLifecycleAwareHorizonUtility(decision MarketMakerHorizonDecision, config MarketMakerConfig) MarketMakerHorizonDecision {
+	if decision.Horizon <= 0 {
+		return decision
+	}
+	z := config.InventoryRiskZScore
+	if z <= 0 || math.IsNaN(z) || math.IsInf(z, 0) {
+		z = 1.645
+	}
+	uncertainty := z * math.Max(0, decision.ScoreStdErrorBpsHour)
+	replacement := math.Max(0, config.QuoteLifecycleAction.ReplacementCostBps)
+	if hours := decision.Horizon.Hours(); hours > 0 {
+		replacement /= hours
+	} else {
+		replacement = 0
+	}
+	decision.HorizonUncertaintyPenaltyBpsHour = uncertainty
+	decision.HorizonReplacementCostBpsHour = replacement
+	decision.SelectionScoreBpsPerHour -= uncertainty + replacement
+	return decision
 }
 
 // FastHorizonMarginalBuyInput is the causal account state needed to return
@@ -926,20 +994,26 @@ func (d MarketMakerHorizonDecision) SellTouchRatePerHour() float64 {
 // reference for the next trading window; callers must not cancel an existing
 // quote merely because this decision changed.
 type MarketMakerHorizonModel struct {
-	points                   []MarketMakerHorizonPoint
-	lastSecond               time.Time
-	lastTrimSecond           time.Time
-	lastUpdate               time.Time
-	decision                 MarketMakerHorizonDecision
-	sideHARVarianceRisk      map[time.Duration]*OnlineSideHARVarianceRisk
-	crossingExposureCaches   map[time.Duration]*marketMakerHorizonExposureCache
-	bboRangeIndex            *marketMakerBBORangeIndex
-	fastDrift                map[time.Duration]*fastDriftRegression
-	fastDriftBBOStateTags    map[time.Duration]fastDriftBBOStateTagCache
-	asymmetricRiskFeatures   map[time.Duration]asymmetricOscillationRiskFeatureCache
-	volumeProfiles           map[time.Duration]*RollingVolumeProfile
-	volumeProfileWindows     []time.Duration
-	volumeProfileConfig      VolumeProfileConfig
+	points                 []MarketMakerHorizonPoint
+	lastSecond             time.Time
+	lastTrimSecond         time.Time
+	lastUpdate             time.Time
+	decision               MarketMakerHorizonDecision
+	sideHARVarianceRisk    map[time.Duration]*OnlineSideHARVarianceRisk
+	crossingExposureCaches map[time.Duration]*marketMakerHorizonExposureCache
+	bboRangeIndex          *marketMakerBBORangeIndex
+	fastDrift              map[time.Duration]*fastDriftRegression
+	fastDriftBBOStateTags  map[time.Duration]fastDriftBBOStateTagCache
+	asymmetricRiskFeatures map[time.Duration]asymmetricOscillationRiskFeatureCache
+	conditionalStates      map[time.Duration]conditionalExecutionState
+	volumeProfiles         map[time.Duration]*RollingVolumeProfile
+	volumeProfileWindows   []time.Duration
+	volumeProfileConfig    VolumeProfileConfig
+	// pathDecay is causal model state keyed by the selected Fast horizon. It
+	// contains only matured path-persistence and Neff summaries; raw paths
+	// remain in crossingExposureCaches and are still valued by the exact BBO
+	// first-passage estimator.
+	pathDecay                map[time.Duration]*adaptivePathDecayState
 	downsideEProcess         *DrawdownEProcess
 	downsideDecision         DrawdownEProcessDecision
 	downsidePublished        DrawdownEProcessDecision
@@ -950,6 +1024,57 @@ type MarketMakerHorizonModel struct {
 	upsidePublished          DrawdownEProcessDecision
 	upsidePublishedAt        time.Time
 	upsidePublishedHorizon   time.Duration
+	// crossingDecisionCache is an ephemeral same-observation cache. A single
+	// quote pass asks for the same completed-path statistics from several
+	// downstream optimizers; reusing an exact query avoids rescanning the
+	// horizon exposure slice without changing the statistical clock. It is
+	// intentionally discarded whenever a new BBO observation arrives and is
+	// never checkpointed.
+	crossingDecisionCacheAt time.Time
+	crossingDecisionCache   map[crossingDecisionCacheKey]MarketMakerHorizonDecision
+}
+
+type crossingDecisionCacheKey struct {
+	horizon, lookback                time.Duration
+	buyDistance, sellDistance        uint64
+	grossEdge, makerFee              uint64
+	adverseSelection, minimumNetEdge uint64
+}
+
+func makeCrossingDecisionCacheKey(c MarketMakerConfig, horizon time.Duration, buyDistanceBps, sellDistanceBps, grossQuoteEdgeBps float64) crossingDecisionCacheKey {
+	return crossingDecisionCacheKey{
+		horizon: horizon, lookback: time.Duration(c.HorizonLookback),
+		buyDistance: math.Float64bits(buyDistanceBps), sellDistance: math.Float64bits(sellDistanceBps),
+		grossEdge: math.Float64bits(grossQuoteEdgeBps), makerFee: math.Float64bits(c.MakerFeeBps),
+		adverseSelection: math.Float64bits(c.AdverseSelectionBps), minimumNetEdge: math.Float64bits(c.MinimumNetEdgeBps),
+	}
+}
+
+func (m *MarketMakerHorizonModel) clearCrossingDecisionCache() {
+	if m == nil {
+		return
+	}
+	m.crossingDecisionCacheAt = time.Time{}
+	m.crossingDecisionCache = nil
+}
+
+func (m *MarketMakerHorizonModel) cachedCrossingDecision(now time.Time, key crossingDecisionCacheKey) (MarketMakerHorizonDecision, bool) {
+	if m == nil || m.crossingDecisionCacheAt.IsZero() || !m.crossingDecisionCacheAt.Equal(now) {
+		return MarketMakerHorizonDecision{}, false
+	}
+	d, ok := m.crossingDecisionCache[key]
+	return d, ok
+}
+
+func (m *MarketMakerHorizonModel) storeCrossingDecision(now time.Time, key crossingDecisionCacheKey, decision MarketMakerHorizonDecision) {
+	if m == nil {
+		return
+	}
+	if !m.crossingDecisionCacheAt.Equal(now) {
+		m.crossingDecisionCacheAt = now
+		m.crossingDecisionCache = make(map[crossingDecisionCacheKey]MarketMakerHorizonDecision)
+	}
+	m.crossingDecisionCache[key] = decision
 }
 
 type asymmetricOscillationRiskFeatureCache struct {
@@ -1096,9 +1221,21 @@ func (m *MarketMakerHorizonModel) ObserveBookWithSizesAndGap(
 	if at.IsZero() || bid <= 0 || ask <= 0 || ask < bid {
 		return
 	}
+	// Any accepted BBO can change completed-window availability or the most
+	// recent same-second replacement. Invalidate only the ephemeral query
+	// cache; distance-independent exposure caches remain incrementally valid.
+	m.clearCrossingDecisionCache()
+	m.conditionalStates = nil
 	if gapBefore {
 		m.fastDriftBBOStateTags = nil
 		m.asymmetricRiskFeatures = nil
+		if m.pathDecay != nil {
+			for _, state := range m.pathDecay {
+				if state != nil {
+					state.resetSegment()
+				}
+			}
+		}
 	}
 	// Normal live/replay configs are normalized before the stream starts.
 	// Retain zero-value compatibility for unit tests and legacy callers, but
@@ -1761,6 +1898,10 @@ func (m *MarketMakerHorizonModel) CrossingDecisionAtSideDistances(
 	buyDistanceBps, sellDistanceBps, grossQuoteEdgeBps float64,
 ) MarketMakerHorizonDecision {
 	c.setDefaults()
+	cacheKey := makeCrossingDecisionCacheKey(c, horizon, buyDistanceBps, sellDistanceBps, grossQuoteEdgeBps)
+	if cached, ok := m.cachedCrossingDecision(now, cacheKey); ok {
+		return cached
+	}
 	neutralDistance := grossQuoteEdgeBps / 2
 	d := MarketMakerHorizonDecision{
 		Horizon: horizon, HorizonSeconds: int64(horizon.Seconds()), QuoteDistanceBps: neutralDistance,
@@ -1768,6 +1909,7 @@ func (m *MarketMakerHorizonModel) CrossingDecisionAtSideDistances(
 		Reason: "insufficient completed horizon samples", EstimatorSource: "bbo-side", UpdatedAt: now,
 	}
 	if horizon <= 0 || buyDistanceBps <= 0 || sellDistanceBps <= 0 {
+		m.storeCrossingDecision(now, cacheKey, d)
 		return d
 	}
 	cutoff := now.Add(-time.Duration(c.HorizonLookback))
@@ -1833,6 +1975,7 @@ func (m *MarketMakerHorizonModel) CrossingDecisionAtSideDistances(
 		index = exposure.NextMinute
 	}
 	if first.IsZero() || !last.After(first) {
+		m.storeCrossingDecision(now, cacheKey, d)
 		return d
 	}
 	d.ObservedHours = last.Sub(first).Hours()
@@ -1861,6 +2004,7 @@ func (m *MarketMakerHorizonModel) CrossingDecisionAtSideDistances(
 		d.ScoreStdErrorBpsHour = math.Max(d.BuyTouchStdError, d.SellTouchStdError) / horizonHours * edge
 	}
 	d.Reason = "max fee-adjusted two-sided edge per hour"
+	m.storeCrossingDecision(now, cacheKey, d)
 	return d
 }
 
@@ -1897,8 +2041,10 @@ func (m *MarketMakerHorizonModel) UpdateForBook(
 	best := MarketMakerHorizonDecision{Reason: "insufficient completed horizon samples", UpdatedAt: now}
 	for _, horizon := range c.TradingHorizons() {
 		decision := m.DecisionForHorizon(now, c, volatilityBpsPerSqrtSec, bestBid, bestAsk, horizon)
+		decision.SelectionScoreBpsPerHour = decision.ScoreBpsPerHour
+		decision = applyLifecycleAwareHorizonUtility(decision, c)
 		if decision.HasSufficientCrossings(c.HorizonMinSamples) &&
-			(best.Horizon == 0 || decision.ScoreBpsPerHour > best.ScoreBpsPerHour) {
+			(best.Horizon == 0 || decision.SelectionScoreBpsPerHour > best.SelectionScoreBpsPerHour) {
 			best = decision
 		}
 	}
@@ -1907,6 +2053,8 @@ func (m *MarketMakerHorizonModel) UpdateForBook(
 		halfSpread := c.HalfSpreadForHorizon(horizon, volatilityBpsPerSqrtSec)
 		buyDistance, sellDistance, grossEdge := neutralMakerTouchDistances(bestBid, bestAsk, halfSpread)
 		best = m.CrossingDecisionAtSideDistances(now, c, horizon, buyDistance, sellDistance, grossEdge)
+		best.SelectionScoreBpsPerHour = best.ScoreBpsPerHour
+		best = applyLifecycleAwareHorizonUtility(best, c)
 	}
 	m.decision = best
 	m.publishExecutableDownside(updateBucket, best.Horizon)
@@ -1977,6 +2125,7 @@ func (m *MarketMakerHorizonModel) updateForBookAdaptiveVolatility(
 				decision = scoreFastHorizonWithMarginalBuy(decision, stats, *marginalBuy)
 			}
 		}
+		decision = applyLifecycleAwareHorizonUtility(decision, c)
 		if decision.HasSufficientCrossings(c.HorizonMinSamples) &&
 			(best.Horizon == 0 || decision.SelectionScoreBpsPerHour > best.SelectionScoreBpsPerHour) {
 			best = decision
@@ -2000,6 +2149,7 @@ func (m *MarketMakerHorizonModel) updateForBookAdaptiveVolatility(
 				best = scoreFastHorizonWithMarginalBuy(best, stats, *marginalBuy)
 			}
 		}
+		best = applyLifecycleAwareHorizonUtility(best, c)
 	}
 	m.decision = best
 	m.publishExecutableDownside(updateBucket, best.Horizon)

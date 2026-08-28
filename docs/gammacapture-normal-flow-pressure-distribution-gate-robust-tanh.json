@@ -1,0 +1,16 @@
+{
+  "name": "normal-flow-pressure-robust-tanh",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 144,
+  "minimum_effective_samples": 100,
+  "incremental_mean_bps": -1.3383075346464584,
+  "incremental_standard_error_bps": 3.1637874979483507,
+  "incremental_cost_bps": 0,
+  "risk_penalty_bps": 0,
+  "candidate_tests": 4,
+  "alpha": 0.05,
+  "positive_blocks": 0,
+  "total_blocks": 2,
+  "minimum_positive_blocks": 2
+}

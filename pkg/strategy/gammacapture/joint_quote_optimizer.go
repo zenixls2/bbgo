@@ -41,6 +41,19 @@ type JointDistanceQuantityInput struct {
 	// admission pass below.  Exchange capacity and the hard inventory band are
 	// still enforced through Projection.Min/Max*NotionalJPY.
 	CompletionSide types.SideType
+	// RelativeHoldRisk is the only optional integration point for the
+	// same-symbol Hold-relative state. The optimizer consumes its scalar
+	// utility once per candidate; it never turns it into a side gate.
+	RelativeHoldRisk RelativeHoldRiskInput
+}
+
+type RelativeHoldRiskInput struct {
+	Enabled               bool
+	ShadowOnly            bool
+	State                 RelativeHoldRiskState
+	TrackingErrorAversion float64
+	DownsideBetaAversion  float64
+	TotalBetaAversion     float64
 }
 
 type JointDistanceQuantityDecision struct {
@@ -59,76 +72,193 @@ type JointDistanceQuantityDecision struct {
 	// bilateral optimizer rejects the pair.  Without these fields the caller
 	// could only observe "authoritative rejection" and would incorrectly turn
 	// an individually positive side into a two-sided no-order decision.
-	FallbackBuyScore                float64
-	FallbackSellScore               float64
-	FallbackBuyPlan                 MarketMakerQuotePlan
-	FallbackSellPlan                MarketMakerQuotePlan
-	Reason                          string
-	Plan                            MarketMakerQuotePlan
-	Projection                      ProbabilityCenteredQuoteDecision
-	Crossing                        MarketMakerHorizonDecision
-	CandidateCount                  int
-	SelectedCandidate               int
-	SelectedQuantityCandidate       int
-	QuantityScale                   float64
-	ExpectedCycleJPY                float64
-	ExpectedPnLJPYHour              float64
-	LowerPnLJPYHour                 float64
-	PathStdErrorJPYHour             float64
-	KellyPenaltyJPYHour             float64
-	KellyUtilityJPYHour             float64
-	FeeValueMeanJPY                 float64
-	FeeValueDownsideRegretJPY       float64
-	FeeValueNetJPY                  float64
-	PathPositiveConfidence          float64
-	PathEffectiveSamples            float64
-	CapitalUtilization              float64
-	PairCapitalUtilization          float64
-	ExistingInventoryExpectedPnLJPY float64
-	BaselineVarianceJPY2            float64
-	WholePositionVarianceJPY2       float64
-	MarginalVarianceJPY2            float64
-	InventoryOrderCovarianceJPY2    float64
-	RiskReducing                    bool
-	DownsideBuyCapApplied           bool
-	DownsideInventoryReturnMeanBps  float64
-	DownsideInventoryReturnSEBps    float64
-	DownsideInventoryReturnUpperBps float64
-	DownsideEffectiveSamples        float64
-	DownsideOriginalMaxBuyJPY       float64
-	DownsideMinimumBuyEvaluated     bool
-	DownsideMinimumBuyCEJPY         float64
-	BuyAdmissionEvaluated           bool
-	BuyAdmissionApplied             bool
-	BuyAdmissionMaximumJPY          float64
-	BuyAdmissionUtilityBoundJPY     float64
-	BuyAdmissionReason              string
-	SellAdmissionEvaluated          bool
-	SellAdmissionApplied            bool
-	SellAdmissionMaximumJPY         float64
-	SellAdmissionUtilityBoundJPY    float64
-	SellAdmissionReason             string
-	AdmissionJointCEJPY             float64
-	AdmissionJointRobustCEJPY       float64
-	AdmissionJointComplementary     bool
-	InwardBuyEligible               bool
-	InwardSellEligible              bool
-	InwardBuySelected               bool
-	InwardSellSelected              bool
-	SelectedInwardBuyDeltaBps       float64
-	SelectedInwardSellDeltaBps      float64
-	ConditionalBuy                  ConditionalExecutionSideDecision
-	ConditionalSell                 ConditionalExecutionSideDecision
-	CompletionProtected             bool
-	PairedDistanceEvaluated         bool
-	PairedDistanceMeanBps           float64
-	PairedDistanceStdErrorBps       float64
-	PairedDistanceLowerBps          float64
-	HorizonCandidateCount           int
-	HorizonEffectiveSamples         float64
-	HorizonReliability              float64
-	HorizonRawUtilityJPYHour        float64
-	HorizonSelectionUtilityJPYHour  float64
+	FallbackBuyScore                    float64
+	FallbackSellScore                   float64
+	FallbackBuyPlan                     MarketMakerQuotePlan
+	FallbackSellPlan                    MarketMakerQuotePlan
+	Reason                              string
+	Plan                                MarketMakerQuotePlan
+	Projection                          ProbabilityCenteredQuoteDecision
+	Crossing                            MarketMakerHorizonDecision
+	CandidateCount                      int
+	SelectedCandidate                   int
+	SelectedQuantityCandidate           int
+	QuantityScale                       float64
+	ExpectedCycleJPY                    float64
+	ExpectedPnLJPYHour                  float64
+	LowerPnLJPYHour                     float64
+	PathStdErrorJPYHour                 float64
+	KellyPenaltyJPYHour                 float64
+	KellyUtilityJPYHour                 float64
+	FeeValueMeanJPY                     float64
+	FeeValueDownsideRegretJPY           float64
+	FeeValueNetJPY                      float64
+	PathPositiveConfidence              float64
+	PathEffectiveSamples                float64
+	PathEffectiveSamplesBaseline        float64
+	PathEffectiveSamplesBaselineStd     float64
+	PathDecayHalfLifeSeconds            float64
+	PathDecayAutocorrelation            float64
+	PathDecayPersistenceObservations    float64
+	PathMaturityReady                   bool
+	PathMaturityReason                  string
+	PathMaturityConfidenceHalfWidthBps  float64
+	PathMaturityReferenceScaleBps       float64
+	PathMaturityRelativeHalfWidth       float64
+	CapitalUtilization                  float64
+	PairCapitalUtilization              float64
+	ExistingInventoryExpectedPnLJPY     float64
+	BaselineVarianceJPY2                float64
+	WholePositionVarianceJPY2           float64
+	MarginalVarianceJPY2                float64
+	InventoryOrderCovarianceJPY2        float64
+	RiskReducing                        bool
+	DownsideBuyCapApplied               bool
+	DownsideInventoryReturnMeanBps      float64
+	DownsideInventoryReturnSEBps        float64
+	DownsideInventoryReturnUpperBps     float64
+	DownsideEffectiveSamples            float64
+	DownsideOriginalMaxBuyJPY           float64
+	DownsideMinimumBuyEvaluated         bool
+	DownsideMinimumBuyCEJPY             float64
+	BuyAdmissionEvaluated               bool
+	BuyAdmissionApplied                 bool
+	BuyAdmissionMaximumJPY              float64
+	BuyAdmissionUtilityBoundJPY         float64
+	BuyAdmissionReason                  string
+	SellAdmissionEvaluated              bool
+	SellAdmissionApplied                bool
+	SellAdmissionMaximumJPY             float64
+	SellAdmissionUtilityBoundJPY        float64
+	SellAdmissionReason                 string
+	AdmissionJointCEJPY                 float64
+	AdmissionJointRobustCEJPY           float64
+	AdmissionJointComplementary         bool
+	InwardBuyEligible                   bool
+	InwardSellEligible                  bool
+	InwardBuySelected                   bool
+	InwardSellSelected                  bool
+	SelectedInwardBuyDeltaBps           float64
+	SelectedInwardSellDeltaBps          float64
+	ConditionalBuy                      ConditionalExecutionSideDecision
+	ConditionalSell                     ConditionalExecutionSideDecision
+	CompletionProtected                 bool
+	PairedDistanceEvaluated             bool
+	PairedDistanceMeanBps               float64
+	PairedDistanceStdErrorBps           float64
+	PairedDistanceLowerBps              float64
+	HorizonCandidateCount               int
+	HorizonEffectiveSamples             float64
+	HorizonReliability                  float64
+	HorizonRawUtilityJPYHour            float64
+	HorizonSelectionUtilityJPYHour      float64
+	RelativeHoldUtilityJPYHour          float64
+	RelativeHoldTrackingPenaltyJPYHour  float64
+	RelativeHoldDownsidePenaltyJPYHour  float64
+	RelativeHoldTotalBetaPenaltyJPYHour float64
+	RelativeHoldCVaRShadowLossJPY       float64
+	RelativeHoldStateReady              bool
+	RelativeHoldDownsideReady           bool
+}
+
+// targetCEAuthoritativeRejection reports whether the terminal target-relative
+// CE has enough completed path evidence to veto the ordinary Fast plan. A
+// missing or immature CE is a data-collection state, not a no-order decision:
+// suppressing the base quote there prevents the private fills needed to
+// calibrate the execution model and creates a bootstrap deadlock.
+func targetCEAuthoritativeRejection(d JointDistanceQuantityDecision) bool {
+	return d.AuthoritativeRejection && d.PathMaturityReady
+}
+
+// targetRestoringPlanAfterJointRejection converts a mature rejection of the
+// complete BUY/SELL allocation into a side-aware maker plan.  A complete-path
+// rejection is not, by itself, a rejection of both individual sides: when the
+// account is above target, the existing SELL is an inventory-risk action; when
+// it is below target, the BUY is the corresponding action. The side-level
+// fallback support flags decide whether that corrective side survives. The
+// other side is deliberately disabled because it would increase the current
+// target error.
+//
+// This helper is used only for an authoritative *rejection* where the joint
+// optimizer did not return an applied plan.  An applied joint plan remains the
+// source of truth and may explicitly clear SELL (or BUY) through its AllowAsk
+// / AllowBid flags.
+func targetRestoringPlanAfterJointRejection(
+	base MarketMakerQuotePlan, currentInventoryBase, targetInventoryBase float64,
+	allowBuy, allowSell bool,
+) MarketMakerQuotePlan {
+	plan := base
+	tolerance := math.Max(1e-12, math.Abs(targetInventoryBase)*1e-12)
+	switch {
+	case currentInventoryBase > targetInventoryBase+tolerance:
+		plan.AllowBid = false
+		plan.BidQuoteNotional = 0
+		if !allowSell {
+			plan.AllowAsk = false
+			plan.AskQuoteNotional = 0
+		}
+	case currentInventoryBase < targetInventoryBase-tolerance:
+		plan.AllowAsk = false
+		plan.AskQuoteNotional = 0
+		if !allowBuy {
+			plan.AllowBid = false
+			plan.BidQuoteNotional = 0
+		}
+	default:
+		plan.AllowBid = false
+		plan.AllowAsk = false
+		plan.BidQuoteNotional = 0
+		plan.AskQuoteNotional = 0
+	}
+	return plan
+}
+
+func jointRelativeHoldUtility(in JointDistanceQuantityInput, buyNotionalJPY, sellNotionalJPY float64) RelativeHoldUtility {
+	risk := in.RelativeHoldRisk
+	if !risk.Enabled || risk.ShadowOnly || !risk.State.Ready || in.PairEquityJPY <= 0 {
+		return RelativeHoldUtility{Reason: "relative-hold utility disabled or immature"}
+	}
+	buyProbability := math.Max(0, math.Min(1, in.Projection.BuyFillProbability))
+	sellProbability := math.Max(0, math.Min(1, in.Projection.SellFillProbability))
+	currentBeta := in.Projection.CurrentInventoryNotionalJPY / in.PairEquityJPY
+	projectedBeta := (in.Projection.CurrentInventoryNotionalJPY +
+		buyProbability*math.Max(0, buyNotionalJPY) -
+		sellProbability*math.Max(0, sellNotionalJPY)) / in.PairEquityJPY
+	return risk.State.EvaluateAction(RelativeHoldAction{
+		RiskWeight:             math.Max(0, buyNotionalJPY+sellNotionalJPY) / in.PairEquityJPY,
+		PairEquityJPY:          in.PairEquityJPY,
+		TrackingErrorAversion:  risk.TrackingErrorAversion,
+		DownsideBetaAversion:   risk.DownsideBetaAversion,
+		TotalBetaAversion:      risk.TotalBetaAversion,
+		CurrentInventoryBeta:   currentBeta,
+		ProjectedInventoryBeta: projectedBeta,
+		InventoryBetaSupplied:  true,
+	})
+}
+
+func recordJointRelativeHoldDiagnostics(d *JointDistanceQuantityDecision, utility RelativeHoldUtility, in JointDistanceQuantityInput) {
+	if d == nil {
+		return
+	}
+	d.RelativeHoldUtilityJPYHour = utility.NetJPYPerHour
+	d.RelativeHoldTrackingPenaltyJPYHour = utility.TrackingErrorPenaltyJPYPerHour
+	d.RelativeHoldDownsidePenaltyJPYHour = utility.DownsideBetaPenaltyJPYPerHour
+	d.RelativeHoldTotalBetaPenaltyJPYHour = utility.TotalBetaPenaltyJPYPerHour
+	d.RelativeHoldCVaRShadowLossJPY = utility.CVaRShadowLossJPY
+	d.RelativeHoldStateReady = in.RelativeHoldRisk.State.Ready
+	d.RelativeHoldDownsideReady = in.RelativeHoldRisk.State.DownsideReady
+}
+
+func setJointPathDecayDiagnostics(d *JointDistanceQuantityDecision, stats JointPathPayoffStats) {
+	if d == nil {
+		return
+	}
+	d.PathEffectiveSamples = stats.EffectiveSamples
+	d.PathEffectiveSamplesBaseline = stats.EffectiveSamplesBaseline
+	d.PathEffectiveSamplesBaselineStd = stats.EffectiveSamplesBaselineStd
+	d.PathDecayHalfLifeSeconds = stats.PathDecayHalfLifeSeconds
+	d.PathDecayAutocorrelation = stats.PathDecayAutocorrelation
+	d.PathDecayPersistenceObservations = stats.PathDecayPersistenceObservations
 }
 
 func inwardDistanceImprovementSupported(
@@ -325,6 +455,24 @@ func fastFeeNetRegretValue(d JointPathPayoffDecision) (mean, downsideRegret, net
 	return mean, downsideRegret, mean - downsideRegret
 }
 
+// targetRelativeCEAdmissionValue is the authoritative mature terminal-path
+// value for an action that is compared with submitting no new order.  The
+// corrected target-relative CE uses the paired whole-position versus baseline
+// confidence width.  Reusing fastFeeNetRegretValue here would substitute the
+// incremental order-payoff SE and would discard the covariance benefit of a
+// target-restoring action (or double-count risk already carried by inventory).
+// The legacy lower-partial-moment value remains available for diagnostics and
+// for explicitly incomplete/legacy callers; it must not own this gate.
+func targetRelativeCEAdmissionValue(raw, confidence JointPathPayoffDecision) (mean, downside, net float64) {
+	mean = raw.ExpectedPnLJPY - raw.KellyPenaltyJPY
+	net = confidence.CertaintyEquivalent
+	if math.IsNaN(mean) || math.IsInf(mean, 0) || math.IsNaN(net) || math.IsInf(net, 0) {
+		return 0, 0, math.Inf(-1)
+	}
+	downside = math.Max(0, mean-net)
+	return mean, downside, net
+}
+
 // sideSafeFallbackAdmission keeps a bilateral rejection from deleting a
 // one-sided hedge.  Ordinary one-sided candidates still need positive
 // fee-net lower-partial-moment value.  A target-restoring candidate may use
@@ -332,13 +480,31 @@ func fastFeeNetRegretValue(d JointPathPayoffDecision) (mean, downsideRegret, net
 // offset by the measured reduction in whole-position variance, but only when
 // the confidence-adjusted terminal wealth remains positive.  This is a
 // risk-budget identity, not a fixed BPS exception.
-func sideSafeFallbackAdmission(feeNet float64, robust JointPathPayoffDecision, continuation float64) (score float64, admitted bool, riskReducing bool) {
+func sideSafeFallbackAdmission(feeNet float64, robust JointPathPayoffDecision) (score float64, admitted bool, riskReducing bool) {
 	if feeNet > 0 && !math.IsNaN(feeNet) && !math.IsInf(feeNet, 0) {
 		return feeNet, true, false
 	}
-	robustScore := robust.CertaintyEquivalent + continuation
+	// EvaluateTargetRelativePosition already measures the action against no
+	// order around the same inventory target.  Adding a separate target-progress
+	// continuation here would count the same inventory deviation twice.
+	robustScore := robust.CertaintyEquivalent
 	if robust.RiskReducing && robustScore > 0 && !math.IsNaN(robustScore) && !math.IsInf(robustScore, 0) {
 		return robustScore, true, true
+	}
+	return feeNet, false, false
+}
+
+func sideSafeFallbackAdmissionForReplay(
+	feeNet float64, robust JointPathPayoffDecision,
+	legacyContinuation float64, legacyReplay bool,
+) (score float64, admitted bool, riskReducing bool) {
+	if score, admitted, riskReducing = sideSafeFallbackAdmission(feeNet, robust); admitted || !legacyReplay {
+		return score, admitted, riskReducing
+	}
+	legacyScore := robust.CertaintyEquivalent + legacyContinuation
+	if robust.RiskReducing && legacyScore > 0 &&
+		!math.IsNaN(legacyScore) && !math.IsInf(legacyScore, 0) {
+		return legacyScore, true, true
 	}
 	return feeNet, false, false
 }
@@ -384,25 +550,30 @@ func fastCandidateValue(
 
 // targetRestoringOrderNetValue values a one-sided inventory correction without
 // importing the reservation profit of a hypothetical future oscillation. A
-// mature terminal-path posterior pays the actual one-fill fee/markout carried
-// by stats and receives the same target-progress continuation as the joint
-// optimizer. When that posterior is unavailable, the Bellman prior pays the
-// configured one-way execution cost exactly once. MinimumNetEdgeBps is absent
-// by construction: it belongs only to matched BUY/SELL cycle notional.
+// mature terminal-path posterior already contains target-relative inventory
+// risk and is therefore the complete action value. When that posterior is
+// unavailable, the Bellman prior pays the configured one-way execution cost
+// exactly once. MinimumNetEdgeBps is absent by construction: it belongs only
+// to matched BUY/SELL cycle notional.
 func targetRestoringOrderNetValue(
 	stats JointPathPayoffStats,
 	currentInventoryNotionalJPY, targetInventoryNotionalJPY, pairEquityJPY,
 	buyNotionalJPY, sellNotionalJPY,
 	buyProbability, sellProbability, bothProbability,
-	riskAversion, entryCostBps float64,
+	riskAversion, entryCostBps, confidenceZScore float64,
+	legacyStackedTargetContinuation bool,
 ) float64 {
 	if stats.EffectiveSamples > 1 {
+		if confidenceZScore <= 0 || math.IsNaN(confidenceZScore) || math.IsInf(confidenceZScore, 0) {
+			confidenceZScore = 1.645
+		}
 		payoff := stats.EvaluateTargetRelativePosition(
 			currentInventoryNotionalJPY, targetInventoryNotionalJPY,
 			buyNotionalJPY, sellNotionalJPY,
-			pairEquityJPY, riskAversion, 0)
-		_, _, net := fastFeeNetRegretValue(payoff)
-		return net + TargetProgressContinuationValue(
+			pairEquityJPY, riskAversion, confidenceZScore)
+		net := payoff.CertaintyEquivalent
+		return net + matureTargetProgressContinuationValue(
+			legacyStackedTargetContinuation,
 			currentInventoryNotionalJPY, targetInventoryNotionalJPY,
 			pairEquityJPY, buyNotionalJPY, sellNotionalJPY,
 			buyProbability, sellProbability, bothProbability)
@@ -447,6 +618,24 @@ func TargetProgressContinuationValue(
 	expectedDeltaSquaredJPY2 = math.Max(0, expectedDeltaSquaredJPY2)
 	return -errorJPY*expectedDeltaJPY/pairEquityJPY -
 		expectedDeltaSquaredJPY2/(2*gapJPY)
+}
+
+// matureTargetProgressContinuationValue exists only to reproduce the retired
+// stacked policy in paired research replay. Production configuration cannot
+// enable it; mature live candidates always receive zero here.
+func matureTargetProgressContinuationValue(
+	legacyReplay bool,
+	currentInventoryNotionalJPY, targetInventoryNotionalJPY, pairEquityJPY,
+	buyNotionalJPY, sellNotionalJPY,
+	buyProbability, sellProbability, bothProbability float64,
+) float64 {
+	if !legacyReplay {
+		return 0
+	}
+	return TargetProgressContinuationValue(
+		currentInventoryNotionalJPY, targetInventoryNotionalJPY, pairEquityJPY,
+		buyNotionalJPY, sellNotionalJPY,
+		buyProbability, sellProbability, bothProbability)
 }
 
 // RiskReducingContinuationNetValue prices a one-sided boundary action when a
@@ -935,7 +1124,7 @@ func applyFastPathAdmissions(
 	d.MarginalVarianceJPY2 = payoff.MarginalVarianceJPY2
 	d.InventoryOrderCovarianceJPY2 = payoff.InventoryOrderCovarianceJPY2
 	d.RiskReducing = payoff.RiskReducing
-	d.PathEffectiveSamples = stats.EffectiveSamples
+	setJointPathDecayDiagnostics(&d, stats)
 	if in.PairEquityJPY > 0 {
 		d.PairCapitalUtilization = d.Projection.ProjectedGrossNotionalJPY / in.PairEquityJPY
 	}
@@ -1040,20 +1229,25 @@ func jointHorizonRawUtility(
 		d.Projection.BuyNotionalJPY, d.Projection.SellNotionalJPY,
 		crossing.BuyTouchProbability, crossing.SellTouchProbability,
 		crossing.BothTouchProbability)
-	feeValueNet += TargetProgressContinuationValue(
+	feeValueNet += matureTargetProgressContinuationValue(
+		config.JointDistanceQuantity.LegacyStackedTargetContinuation,
 		in.Projection.CurrentInventoryNotionalJPY,
 		in.Projection.TargetInventoryNotionalJPY,
 		in.PairEquityJPY,
 		d.Projection.BuyNotionalJPY, d.Projection.SellNotionalJPY,
 		crossing.BuyTouchProbability, crossing.SellTouchProbability,
 		crossing.BothTouchProbability)
+	relativeHoldUtility := jointRelativeHoldUtility(in,
+		d.Projection.BuyNotionalJPY, d.Projection.SellNotionalJPY)
+	feeValueNet += relativeHoldUtility.NetJPYPerHour * in.Horizon.Hours()
 	floor := fastValueIdentificationFloor(
 		config, in.Horizon,
 		in.Projection.MinBuyNotionalJPY, in.Projection.MinSellNotionalJPY)
 	d.Crossing = crossing
-	d.PathEffectiveSamples = stats.EffectiveSamples
+	setJointPathDecayDiagnostics(d, stats)
 	d.FeeValueNetJPY = feeValueNet
-	d.HorizonRawUtilityJPYHour = (feeValueNet - floor) / in.Horizon.Hours()
+	d.HorizonRawUtilityJPYHour = (feeValueNet-floor)/in.Horizon.Hours() + relativeHoldUtility.NetJPYPerHour
+	recordJointRelativeHoldDiagnostics(d, relativeHoldUtility, in)
 	return d.HorizonRawUtilityJPYHour
 }
 
@@ -1136,7 +1330,33 @@ func OptimizeUnifiedFastQuantity(
 	return best
 }
 
+// optimizeUnifiedFastQuantityAtHorizon applies the same relative-Hold scalar
+// to a fallback decision that is returned after the terminal-path optimizer
+// rejects its bilateral candidate. The ordinary candidate path already adds
+// the scalar while ranking quantities, so this wrapper only fills the
+// diagnostic/objective field when a continuity or side-safe fallback was
+// selected; it never introduces a second side gate.
 func optimizeUnifiedFastQuantityAtHorizon(
+	model *MarketMakerHorizonModel,
+	config MarketMakerConfig,
+	fullInput JointDistanceQuantityInput,
+	baselineProjection ProbabilityCenteredQuoteInput,
+) JointDistanceQuantityDecision {
+	d := optimizeUnifiedFastQuantityAtHorizonRaw(
+		model, config, fullInput, baselineProjection)
+	if !d.RelativeHoldStateReady && d.Projection.ProjectedGrossNotionalJPY > 0 {
+		u := jointRelativeHoldUtility(fullInput,
+			d.Projection.BuyNotionalJPY, d.Projection.SellNotionalJPY)
+		if u.Ready {
+			recordJointRelativeHoldDiagnostics(&d, u, fullInput)
+			d.FeeValueNetJPY += u.NetJPYPerHour * fullInput.Horizon.Hours()
+			d.KellyUtilityJPYHour += u.NetJPYPerHour
+		}
+	}
+	return d
+}
+
+func optimizeUnifiedFastQuantityAtHorizonRaw(
 	model *MarketMakerHorizonModel,
 	config MarketMakerConfig,
 	fullInput JointDistanceQuantityInput,
@@ -1263,6 +1483,19 @@ func retainJointEvaluationDiagnostics(
 	}
 	if evaluated.PathEffectiveSamples > selected.PathEffectiveSamples {
 		selected.PathEffectiveSamples = evaluated.PathEffectiveSamples
+	}
+	// The relative-Hold contribution is part of the same joint scalar even
+	// when the executable baseline is retained for a separate Fast-side
+	// continuity rule. Preserve its evidence/utility diagnostics so the caller
+	// can distinguish "scalar evaluated but baseline retained" from "scalar
+	// never reached the optimizer". This does not copy prices or quantities.
+	if evaluated.RelativeHoldStateReady {
+		selected.RelativeHoldStateReady = true
+		selected.RelativeHoldDownsideReady = evaluated.RelativeHoldDownsideReady
+		selected.RelativeHoldUtilityJPYHour = evaluated.RelativeHoldUtilityJPYHour
+		selected.RelativeHoldTrackingPenaltyJPYHour = evaluated.RelativeHoldTrackingPenaltyJPYHour
+		selected.RelativeHoldDownsidePenaltyJPYHour = evaluated.RelativeHoldDownsidePenaltyJPYHour
+		selected.RelativeHoldCVaRShadowLossJPY = evaluated.RelativeHoldCVaRShadowLossJPY
 	}
 	return selected
 }
@@ -1466,7 +1699,7 @@ func twoSidedContinuationFallbackAfterPathGap(
 	d.Plan.AllowAsk = true
 	d.Projection = projection
 	d.Crossing = crossing
-	d.PathEffectiveSamples = basePath.EffectiveSamples
+	setJointPathDecayDiagnostics(&d, basePath)
 	d.ExpectedCycleJPY = crossing.BothTouchProbability *
 		projection.ProjectedGrossNotionalJPY * crossing.NetRoundTripEdgeBps / 10_000
 	d.KellyUtilityJPYHour = d.ExpectedCycleJPY / in.Horizon.Hours()
@@ -1752,7 +1985,7 @@ func targetContinuationFallbackAfterPathGap(
 	d.RiskReducing = true
 	d.KellyUtilityJPYHour = net / in.Horizon.Hours()
 	d.LowerPnLJPYHour = d.KellyUtilityJPYHour
-	d.PathEffectiveSamples = basePath.EffectiveSamples
+	setJointPathDecayDiagnostics(&d, basePath)
 	d.ExpectedCycleJPY = projection.ProjectedGrossNotionalJPY *
 		math.Max(crossing.BuyTouchProbability, crossing.SellTouchProbability)
 	if in.PairEquityJPY > 0 {
@@ -1892,12 +2125,6 @@ func sideSafeFallbackAfterJointRejection(
 		riskAversion = fastRiskAversionOrDefault(config, riskAversion)
 	}
 	mean, regret, net := 0.0, 0.0, 0.0
-	continuation := TargetProgressContinuationValue(
-		in.Projection.CurrentInventoryNotionalJPY,
-		in.Projection.TargetInventoryNotionalJPY,
-		in.PairEquityJPY, projection.BuyNotionalJPY, projection.SellNotionalJPY,
-		crossing.BuyTouchProbability, crossing.SellTouchProbability,
-		crossing.BothTouchProbability)
 	admittedUtility := 0.0
 	riskReducingAdmission := false
 	continuationOnly := stats.EffectiveSamples <= 1
@@ -1929,7 +2156,14 @@ func sideSafeFallbackAfterJointRejection(
 			projection.BuyNotionalJPY, projection.SellNotionalJPY,
 			in.PairEquityJPY, riskAversion, 0)
 		mean, regret, net = fastFeeNetRegretValue(payoff)
-		net += continuation
+		legacyContinuation := matureTargetProgressContinuationValue(
+			config.JointDistanceQuantity.LegacyStackedTargetContinuation,
+			in.Projection.CurrentInventoryNotionalJPY,
+			in.Projection.TargetInventoryNotionalJPY,
+			in.PairEquityJPY, projection.BuyNotionalJPY, projection.SellNotionalJPY,
+			crossing.BuyTouchProbability, crossing.SellTouchProbability,
+			crossing.BothTouchProbability)
+		net += legacyContinuation
 		admittedUtility = net
 		if net <= 0 || math.IsNaN(net) || math.IsInf(net, 0) {
 			// A one-sided target-restoring hedge is admitted only by its
@@ -1945,7 +2179,9 @@ func sideSafeFallbackAfterJointRejection(
 				in.Projection.TargetInventoryNotionalJPY,
 				projection.BuyNotionalJPY, projection.SellNotionalJPY,
 				in.PairEquityJPY, riskAversion, confidenceZ)
-			admittedScore, admitted, riskReducing := sideSafeFallbackAdmission(net, robust, continuation)
+			admittedScore, admitted, riskReducing := sideSafeFallbackAdmissionForReplay(
+				net, robust, legacyContinuation,
+				config.JointDistanceQuantity.LegacyStackedTargetContinuation)
 			if !admitted {
 				return d
 			}
@@ -2007,7 +2243,7 @@ func sideSafeFallbackAfterJointRejection(
 		d.InventoryOrderCovarianceJPY2 = payoff.InventoryOrderCovarianceJPY2
 		d.RiskReducing = payoff.RiskReducing
 	}
-	d.PathEffectiveSamples = stats.EffectiveSamples
+	setJointPathDecayDiagnostics(&d, stats)
 	if in.PairEquityJPY > 0 {
 		d.PairCapitalUtilization = projection.ProjectedGrossNotionalJPY / in.PairEquityJPY
 	}
@@ -2249,7 +2485,9 @@ func targetRestoringFastContinuation(
 				crossing.BuyTouchProbability,
 				crossing.SellTouchProbability,
 				0, riskAversion,
-				config.MakerFeeBps+config.AdverseSelectionBps)
+				config.MakerFeeBps+config.AdverseSelectionBps,
+				z,
+				config.JointDistanceQuantity.LegacyStackedTargetContinuation)
 			if value > bestCE {
 				bestCE = value
 				d.Plan = candidate
@@ -2329,7 +2567,9 @@ func targetRestoringFastContinuation(
 		stats, current, target, in.PairEquityJPY,
 		projection.BuyNotionalJPY, projection.SellNotionalJPY,
 		crossing.BuyTouchProbability, crossing.SellTouchProbability,
-		0, riskAversion, config.MakerFeeBps+config.AdverseSelectionBps)
+		0, riskAversion, config.MakerFeeBps+config.AdverseSelectionBps,
+		in.ConfidenceZScore,
+		config.JointDistanceQuantity.LegacyStackedTargetContinuation)
 	if continuationNet <= 0 || math.IsNaN(continuationNet) || math.IsInf(continuationNet, 0) {
 		d.Reason = "target-restoring order has non-positive posterior continuation value"
 		return d
@@ -2438,6 +2678,7 @@ func OptimizeJointDistanceQuantity(
 		in.Projection.MinBuyNotionalJPY,
 		in.Projection.MinSellNotionalJPY)
 	crossingReady, positiveEdge, pathReady, projectionReady := 0, 0, 0, 0
+	pathObserved, pathImmature := 0, false
 	positivePathUtility, confidenceScaleReady := 0, 0
 	baseBuyDistance, baseSellDistance, _ := MakerTouchDistances(
 		in.BestBid, in.BestAsk, in.BasePlan.BidPrice, in.BasePlan.AskPrice)
@@ -2497,20 +2738,33 @@ func OptimizeJointDistanceQuantity(
 			pathStats = model.conditionalJointPathPayoffStatistics(
 				in.Now, config, in.Horizon, buyDistance, sellDistance, conditionalState)
 		}
-		// One independent path cannot identify dispersion. Beyond that minimum,
-		// sample scarcity belongs in the standard error and confidence bound,
-		// rather than a duplicate hard gate tied to crossing sample health.
-		if pathStats.EffectiveSamples <= 1 {
+		pathObserved++
+		setJointPathDecayDiagnostics(&d, pathStats)
+		maturity := AssessJointPathMaturity(pathStats, config, z)
+		// Keep the diagnostics from the best available candidate even when no
+		// candidate is mature. This is what lets the caller distinguish a data
+		// gap from a measured negative terminal-wealth posterior.
+		if d.PathMaturityReason == "" || maturity.EffectiveSamples > d.PathEffectiveSamples ||
+			(maturity.Matured && !d.PathMaturityReady) {
+			d.PathMaturityReason = maturity.Reason
+			d.PathMaturityConfidenceHalfWidthBps = maturity.ConfidenceHalfWidthBps
+			d.PathMaturityReferenceScaleBps = maturity.ReferenceScaleBps
+			d.PathMaturityRelativeHalfWidth = maturity.RelativeHalfWidth
+		}
+		if d.PathEffectiveSamples < maturity.EffectiveSamples {
+			d.PathEffectiveSamples = maturity.EffectiveSamples
+		}
+		if !maturity.Matured {
+			pathImmature = true
 			continue
 		}
 		pathReady++
+		d.PathMaturityReady = true
 		// Preserve estimator diagnostics even when every terminal-wealth
 		// candidate is later rejected. PathEffectiveSamples describes the
 		// evidence evaluated, not only evidence attached to a winning allocation;
 		// otherwise measured negative posterior utility is logged like a genuine
 		// path-data gap.
-		d.PathEffectiveSamples = math.Max(
-			d.PathEffectiveSamples, pathStats.EffectiveSamples)
 		// A rejected two-sided allocation must not silently fall back to the
 		// original, more inward Fast quote. Track the best conservative
 		// executable point independently for each side. The one-sided terminal
@@ -2523,8 +2777,8 @@ func OptimizeJointDistanceQuantity(
 				in.Projection.CurrentInventoryNotionalJPY,
 				in.Projection.TargetInventoryNotionalJPY,
 				buyUnit, 0, in.PairEquityJPY, riskAversion, 0)
-			_, _, buyNetValue := fastFeeNetRegretValue(buyUtility)
-			buyNetValue += TargetProgressContinuationValue(
+			buyContinuation := matureTargetProgressContinuationValue(
+				config.JointDistanceQuantity.LegacyStackedTargetContinuation,
 				in.Projection.CurrentInventoryNotionalJPY,
 				in.Projection.TargetInventoryNotionalJPY,
 				in.PairEquityJPY, buyUnit, 0,
@@ -2533,15 +2787,13 @@ func OptimizeJointDistanceQuantity(
 				in.Projection.CurrentInventoryNotionalJPY,
 				in.Projection.TargetInventoryNotionalJPY,
 				buyUnit, 0, in.PairEquityJPY, riskAversion, z)
-			buyContinuation := TargetProgressContinuationValue(
-				in.Projection.CurrentInventoryNotionalJPY,
-				in.Projection.TargetInventoryNotionalJPY,
-				in.PairEquityJPY, buyUnit, 0,
-				crossing.BuyTouchProbability, 0, 0)
+			_, _, buyNetValue := targetRelativeCEAdmissionValue(buyUtility, buyRobust)
+			buyNetValue += buyContinuation
 			buyFloorJPY := fastValueIdentificationFloor(
 				config, in.Horizon, in.Projection.MinBuyNotionalJPY, 0)
-			buyScore, buyAdmitted, _ := sideSafeFallbackAdmission(
-				buyNetValue-buyFloorJPY, buyRobust, buyContinuation)
+			buyScore, buyAdmitted, _ := sideSafeFallbackAdmissionForReplay(
+				buyNetValue-buyFloorJPY, buyRobust, buyContinuation,
+				config.JointDistanceQuantity.LegacyStackedTargetContinuation)
 			// A non-target BUY is still an oscillation leg and must pay the
 			// completed-cycle reservation edge.  A BUY that reduces |I-I*| is
 			// admitted by its one-sided posterior/continuation value instead.
@@ -2561,8 +2813,8 @@ func OptimizeJointDistanceQuantity(
 				in.Projection.CurrentInventoryNotionalJPY,
 				in.Projection.TargetInventoryNotionalJPY,
 				0, sellUnit, in.PairEquityJPY, riskAversion, 0)
-			_, _, sellNetValue := fastFeeNetRegretValue(sellUtility)
-			sellNetValue += TargetProgressContinuationValue(
+			sellContinuation := matureTargetProgressContinuationValue(
+				config.JointDistanceQuantity.LegacyStackedTargetContinuation,
 				in.Projection.CurrentInventoryNotionalJPY,
 				in.Projection.TargetInventoryNotionalJPY,
 				in.PairEquityJPY, 0, sellUnit,
@@ -2571,15 +2823,13 @@ func OptimizeJointDistanceQuantity(
 				in.Projection.CurrentInventoryNotionalJPY,
 				in.Projection.TargetInventoryNotionalJPY,
 				0, sellUnit, in.PairEquityJPY, riskAversion, z)
-			sellContinuation := TargetProgressContinuationValue(
-				in.Projection.CurrentInventoryNotionalJPY,
-				in.Projection.TargetInventoryNotionalJPY,
-				in.PairEquityJPY, 0, sellUnit,
-				0, crossing.SellTouchProbability, 0)
+			_, _, sellNetValue := targetRelativeCEAdmissionValue(sellUtility, sellRobust)
+			sellNetValue += sellContinuation
 			sellFloorJPY := fastValueIdentificationFloor(
 				config, in.Horizon, 0, in.Projection.MinSellNotionalJPY)
-			sellScore, sellAdmitted, _ := sideSafeFallbackAdmission(
-				sellNetValue-sellFloorJPY, sellRobust, sellContinuation)
+			sellScore, sellAdmitted, _ := sideSafeFallbackAdmissionForReplay(
+				sellNetValue-sellFloorJPY, sellRobust, sellContinuation,
+				config.JointDistanceQuantity.LegacyStackedTargetContinuation)
 			if !cycleEdgePositive &&
 				in.Projection.CurrentInventoryNotionalJPY <= in.Projection.TargetInventoryNotionalJPY {
 				sellAdmitted = false
@@ -2611,12 +2861,18 @@ func OptimizeJointDistanceQuantity(
 				continue
 			}
 			projectionReady++
-			rawPayoff := pathStats.EvaluateTargetRelativePosition(
+			rawConfidence := pathStats.EvaluateTargetRelativePosition(
 				in.Projection.CurrentInventoryNotionalJPY,
 				in.Projection.TargetInventoryNotionalJPY,
 				rawProjection.BuyNotionalJPY, rawProjection.SellNotionalJPY,
-				in.PairEquityJPY, riskAversion, 0)
-			positiveConfidence := jointPathUtilityConfidence(rawPayoff)
+				in.PairEquityJPY, riskAversion, z)
+			// The corrected paired CE already contains the confidence adjustment.
+			// Do not apply the old incremental-SE confidence factor a second time;
+			// it was the source of the false terminal rejection for target repair.
+			positiveConfidence := 0.0
+			if rawConfidence.CertaintyEquivalent > 0 {
+				positiveConfidence = 1
+			}
 			if positiveConfidence > 0 {
 				positivePathUtility++
 			}
@@ -2649,25 +2905,26 @@ func OptimizeJointDistanceQuantity(
 				projection.BuyNotionalJPY, projection.SellNotionalJPY,
 				in.PairEquityJPY, riskAversion, z)
 			feeValueMean, feeValueDownsideRegret, feeValueNet :=
-				fastCandidateValue(
-					pathPayoff,
-					projection.BuyNotionalJPY,
-					projection.SellNotionalJPY,
-					crossing.BuyTouchProbability,
-					crossing.SellTouchProbability,
-					crossing.BothTouchProbability)
-			feeValueNet += TargetProgressContinuationValue(
+				targetRelativeCEAdmissionValue(pathPayoff, pathConfidence)
+			feeValueNet += matureTargetProgressContinuationValue(
+				config.JointDistanceQuantity.LegacyStackedTargetContinuation,
 				in.Projection.CurrentInventoryNotionalJPY,
 				in.Projection.TargetInventoryNotionalJPY,
 				in.PairEquityJPY,
 				projection.BuyNotionalJPY, projection.SellNotionalJPY,
 				crossing.BuyTouchProbability, crossing.SellTouchProbability,
 				crossing.BothTouchProbability)
+			relativeHoldUtility := jointRelativeHoldUtility(in,
+				projection.BuyNotionalJPY, projection.SellNotionalJPY)
+			feeValueNet += relativeHoldUtility.NetJPYPerHour * hours
 			// Every executable candidate, including the venue-minimum cell, must
 			// pay its fee-net posterior downside regret relative to no new order.
 			if feeValueNet <= jointIdentificationFloorJPY {
 				continue
 			}
+			// Relative-Hold is already expressed as the same JPY/hour scalar as
+			// the Fast terminal-wealth objective. It is added once above, after
+			// fee/path feasibility, and never controls a side independently.
 			score := (feeValueNet - jointIdentificationFloorJPY) / hours
 			gross := projection.ProjectedGrossNotionalJPY
 			if score > bestScore+1e-12 ||
@@ -2707,6 +2964,7 @@ func OptimizeJointDistanceQuantity(
 				d.FeeValueMeanJPY = feeValueMean
 				d.FeeValueDownsideRegretJPY = feeValueDownsideRegret
 				d.FeeValueNetJPY = feeValueNet
+				recordJointRelativeHoldDiagnostics(&d, relativeHoldUtility, in)
 				d.PathPositiveConfidence = positiveConfidence
 				d.ExistingInventoryExpectedPnLJPY = pathPayoff.ExistingInventoryExpectedPnLJPY
 				d.BaselineVarianceJPY2 = pathPayoff.BaselineVarianceJPY2
@@ -2714,7 +2972,7 @@ func OptimizeJointDistanceQuantity(
 				d.MarginalVarianceJPY2 = pathPayoff.MarginalVarianceJPY2
 				d.InventoryOrderCovarianceJPY2 = pathPayoff.InventoryOrderCovarianceJPY2
 				d.RiskReducing = pathPayoff.RiskReducing
-				d.PathEffectiveSamples = pathStats.EffectiveSamples
+				setJointPathDecayDiagnostics(&d, pathStats)
 				d.PairCapitalUtilization = gross / in.PairEquityJPY
 				if in.Projection.FastBuyNotionalJPY+in.Projection.FastSellNotionalJPY > 0 {
 					d.CapitalUtilization = gross /
@@ -2840,14 +3098,9 @@ func OptimizeJointDistanceQuantity(
 					projection.BuyNotionalJPY, projection.SellNotionalJPY,
 					in.PairEquityJPY, riskAversion, z)
 				feeValueMean, feeValueDownsideRegret, feeValueNet :=
-					fastCandidateValue(
-						payoff,
-						projection.BuyNotionalJPY,
-						projection.SellNotionalJPY,
-						crossing.BuyTouchProbability,
-						crossing.SellTouchProbability,
-						crossing.BothTouchProbability)
-				feeValueNet += TargetProgressContinuationValue(
+					targetRelativeCEAdmissionValue(payoff, confidence)
+				feeValueNet += matureTargetProgressContinuationValue(
+					config.JointDistanceQuantity.LegacyStackedTargetContinuation,
 					in.Projection.CurrentInventoryNotionalJPY,
 					in.Projection.TargetInventoryNotionalJPY,
 					in.PairEquityJPY,
@@ -2865,19 +3118,21 @@ func OptimizeJointDistanceQuantity(
 						baselineProjection.BuyNotionalJPY,
 						baselineProjection.SellNotionalJPY,
 						in.PairEquityJPY, riskAversion, 0)
+					baselineConfidence := pathStats.EvaluateTargetRelativePosition(
+						in.Projection.CurrentInventoryNotionalJPY,
+						in.Projection.TargetInventoryNotionalJPY,
+						baselineProjection.BuyNotionalJPY,
+						baselineProjection.SellNotionalJPY,
+						in.PairEquityJPY, riskAversion, z)
 					promoted = projection.BuyNotionalJPY >
 						baselineProjection.BuyNotionalJPY+1e-9 ||
 						projection.SellNotionalJPY >
 							baselineProjection.SellNotionalJPY+1e-9
 					if promoted {
-						_, _, baselineFeeValueNet := fastCandidateValue(
-							baselinePayoff,
-							baselineProjection.BuyNotionalJPY,
-							baselineProjection.SellNotionalJPY,
-							crossing.BuyTouchProbability,
-							crossing.SellTouchProbability,
-							crossing.BothTouchProbability)
-						baselineFeeValueNet += TargetProgressContinuationValue(
+						_, _, baselineFeeValueNet := targetRelativeCEAdmissionValue(
+							baselinePayoff, baselineConfidence)
+						baselineFeeValueNet += matureTargetProgressContinuationValue(
+							config.JointDistanceQuantity.LegacyStackedTargetContinuation,
 							in.Projection.CurrentInventoryNotionalJPY,
 							in.Projection.TargetInventoryNotionalJPY,
 							in.PairEquityJPY,
@@ -2918,7 +3173,7 @@ func OptimizeJointDistanceQuantity(
 					d.MarginalVarianceJPY2 = payoff.MarginalVarianceJPY2
 					d.InventoryOrderCovarianceJPY2 = payoff.InventoryOrderCovarianceJPY2
 					d.RiskReducing = payoff.RiskReducing
-					d.PathEffectiveSamples = pathStats.EffectiveSamples
+					setJointPathDecayDiagnostics(&d, pathStats)
 					d.PairCapitalUtilization = projection.ProjectedGrossNotionalJPY / in.PairEquityJPY
 					fastGross := in.Projection.FastBuyNotionalJPY + in.Projection.FastSellNotionalJPY
 					if fastGross > 0 {
@@ -2930,6 +3185,9 @@ func OptimizeJointDistanceQuantity(
 		}
 	}
 	if !d.Enabled {
+		// An immature path is inconclusive, not an authoritative terminal-wealth
+		// rejection. The caller therefore retains the already computed Fast plan
+		// while the path estimator accumulates more completed evidence.
 		d.AuthoritativeRejection = pathReady > 0
 		switch {
 		case crossingReady == 0:
@@ -2937,7 +3195,11 @@ func OptimizeJointDistanceQuantity(
 		case positiveEdge == 0:
 			d.Reason = "no distance has positive fee-net crossing edge"
 		case pathReady == 0:
-			d.Reason = "insufficient terminal path variance samples"
+			if pathObserved > 0 && pathImmature {
+				d.Reason = "terminal path evidence is immature"
+			} else {
+				d.Reason = "insufficient terminal path variance samples"
+			}
 		case bestFallbackBuyScore <= 0 && bestFallbackSellScore <= 0:
 			d.Reason = "no side distance has positive posterior-risk terminal wealth"
 		case projectionReady == 0:

@@ -69,6 +69,25 @@ func toGlobalMarket(symbol binance.Symbol) types.Market {
 		market.TickSize = fixedpoint.MustNewFromString(f.TickSize)
 	}
 
+	// Binance evaluates this side-aware bound against a rolling weighted
+	// average. Preserve the filter even when a symbol has no such rule (the
+	// zero values remain a backwards-compatible "unknown" state).
+	if f := symbol.PercentPriceBySideFilter(); f != nil {
+		if f.BidMultiplierUp != "" {
+			market.PercentPriceBidMultiplierUp = fixedpoint.MustNewFromString(f.BidMultiplierUp)
+		}
+		if f.BidMultiplierDown != "" {
+			market.PercentPriceBidMultiplierDown = fixedpoint.MustNewFromString(f.BidMultiplierDown)
+		}
+		if f.AskMultiplierUp != "" {
+			market.PercentPriceAskMultiplierUp = fixedpoint.MustNewFromString(f.AskMultiplierUp)
+		}
+		if f.AskMultiplierDown != "" {
+			market.PercentPriceAskMultiplierDown = fixedpoint.MustNewFromString(f.AskMultiplierDown)
+		}
+		market.PercentPriceAveragePriceMins = f.AveragePriceMins
+	}
+
 	if market.MinNotional.IsZero() {
 		log.Warnf("binance market %s minNotional is zero", market.Symbol)
 	}
@@ -192,6 +211,14 @@ func toGlobalOrders(binanceOrders []*binance.Order, isMargin bool) (orders []typ
 }
 
 func toGlobalOrder(binanceOrder *binance.Order, isMargin bool) (*types.Order, error) {
+	executedQuantity := fixedpoint.MustNewFromString(binanceOrder.ExecutedQuantity)
+	averagePrice := fixedpoint.Zero
+	if executedQuantity.Sign() > 0 && binanceOrder.CummulativeQuoteQuantity != "" {
+		quoteQuantity := fixedpoint.MustNewFromString(binanceOrder.CummulativeQuoteQuantity)
+		if quoteQuantity.Sign() > 0 {
+			averagePrice = quoteQuantity.Div(executedQuantity)
+		}
+	}
 	return &types.Order{
 		SubmitOrder: types.SubmitOrder{
 			ClientOrderID: binanceOrder.ClientOrderID,
@@ -200,6 +227,7 @@ func toGlobalOrder(binanceOrder *binance.Order, isMargin bool) (*types.Order, er
 			Type:          toGlobalOrderType(binanceOrder.Type),
 			Quantity:      fixedpoint.MustNewFromString(binanceOrder.OrigQuantity),
 			Price:         fixedpoint.MustNewFromString(binanceOrder.Price),
+			AveragePrice:  averagePrice,
 			TimeInForce:   types.TimeInForce(binanceOrder.TimeInForce),
 		},
 		Exchange:         types.ExchangeBinance,
@@ -207,7 +235,7 @@ func toGlobalOrder(binanceOrder *binance.Order, isMargin bool) (*types.Order, er
 		OrderID:          uint64(binanceOrder.OrderID),
 		Status:           toGlobalOrderStatus(binanceOrder.Status),
 		OriginalStatus:   string(binanceOrder.Status),
-		ExecutedQuantity: fixedpoint.MustNewFromString(binanceOrder.ExecutedQuantity),
+		ExecutedQuantity: executedQuantity,
 		CreationTime:     types.Time(millisecondTime(binanceOrder.Time)),
 		UpdateTime:       types.Time(millisecondTime(binanceOrder.UpdateTime)),
 		IsMargin:         isMargin,

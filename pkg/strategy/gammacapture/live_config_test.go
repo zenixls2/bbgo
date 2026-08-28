@@ -50,8 +50,8 @@ func TestLiveETHJPYConfigDecodesInventoryControllers(t *testing.T) {
 	if !strategy.MarketMaker.ConditionalExecution.Enabled {
 		t.Fatal("live ETHJPY config must enable symmetric conditional Fast execution")
 	}
-	if !strategy.MarketMaker.PosteriorInventoryTarget {
-		t.Fatal("live ETHJPY config must enable posterior inventory targeting")
+	if strategy.MarketMaker.PosteriorInventoryTarget {
+		t.Fatal("live ETHJPY config must disable the competing posterior inventory target")
 	}
 	if strategy.MarketMaker.DynamicInventoryAim.Enabled || strategy.MarketMaker.DynamicInventoryAim.ShadowOnly {
 		t.Fatalf("live ETHJPY config must keep the retired DynamicInventoryAim inactive: %+v", strategy.MarketMaker.DynamicInventoryAim)
@@ -62,10 +62,16 @@ func TestLiveETHJPYConfigDecodesInventoryControllers(t *testing.T) {
 		t.Fatalf("live ETHJPY config must retain but disable the rejected regime-conditioned target: %+v", strategy.MarketMaker.DynamicInventoryAim.RegimeConditionedTarget)
 	}
 	pivotTarget := strategy.MarketMaker.DynamicInventoryAim.PivotRegimeTarget
-	if pivotTarget.Enabled || math.Abs(pivotTarget.ReversalBps-26) > 1e-12 ||
-		time.Duration(pivotTarget.MaxGap) != 15*time.Minute || pivotTarget.MinLegSamples != 2 ||
+	if pivotTarget.Enabled || !pivotTarget.CausalCEEnabled ||
+		math.Abs(pivotTarget.CausalRiskAversion-0.02) > 1e-12 ||
+		math.Abs(pivotTarget.CausalPriorStrengthBps-8) > 1e-12 ||
+		math.Abs(pivotTarget.ReversalBps-26) > 1e-12 ||
+		time.Duration(pivotTarget.MaxGap) != 15*time.Minute || time.Duration(pivotTarget.StartupWarmup) != 24*time.Hour || pivotTarget.MinLegSamples != 2 ||
 		math.Abs(pivotTarget.PriorLegSamples-2) > 1e-12 || math.Abs(pivotTarget.MaxShiftRatio-0.20) > 1e-12 {
-		t.Fatalf("live ETHJPY config must retain but disable the pivot-first target pending private-fill calibration: %+v", pivotTarget)
+		t.Fatalf("live ETHJPY config must enable the sole pivot-first CE target owner: %+v", pivotTarget)
+	}
+	if strategy.MarketMaker.CausalKlinePivot.Enabled {
+		t.Fatal("live ETHJPY config must disable the competing causal Kline target overlay")
 	}
 	if !strategy.MarketMaker.BOCPD45.Enabled || strategy.MarketMaker.BOCPD45.Calibration != "platt" {
 		t.Fatalf("live ETHJPY config must enable strictly-prequential Platt BOCPD45: %+v", strategy.MarketMaker.BOCPD45)

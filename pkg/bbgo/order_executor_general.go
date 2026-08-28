@@ -28,10 +28,11 @@ const submitOrderRetryLimit = 5
 
 // BaseOrderExecutor provides the common accessors for order executor
 type BaseOrderExecutor struct {
-	exchange          types.Exchange
-	session           *ExchangeSession
-	activeMakerOrders *ActiveOrderBook
-	orderStore        *core.OrderStore
+	exchange               types.Exchange
+	session                *ExchangeSession
+	activeMakerOrders      *ActiveOrderBook
+	orderStore             *core.OrderStore
+	privateOrderFillLedger PrivateOrderFillLedger
 }
 
 func (e *BaseOrderExecutor) OrderStore() *core.OrderStore {
@@ -69,6 +70,62 @@ type GeneralOrderExecutor struct {
 	disableNotify bool
 }
 
+func (e *GeneralOrderExecutor) recordSubmitIntent(ctx context.Context, orders []types.SubmitOrder) {
+	if e.privateOrderFillLedger == nil {
+		return
+	}
+	for index, order := range orders {
+		if err := e.privateOrderFillLedger.RecordSubmitIntent(ctx, e.session.Name, e.strategy, e.strategyInstanceID, index, order); err != nil {
+			log.WithError(err).WithField("symbol", order.Symbol).Warn("private order/fill ledger submit intent failed")
+		}
+	}
+}
+
+func (e *GeneralOrderExecutor) recordSubmitResult(ctx context.Context, orders []types.SubmitOrder, created types.OrderSlice, errIndexes []int, submitErr error) {
+	if e.privateOrderFillLedger == nil {
+		return
+	}
+	createdByClientID := make(map[string]*types.Order, len(created))
+	for index := range created {
+		order := created[index]
+		if order.ClientOrderID != "" {
+			createdByClientID[order.ClientOrderID] = &order
+		}
+	}
+	errByIndex := make(map[int]struct{}, len(errIndexes))
+	for _, index := range errIndexes {
+		errByIndex[index] = struct{}{}
+	}
+	for index, submit := range orders {
+		createdOrder := createdByClientID[submit.ClientOrderID]
+		var resultErr error
+		if _, failed := errByIndex[index]; failed {
+			resultErr = submitErr
+		}
+		if err := e.privateOrderFillLedger.RecordSubmitResult(ctx, e.session.Name, e.strategy, e.strategyInstanceID, index, submit, createdOrder, resultErr); err != nil {
+			log.WithError(err).WithField("symbol", submit.Symbol).Warn("private order/fill ledger submit result failed")
+		}
+	}
+}
+
+func (e *GeneralOrderExecutor) recordCancelRequest(ctx context.Context, reason string, orders []types.Order) {
+	if e.privateOrderFillLedger == nil {
+		return
+	}
+	if err := e.privateOrderFillLedger.RecordCancelRequest(ctx, e.session.Name, e.strategy, e.strategyInstanceID, reason, orders); err != nil {
+		log.WithError(err).WithField("symbol", e.symbol).Warn("private order/fill ledger cancel request failed")
+	}
+}
+
+func (e *GeneralOrderExecutor) recordCancelResult(ctx context.Context, reason string, orders []types.Order, cancelErr error) {
+	if e.privateOrderFillLedger == nil {
+		return
+	}
+	if err := e.privateOrderFillLedger.RecordCancelResult(ctx, e.session.Name, e.strategy, e.strategyInstanceID, reason, orders, cancelErr); err != nil {
+		log.WithError(err).WithField("symbol", e.symbol).Warn("private order/fill ledger cancel result failed")
+	}
+}
+
 // NewGeneralOrderExecutor allocates a GeneralOrderExecutor
 // which has its own order store, trade collector
 func NewGeneralOrderExecutor(
@@ -84,10 +141,11 @@ func NewGeneralOrderExecutor(
 
 	executor := &GeneralOrderExecutor{
 		BaseOrderExecutor: BaseOrderExecutor{
-			session:           session,
-			exchange:          session.Exchange,
-			activeMakerOrders: NewActiveOrderBook(symbol),
-			orderStore:        orderStore,
+			session:                session,
+			exchange:               session.Exchange,
+			activeMakerOrders:      NewActiveOrderBook(symbol),
+			orderStore:             orderStore,
+			privateOrderFillLedger: session.privateOrderFillLedgerSink(),
 		},
 
 		symbol:             symbol,
@@ -204,10 +262,12 @@ func (e *GeneralOrderExecutor) Bind() {
 
 // CancelOrders cancels the given order objects directly
 func (e *GeneralOrderExecutor) CancelOrders(ctx context.Context, orders ...types.Order) error {
+	e.recordCancelRequest(ctx, "cancel_orders", orders)
 	err := e.session.Exchange.CancelOrders(ctx, orders...)
 	if err != nil { // Retry once
 		err = e.session.Exchange.CancelOrders(ctx, orders...)
 	}
+	e.recordCancelResult(ctx, "cancel_orders", orders, err)
 	return err
 }
 
@@ -222,6 +282,7 @@ func (e *GeneralOrderExecutor) SubmitOrders(
 	if err != nil {
 		return nil, err
 	}
+	e.recordSubmitIntent(ctx, formattedOrders)
 
 	orderCreateCallback := func(createdOrder types.Order) {
 		e.orderStore.Add(createdOrder)
@@ -231,11 +292,13 @@ func (e *GeneralOrderExecutor) SubmitOrders(
 	defer e.tradeCollector.Process()
 
 	if e.maxRetries == 0 {
-		createdOrders, _, err := BatchPlaceOrder(ctx, e.session.Exchange, orderCreateCallback, formattedOrders...)
+		createdOrders, errIndexes, err := BatchPlaceOrder(ctx, e.session.Exchange, orderCreateCallback, formattedOrders...)
+		e.recordSubmitResult(ctx, formattedOrders, createdOrders, errIndexes, err)
 		return createdOrders, err
 	}
 
-	createdOrders, _, err := BatchRetryPlaceOrder(ctx, e.session.Exchange, nil, orderCreateCallback, e.logger, formattedOrders...)
+	createdOrders, errIndexes, err := BatchRetryPlaceOrder(ctx, e.session.Exchange, nil, orderCreateCallback, e.logger, formattedOrders...)
+	e.recordSubmitResult(ctx, formattedOrders, createdOrders, errIndexes, err)
 	return createdOrders, err
 }
 
@@ -460,13 +523,24 @@ func (e *GeneralOrderExecutor) GracefulCancelActiveOrderBook(ctx context.Context
 
 	defer e.tradeCollector.Process()
 
+	orders := activeOrders.Orders()
+	e.recordCancelRequest(ctx, "graceful_cancel_active_order_book", orders)
 	op := func() error { return activeOrders.GracefulCancel(ctx, e.session.Exchange) }
-	return backoff.RetryGeneral(ctx, op)
+	err := backoff.RetryGeneral(ctx, op)
+	e.recordCancelResult(ctx, "graceful_cancel_active_order_book", orders, err)
+	return err
 }
 
 // GracefulCancel cancels all active maker orders if orders are not given, otherwise cancel all the given orders
 func (e *GeneralOrderExecutor) GracefulCancel(ctx context.Context, orders ...types.Order) error {
-	if err := e.activeMakerOrders.GracefulCancel(ctx, e.session.Exchange, orders...); err != nil {
+	trackedOrders := orders
+	if len(trackedOrders) == 0 {
+		trackedOrders = e.activeMakerOrders.Orders()
+	}
+	e.recordCancelRequest(ctx, "graceful_cancel", trackedOrders)
+	err := e.activeMakerOrders.GracefulCancel(ctx, e.session.Exchange, orders...)
+	e.recordCancelResult(ctx, "graceful_cancel", trackedOrders, err)
+	if err != nil {
 		return errors.Wrap(err, "graceful cancel error")
 	}
 

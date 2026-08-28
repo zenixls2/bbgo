@@ -593,3 +593,72 @@ func TestSymmetricInventoryProjectionBoundsUsesNarrowerHardHeadroom(t *testing.T
 		t.Fatalf("out-of-band target must collapse at the nearest hard boundary: lower=%f upper=%f", lower, upper)
 	}
 }
+
+func TestTargetAwareFallbackNeverTradesAwayFromBoundaryTarget(t *testing.T) {
+	tests := []struct {
+		name              string
+		in                TargetAwareFallbackQuoteInput
+		wantBuy, wantSell float64
+	}{
+		{
+			name: "flat target cannot buy",
+			in: TargetAwareFallbackQuoteInput{
+				CurrentInventoryNotionalJPY: 5_000, TargetInventoryNotionalJPY: 0,
+				HardLowerInventoryNotionalJPY: 0, HardUpperInventoryNotionalJPY: 6_773,
+				BuyNotionalCapJPY: 5_652, SellNotionalCapJPY: 5_000,
+				MinBuyNotionalJPY: 108, MinSellNotionalJPY: 100,
+			},
+			wantSell: 5_000,
+		},
+		{
+			name: "full-long target cannot sell",
+			in: TargetAwareFallbackQuoteInput{
+				CurrentInventoryNotionalJPY: 0, TargetInventoryNotionalJPY: 6_773,
+				HardLowerInventoryNotionalJPY: 0, HardUpperInventoryNotionalJPY: 6_773,
+				BuyNotionalCapJPY: 5_652, SellNotionalCapJPY: 5_000,
+				MinBuyNotionalJPY: 108, MinSellNotionalJPY: 100,
+			},
+			wantBuy: 5_652,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := TargetAwareFallbackQuoteNotionals(tt.in)
+			if !d.Enabled || math.Abs(d.BuyNotionalJPY-tt.wantBuy) > 1e-9 ||
+				math.Abs(d.SellNotionalJPY-tt.wantSell) > 1e-9 {
+				t.Fatalf("unexpected target-aware fallback: %+v", d)
+			}
+		})
+	}
+}
+
+func TestTargetAwareFallbackRetainsOnlyMinimumLearningCellsWhenAligned(t *testing.T) {
+	d := TargetAwareFallbackQuoteNotionals(TargetAwareFallbackQuoteInput{
+		CurrentInventoryNotionalJPY: 3_386, TargetInventoryNotionalJPY: 3_386,
+		HardLowerInventoryNotionalJPY: 0, HardUpperInventoryNotionalJPY: 6_773,
+		BuyNotionalCapJPY: 2_000, SellNotionalCapJPY: 2_000,
+		MinBuyNotionalJPY: 108, MinSellNotionalJPY: 100,
+	})
+	if !d.Enabled || d.BuyNotionalJPY != 108 || d.SellNotionalJPY != 100 {
+		t.Fatalf("aligned interior target should retain only exchange-sized learning cells: %+v", d)
+	}
+}
+
+func TestTargetAwareFallbackRejectsSubMinimumCorrectionAndNonFiniteInput(t *testing.T) {
+	d := TargetAwareFallbackQuoteNotionals(TargetAwareFallbackQuoteInput{
+		CurrentInventoryNotionalJPY: 0.403, TargetInventoryNotionalJPY: 0,
+		HardLowerInventoryNotionalJPY: 0, HardUpperInventoryNotionalJPY: 6_773,
+		BuyNotionalCapJPY: 5_652, SellNotionalCapJPY: 0.403,
+		MinBuyNotionalJPY: 108, MinSellNotionalJPY: 100,
+	})
+	if d.Enabled || d.BuyNotionalJPY != 0 || d.SellNotionalJPY != 0 {
+		t.Fatalf("sub-minimum correction must not become an opposite-side order: %+v", d)
+	}
+	d = TargetAwareFallbackQuoteNotionals(TargetAwareFallbackQuoteInput{
+		CurrentInventoryNotionalJPY: math.NaN(), TargetInventoryNotionalJPY: 0,
+		HardLowerInventoryNotionalJPY: 0, HardUpperInventoryNotionalJPY: 1,
+	})
+	if d.Enabled {
+		t.Fatalf("non-finite fallback input must fail closed: %+v", d)
+	}
+}

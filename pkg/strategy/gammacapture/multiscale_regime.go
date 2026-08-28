@@ -1,25 +1,43 @@
-//go:build ignore
-
 package gammacapture
 
 import (
+	"fmt"
 	"math"
 	"time"
+
+	"github.com/c9s/bbgo/pkg/types"
 )
 
-// MultiscaleRegimeConfig controls the research-only one-minute regime filter.
+type multiscaleRegimeCheckpoint struct {
+	LastAt        time.Time                `json:"lastAt"`
+	LastBid       float64                  `json:"lastBid"`
+	LastAsk       float64                  `json:"lastAsk"`
+	Samples       int                      `json:"samples"`
+	AskReturns    []float64                `json:"askReturns,omitempty"`
+	BidReturns    []float64                `json:"bidReturns,omitempty"`
+	ReturnHead    int                      `json:"returnHead"`
+	Probabilities []float64                `json:"probabilities,omitempty"`
+	Runs          []multiscaleRunPosterior `json:"runs,omitempty"`
+	LastDecision  MultiscaleRegimeDecision `json:"lastDecision"`
+}
+
+// MultiscaleRegimeConfig controls the optional one-minute regime fallback.
 // The filter has no fitted artifact: all posterior state is learned causally
 // from observations received after construction.
 type MultiscaleRegimeConfig struct {
-	HazardMean       time.Duration
-	MaximumRunLength int
-	VolatilityWindow int
-	MinimumSamples   int
+	Enabled bool `json:"enabled" yaml:"enabled"`
+	// types.Duration accepts both YAML duration strings (e.g. 3h) and the
+	// generated JSON representation used by the live config loader. Using
+	// time.Duration directly would fail after YAML is converted to JSON.
+	HazardMean       types.Duration `json:"hazardMean" yaml:"hazardMean"`
+	MaximumRunLength int            `json:"maximumRunLength" yaml:"maximumRunLength"`
+	VolatilityWindow int            `json:"volatilityWindow" yaml:"volatilityWindow"`
+	MinimumSamples   int            `json:"minimumSamples" yaml:"minimumSamples"`
 }
 
 func (c MultiscaleRegimeConfig) withDefaults() MultiscaleRegimeConfig {
 	if c.HazardMean <= 0 {
-		c.HazardMean = 3 * time.Hour
+		c.HazardMean = types.Duration(3 * time.Hour)
 	}
 	if c.MaximumRunLength <= 0 {
 		c.MaximumRunLength = int((6 * time.Hour) / time.Minute)
@@ -35,8 +53,7 @@ func (c MultiscaleRegimeConfig) withDefaults() MultiscaleRegimeConfig {
 
 // MultiscaleRegimeDecision is a posterior over the sign and age of the
 // current executable-price regime. It deliberately does not produce an
-// inventory target. Integration is allowed only after standalone calibration
-// and stability tests pass.
+// inventory target or an independent admission decision.
 type MultiscaleRegimeDecision struct {
 	Healthy bool
 	Reason  string
@@ -86,6 +103,7 @@ type BayesianMultiscaleRegime struct {
 
 	probabilities []float64
 	runs          []multiscaleRunPosterior
+	lastDecision  MultiscaleRegimeDecision
 }
 
 func NewBayesianMultiscaleRegime(c MultiscaleRegimeConfig) *BayesianMultiscaleRegime {
@@ -94,6 +112,7 @@ func NewBayesianMultiscaleRegime(c MultiscaleRegimeConfig) *BayesianMultiscaleRe
 		config:        c,
 		probabilities: []float64{1},
 		runs:          []multiscaleRunPosterior{{}},
+		lastDecision:  MultiscaleRegimeDecision{Reason: "waiting for consecutive one-minute executable BBO closes"},
 	}
 }
 
@@ -106,23 +125,86 @@ func (m *BayesianMultiscaleRegime) Reset() {
 	*m = *NewBayesianMultiscaleRegime(c)
 }
 
+func (m *BayesianMultiscaleRegime) checkpoint() *multiscaleRegimeCheckpoint {
+	if m == nil {
+		return nil
+	}
+	return &multiscaleRegimeCheckpoint{
+		LastAt: m.lastAt, LastBid: m.lastBid, LastAsk: m.lastAsk, Samples: m.samples,
+		AskReturns: append([]float64(nil), m.askReturns...),
+		BidReturns: append([]float64(nil), m.bidReturns...), ReturnHead: m.returnHead,
+		Probabilities: append([]float64(nil), m.probabilities...),
+		Runs:          append([]multiscaleRunPosterior(nil), m.runs...), LastDecision: m.lastDecision,
+	}
+}
+
+func (m *BayesianMultiscaleRegime) restore(state *multiscaleRegimeCheckpoint) error {
+	if m == nil || state == nil {
+		return fmt.Errorf("multiscale regime checkpoint is missing")
+	}
+	maximumReturns := m.config.VolatilityWindow + 1
+	if state.Samples < 0 || len(state.AskReturns) != len(state.BidReturns) ||
+		len(state.AskReturns) > maximumReturns || state.ReturnHead < 0 ||
+		(state.ReturnHead >= len(state.AskReturns) && len(state.AskReturns) > 0) ||
+		len(state.Probabilities) == 0 || len(state.Probabilities) != len(state.Runs) ||
+		len(state.Probabilities) > m.config.MaximumRunLength+1 {
+		return fmt.Errorf("multiscale regime checkpoint state is invalid")
+	}
+	var total float64
+	for _, probability := range state.Probabilities {
+		if probability < 0 || math.IsNaN(probability) || math.IsInf(probability, 0) {
+			return fmt.Errorf("multiscale regime checkpoint probability is invalid")
+		}
+		total += probability
+	}
+	if total <= 0 || math.IsNaN(total) || math.IsInf(total, 0) {
+		return fmt.Errorf("multiscale regime checkpoint probability mass is invalid")
+	}
+	*m = *NewBayesianMultiscaleRegime(m.config)
+	m.lastAt, m.lastBid, m.lastAsk, m.samples = state.LastAt, state.LastBid, state.LastAsk, state.Samples
+	m.askReturns = append([]float64(nil), state.AskReturns...)
+	m.bidReturns = append([]float64(nil), state.BidReturns...)
+	m.returnHead = state.ReturnHead
+	m.probabilities = make([]float64, len(state.Probabilities))
+	for index, probability := range state.Probabilities {
+		m.probabilities[index] = probability / total
+	}
+	m.runs = append([]multiscaleRunPosterior(nil), state.Runs...)
+	m.lastDecision = state.LastDecision
+	return nil
+}
+
 // ObserveMinute consumes the last executable bid/ask in a closed UTC minute.
 // Consecutive timestamps must be exactly one minute apart; a gap starts a new
 // segment rather than fabricating zero returns.
 func (m *BayesianMultiscaleRegime) ObserveMinute(at time.Time, bid, ask float64) MultiscaleRegimeDecision {
-	d := MultiscaleRegimeDecision{Reason: "waiting for consecutive one-minute executable BBO closes"}
-	if m == nil || at.IsZero() || bid <= 0 || ask < bid {
+	if m == nil {
+		return MultiscaleRegimeDecision{Reason: "multiscale regime model unavailable"}
+	}
+	d := m.lastDecision
+	if d.Reason == "" {
+		d = MultiscaleRegimeDecision{Reason: "waiting for consecutive one-minute executable BBO closes"}
+	}
+	if at.IsZero() || bid <= 0 || ask < bid {
 		return d
 	}
 	at = at.UTC().Truncate(time.Minute)
 	if m.lastAt.IsZero() {
 		m.lastAt, m.lastBid, m.lastAsk = at, bid, ask
+		m.lastDecision = d
 		return d
+	}
+	// Live BBO callbacks can arrive many times inside one minute. They are the
+	// same closed-minute observation, not a missing-minute gap; return the last
+	// posterior without resetting or double-counting it.
+	if at.Equal(m.lastAt) {
+		return m.lastDecision
 	}
 	if !at.Equal(m.lastAt.Add(time.Minute)) {
 		m.Reset()
 		m.lastAt, m.lastBid, m.lastAsk = at, bid, ask
-		d.Reason = "one-minute BBO gap started a new causal segment"
+		d = MultiscaleRegimeDecision{Reason: "one-minute BBO gap started a new causal segment"}
+		m.lastDecision = d
 		return d
 	}
 
@@ -141,6 +223,7 @@ func (m *BayesianMultiscaleRegime) ObserveMinute(at time.Time, bid, ask float64)
 	}
 	if m.samples < m.config.MinimumSamples || continuousVariance <= 0 {
 		d.Reason = "insufficient one-minute observations for jump-robust scale"
+		m.lastDecision = d
 		return d
 	}
 
@@ -152,6 +235,7 @@ func (m *BayesianMultiscaleRegime) ObserveMinute(at time.Time, bid, ask float64)
 	m.updateBOCPD(standardized)
 	d = m.decision(continuousVariance, realizedVariance)
 	d.Samples = m.samples
+	m.lastDecision = d
 	return d
 }
 
@@ -209,7 +293,7 @@ func (m *BayesianMultiscaleRegime) updateBOCPD(x float64) {
 	newProbabilities := make([]float64, newLength)
 	newRuns := make([]multiscaleRunPosterior, newLength)
 
-	hazardMinutes := m.config.HazardMean.Minutes()
+	hazardMinutes := m.config.HazardMean.Duration().Minutes()
 	hazard := 1 / math.Max(1, hazardMinutes)
 	priorPredictive := multiscaleStudentLogPDF(multiscaleRunPosterior{}, x)
 	changeMass := 0.0

@@ -72,15 +72,16 @@ func TestAsymmetricOscillationRiskMaturedLabelsChangeAsymmetry(t *testing.T) {
 			t.Fatal("matured downward label was not accepted")
 		}
 	}
-	if m.Stats.UpSamples != 2 || m.Stats.DownSamples != 2 ||
-		m.Stats.DownVarianceBps2 <= m.Stats.UpVarianceBps2 {
-		t.Fatalf("unexpected asymmetric variance state: %+v", m.Stats)
+	stats, ok := m.StatsForHorizon(10 * time.Minute)
+	if !ok || stats.UpSamples != 2 || stats.DownSamples != 2 ||
+		stats.DownVarianceBps2 <= stats.UpVarianceBps2 {
+		t.Fatalf("unexpected asymmetric variance state: ok=%t stats=%+v", ok, stats)
 	}
-	decision := EvaluateAsymmetricOscillationRisk(m.Config, features, m.Stats)
+	decision := EvaluateAsymmetricOscillationRisk(m.Config, features, stats)
 	if !decision.AsymmetryReady || decision.AsymmetryScore <= 0 || decision.RiskMultiplier >= 1 {
 		t.Fatalf("downside-dominant asymmetry did not reduce upward risk: %+v", decision)
 	}
-	decision = EvaluateAsymmetricOscillationRisk(m.Config, downFeatures, m.Stats)
+	decision = EvaluateAsymmetricOscillationRisk(m.Config, downFeatures, stats)
 	if decision.RiskMultiplier <= 1 {
 		t.Fatalf("downward oscillation did not increase risk: %+v", decision)
 	}
@@ -95,13 +96,118 @@ func TestAsymmetricOscillationRiskGapResetAndBounds(t *testing.T) {
 	if m.UpdateLabel(start.Add(10*time.Minute), 90) {
 		t.Fatal("a gap-reset pending label must not update statistics")
 	}
-	decision := EvaluateAsymmetricOscillationRisk(m.Config, features, m.Stats)
+	stats, ok := m.StatsForHorizon(10 * time.Minute)
+	if !ok {
+		t.Fatal("expected horizon state after prediction")
+	}
+	decision := EvaluateAsymmetricOscillationRisk(m.Config, features, stats)
 	if decision.RiskMultiplier < m.Config.MinMultiplier || decision.RiskMultiplier > m.Config.MaxMultiplier ||
 		!finiteAsymmetricRisk(decision.RiskMultiplier) {
 		t.Fatalf("risk multiplier escaped bounds: %+v", decision)
 	}
-	if invalid := EvaluateAsymmetricOscillationRisk(m.Config, AsymmetricOscillationRiskFeatures{NetReturnBps: math.NaN()}, m.Stats); invalid.Enabled {
+	if invalid := EvaluateAsymmetricOscillationRisk(m.Config, AsymmetricOscillationRiskFeatures{NetReturnBps: math.NaN()}, stats); invalid.Enabled {
 		t.Fatalf("invalid feature should fail closed: %+v", invalid)
+	}
+}
+
+func TestAsymmetricOscillationRiskModelGatesUnmaturedDirection(t *testing.T) {
+	cfg := testAsymmetricRiskConfig()
+	cfg.MinSamples = 1
+	m := NewAsymmetricOscillationRiskModel(cfg)
+	start := time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC)
+	horizon := 10 * time.Minute
+	up := AsymmetricOscillationRiskFeatures{NetReturnBps: 10, TotalVariationBps: 40, ScaleBps: 10}
+	down := up
+	down.NetReturnBps = -10
+
+	// A path-direction signal exists before any matured labels, but it must
+	// remain neutral at the model boundary.
+	provisional := m.Predict(start, 100, horizon, down)
+	if provisional.RiskMultiplier != 1 || provisional.AsymmetryReady || provisional.Reason != "asymmetry statistics not mature" {
+		t.Fatalf("unmatured direction changed risk aversion: %+v", provisional)
+	}
+	if !m.UpdateLabel(start.Add(horizon), 101) {
+		t.Fatal("first matured label was not accepted")
+	}
+	// Only the down posterior is mature; the opposite direction must still be
+	// blocked until both directional posteriors have evidence.
+	provisional = m.Predict(start.Add(horizon+time.Minute), 100, horizon, up)
+	if provisional.RiskMultiplier != 1 || provisional.AsymmetryReady {
+		t.Fatalf("one-sided matured state was allowed to move risk: %+v", provisional)
+	}
+	if !m.UpdateLabel(start.Add(2*horizon+time.Minute), 99) {
+		t.Fatal("second matured label was not accepted")
+	}
+	ready := m.Predict(start.Add(2*horizon+2*time.Minute), 100, horizon, up)
+	if !ready.AsymmetryReady || ready.RiskMultiplier >= 1 {
+		t.Fatalf("two-sided matured state did not enable upward response: %+v", ready)
+	}
+}
+
+func TestAsymmetricOscillationRiskSeparatesHorizonLabels(t *testing.T) {
+	cfg := testAsymmetricRiskConfig()
+	cfg.MinSamples = 1
+	m := NewAsymmetricOscillationRiskModel(cfg)
+	start := time.Date(2026, 8, 17, 1, 0, 0, 0, time.UTC)
+	short := 10 * time.Minute
+	long := 30 * time.Minute
+	up := AsymmetricOscillationRiskFeatures{NetReturnBps: 8, TotalVariationBps: 32, ScaleBps: 8}
+	down := up
+	down.NetReturnBps = -8
+
+	m.Predict(start, 100, short, up)
+	m.Predict(start, 100, long, down)
+	if !m.UpdateLabel(start.Add(short), 101) {
+		t.Fatal("short-horizon label was not accepted")
+	}
+	shortStats, ok := m.StatsForHorizon(short)
+	if !ok || shortStats.UpSamples != 1 || shortStats.DownSamples != 0 {
+		t.Fatalf("short horizon was not isolated: ok=%t stats=%+v", ok, shortStats)
+	}
+	longStats, ok := m.StatsForHorizon(long)
+	if !ok || longStats.UpSamples != 0 || longStats.DownSamples != 0 {
+		t.Fatalf("long horizon was prematurely updated: ok=%t stats=%+v", ok, longStats)
+	}
+	shortDecision := m.Predict(start.Add(short+time.Second), 100, short, down)
+	if shortDecision.AsymmetryReady || shortDecision.RiskMultiplier != 1 {
+		t.Fatalf("short horizon should remain neutral with one-sided evidence: %+v", shortDecision)
+	}
+	if !m.UpdateLabel(start.Add(long), 98) {
+		t.Fatal("long-horizon label was not accepted")
+	}
+	longStats, ok = m.StatsForHorizon(long)
+	if !ok || longStats.DownSamples != 1 || longStats.UpSamples != 0 {
+		t.Fatalf("long horizon state was mixed with short horizon: ok=%t stats=%+v", ok, longStats)
+	}
+}
+
+func TestAsymmetricOscillationRiskCheckpointRoundTripPreservesHorizons(t *testing.T) {
+	cfg := testAsymmetricRiskConfig()
+	m := NewAsymmetricOscillationRiskModel(cfg)
+	start := time.Date(2026, 8, 17, 2, 0, 0, 0, time.UTC)
+	short := 10 * time.Minute
+	long := 30 * time.Minute
+	features := AsymmetricOscillationRiskFeatures{NetReturnBps: 10, TotalVariationBps: 40, ScaleBps: 10}
+	m.Predict(start, 100, short, features)
+	m.Predict(start, 100, long, features)
+	checkpoint := m.checkpoint()
+	restored := NewAsymmetricOscillationRiskModel(cfg)
+	if err := restored.restore(checkpoint); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	for _, horizon := range []time.Duration{short, long} {
+		stats, ok := restored.StatsForHorizon(horizon)
+		if !ok || stats != (AsymmetricOscillationRiskStats{}) {
+			t.Fatalf("restored stats changed for %s: ok=%t stats=%+v", horizon, ok, stats)
+		}
+	}
+	if !restored.UpdateLabel(start.Add(short), 101) {
+		t.Fatal("restored short pending label was not accepted")
+	}
+	shortStats, _ := restored.StatsForHorizon(short)
+	longStats, _ := restored.StatsForHorizon(long)
+	if shortStats.UpSamples != 1 || longStats.UpSamples != 0 {
+		t.Fatalf("restored pending labels were not horizon-specific: short=%+v long=%+v", shortStats, longStats)
 	}
 }
 

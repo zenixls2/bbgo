@@ -8,6 +8,43 @@ import (
 	"github.com/c9s/bbgo/pkg/types"
 )
 
+func TestAssessJointPathMaturitySeparatesUncertaintyFromNegativeValue(t *testing.T) {
+	config := MarketMakerConfig{
+		MakerFeeBps: 10, AdverseSelectionBps: 2, MinimumNetEdgeBps: 2,
+		JointDistanceQuantity: JointDistanceQuantityConfig{PathMaturityMaxRelativeHalfWidth: 1},
+	}
+	negative := JointPathPayoffStats{
+		EffectiveSamples: 16,
+		BuyDominant:      jointPathPayoffMoments{BuyMeanBps: -20, SellMeanBps: -18, BuyVarBps2: 1, SellVarBps2: 1},
+		SellDominant:     jointPathPayoffMoments{BuyMeanBps: -18, SellMeanBps: -20, BuyVarBps2: 1, SellVarBps2: 1},
+	}
+	if got := AssessJointPathMaturity(negative, config, 1.645); !got.Matured || got.Reason != "terminal-path posterior is mature" {
+		t.Fatalf("precise negative path must be mature, got %+v", got)
+	}
+	uncertain := negative
+	uncertain.EffectiveSamples = 2.1
+	uncertain.BuyDominant.BuyMeanBps = 0
+	uncertain.BuyDominant.SellMeanBps = 0
+	uncertain.BuyDominant.BuyVarBps2 = 900
+	uncertain.BuyDominant.SellVarBps2 = 900
+	uncertain.SellDominant = uncertain.BuyDominant
+	if got := AssessJointPathMaturity(uncertain, config, 1.645); got.Matured || got.Reason != "terminal-path confidence width exceeds maturity scale" {
+		t.Fatalf("uncertain path must remain inconclusive, got %+v", got)
+	}
+}
+
+func TestAssessJointPathMaturityUsesEffectiveTargetEvidence(t *testing.T) {
+	config := MarketMakerConfig{JointDistanceQuantity: JointDistanceQuantityConfig{PathMaturityMaxRelativeHalfWidth: 1}}
+	stats := JointPathPayoffStats{
+		EffectiveSamples: 10, InventoryTargetEffectiveSamples: 1,
+		BuyDominant:  jointPathPayoffMoments{BuyMeanBps: 10},
+		SellDominant: jointPathPayoffMoments{SellMeanBps: 10},
+	}
+	if got := AssessJointPathMaturity(stats, config, 1.645); got.Matured {
+		t.Fatalf("one effective target path must be immature: %+v", got)
+	}
+}
+
 func TestJointPathPayoffPenalizesSellingIntoContinuation(t *testing.T) {
 	start := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
 	model := MarketMakerHorizonModel{}
@@ -371,6 +408,35 @@ func TestTargetRelativeRiskIsBuySellSymmetric(t *testing.T) {
 		math.Abs(buy.MarginalVarianceJPY2-sell.MarginalVarianceJPY2) > 1e-12 ||
 		math.Abs(buy.CertaintyEquivalent-sell.CertaintyEquivalent) > 1e-12 {
 		t.Fatalf("reflected target-restoring actions must have equal risk: buy=%+v sell=%+v", buy, sell)
+	}
+}
+
+func TestTargetRelativeCEUsesWholeMinusBaselineConfidence(t *testing.T) {
+	moments := jointPathPayoffMoments{
+		BuyVarBps2:       100,
+		InventoryVarBps2: 400,
+	}
+	stats := JointPathPayoffStats{
+		EffectiveSamples: 4,
+		BuyDominant:      moments,
+		SellDominant:     moments,
+	}
+	decision := stats.EvaluateTargetRelativePosition(
+		1_000, 0, 100, 0, 10_000, 0, 1)
+
+	wantBaselineSE := 1.0
+	wantIncrementalSE := 0.05
+	wantWholeSE := math.Sqrt(4.01 / 4)
+	wantLower := -(wantWholeSE - wantBaselineSE)
+	if math.Abs(decision.BaselineStdErrorJPY-wantBaselineSE) > 1e-12 ||
+		math.Abs(decision.IncrementalStdErrorJPY-wantIncrementalSE) > 1e-12 ||
+		math.Abs(decision.WholePositionStdErrorJPY-wantWholeSE) > 1e-12 ||
+		math.Abs(decision.LowerPnLJPY-wantLower) > 1e-12 ||
+		math.Abs(decision.CertaintyEquivalent-wantLower) > 1e-12 {
+		t.Fatalf("CE must use whole-minus-baseline confidence: got=%+v want lower=%v", decision, wantLower)
+	}
+	if math.Abs(decision.StdErrorJPY-decision.IncrementalStdErrorJPY) > 1e-12 {
+		t.Fatalf("legacy StdErrorJPY diagnostic must remain the incremental SE: %+v", decision)
 	}
 }
 

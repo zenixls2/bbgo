@@ -39,6 +39,45 @@ func TestDynamicInventoryAimPositiveSignalMovesTowardHigherTarget(t *testing.T) 
 	if d.NetReturnBps <= 0 || d.AdjustmentFraction <= 0 || d.AdjustmentFraction >= 1 {
 		t.Fatalf("missing positive target economics: %+v", d)
 	}
+	if math.Abs(d.ExecutionReturnBps-d.ShrunkReturnBps) > 1e-12 {
+		t.Fatalf("execution forecast must remain the shrunk price return, not the inventory gradient: %+v", d)
+	}
+}
+
+func TestDynamicInventoryAimPriceBetaTargetCapsMarkedExposure(t *testing.T) {
+	in := dynamicInventoryAimInput()
+	d := EvaluateDynamicInventoryAim(DynamicInventoryAimConfig{
+		Enabled: true, PriceBetaTarget: .35,
+	}, in)
+	if !d.GatePassed || !d.PriceBetaCapApplied || d.PriceBetaTarget != .35 ||
+		d.AimTargetRatio > .35+1e-12 || d.AdjustedTargetRatio > .35+1e-12 {
+		t.Fatalf("price-beta target must cap the single inventory actuator: %+v", d)
+	}
+
+	in.CurrentInventoryRatio = .80
+	in.GrossInventoryReturnBps = -80
+	d = EvaluateDynamicInventoryAim(DynamicInventoryAimConfig{
+		Enabled: true, PriceBetaTarget: .35,
+	}, in)
+	if !d.GatePassed || d.AdjustedTargetRatio >= in.CurrentInventoryRatio || d.AdjustedTargetRatio > .35+1e-12 {
+		t.Fatalf("price-beta target must also de-risk an already overweight inventory: %+v", d)
+	}
+}
+
+func TestDynamicInventoryAimSeparatesRiskGradientFromExecutionReturn(t *testing.T) {
+	in := dynamicInventoryAimInput()
+	in.CurrentInventoryRatio = 0.01
+	in.PolicyTargetRatio = 0.50
+	in.GrossInventoryReturnBps = 1
+	in.PredictiveVarianceBps2 = 10_000
+	in.EffectiveSamples = 64
+	d := EvaluateDynamicInventoryAim(DynamicInventoryAimConfig{Enabled: true}, in)
+	if !d.GatePassed {
+		t.Fatalf("test signal should pass the target gate: %+v", d)
+	}
+	if math.Abs(d.ExecutionReturnBps) > 2 || math.Abs(d.NetReturnBps) < math.Abs(d.ExecutionReturnBps) {
+		t.Fatalf("risk gradient and executable forecast were not separated: %+v", d)
+	}
 }
 
 func TestDynamicInventoryAimNegativeSignalIsSymmetric(t *testing.T) {
@@ -173,5 +212,108 @@ func TestDynamicInventoryAimFasterAdjustmentMovesMoreInitially(t *testing.T) {
 	if dFast.AdjustedTargetRatio <= dSlow.AdjustedTargetRatio ||
 		dFast.AdjustmentFraction <= dSlow.AdjustmentFraction {
 		t.Fatalf("larger adjustment period should move more toward the same aim: fast=%+v slow=%+v", dFast, dSlow)
+	}
+}
+
+func TestDynamicInventoryAimRegimeConditionedTargetIsSingleOutput(t *testing.T) {
+	in := dynamicInventoryAimInput()
+	in.CurrentInventoryRatio = 0.50
+	in.PolicyTargetRatio = 0.50
+	in.GrossInventoryReturnBps = -80
+	in.RegimeConditioned = RegimeConditionedTargetInput{
+		FastPosterior: 0.05, FastConfidence: 0.9, FastEffectiveSamples: 100,
+		BOCPDPosterior: 0.10, BOCPDConfidence: 0.8, BOCPDEffectiveSamples: 80,
+		HorizonPosterior: 0.15, HorizonConfidence: 1, HorizonEffectiveSamples: 40,
+	}
+	d := EvaluateDynamicInventoryAim(DynamicInventoryAimConfig{
+		Enabled: true,
+		RegimeConditionedTarget: RegimeConditionedTargetConfig{
+			Enabled: true, Kappa: 0.20, MaxShiftRatio: 0.20, PriorEffectiveSamples: 8,
+		},
+	}, in)
+	if !d.GatePassed || !d.Applied || !d.RegimeConditionedEnabled {
+		t.Fatalf("regime target should be the single active target actuator: %+v", d)
+	}
+	if d.AimTargetRatio >= in.PolicyTargetRatio || d.AdjustedTargetRatio >= in.PolicyTargetRatio {
+		t.Fatalf("bearish regime should lower both aim and adjusted target: %+v", d)
+	}
+	if d.TargetShiftRatio < -0.20 || d.TargetShiftRatio > 0.20 {
+		t.Fatalf("regime target exceeded configured shift cap: %+v", d)
+	}
+}
+
+func TestDynamicInventoryAimRegimeTargetRequiresEconomicBound(t *testing.T) {
+	in := dynamicInventoryAimInput()
+	in.CurrentInventoryRatio = 0.50
+	in.PolicyTargetRatio = 0.50
+	in.GrossInventoryReturnBps = 8
+	in.PredictiveVarianceBps2 = 400
+	in.RegimeConditioned = RegimeConditionedTargetInput{
+		FastPosterior: 1, FastConfidence: 1, FastEffectiveSamples: 100,
+		BOCPDPosterior: 1, BOCPDConfidence: 1, BOCPDEffectiveSamples: 100,
+	}
+	d := EvaluateDynamicInventoryAim(DynamicInventoryAimConfig{
+		Enabled: true,
+		RegimeConditionedTarget: RegimeConditionedTargetConfig{
+			Enabled: true, Kappa: 0.20, MaxShiftRatio: 0.20, PriorEffectiveSamples: 8,
+		},
+	}, in)
+	if d.GatePassed || d.Applied || d.AdjustedTargetRatio != in.PolicyTargetRatio {
+		t.Fatalf("weak terminal wealth evidence must not move the regime target: %+v", d)
+	}
+}
+
+func TestDynamicInventoryAimPivotRegimeIsContinuousSingleActuator(t *testing.T) {
+	in := dynamicInventoryAimInput()
+	in.CurrentInventoryRatio = 0.50
+	in.PolicyTargetRatio = 0.50
+	in.PivotRegimeDecision = PivotRegimeDecision{
+		Ready: true, Healthy: true, Direction: 1,
+		RemainingAmplitudeBps: 60, ExpectedLegAmplitudeBps: 100,
+		Reliability: 0.5, CompletedLegSamples: 2,
+	}
+	in.PivotRegimeDecisionSupplied = true
+	d := EvaluateDynamicInventoryAim(DynamicInventoryAimConfig{
+		Enabled: true,
+		PivotRegimeTarget: PivotRegimeTargetConfig{
+			Enabled: true, ReversalBps: 26, MaxShiftRatio: 0.20,
+		},
+		// If this accidentally stacks, the test would exercise the old ML path.
+		RegimeConditionedTarget: RegimeConditionedTargetConfig{
+			Enabled: true, Kappa: 0.20, MaxShiftRatio: 0.20, PriorEffectiveSamples: 8,
+		},
+	}, in)
+	if !d.GatePassed || !d.Applied || !d.PivotRegimeEnabled || !d.PivotRegimeReady {
+		t.Fatalf("fee-positive pivot state should drive the target actuator: %+v", d)
+	}
+	if d.AimTargetRatio <= in.PolicyTargetRatio || d.AdjustedTargetRatio <= in.CurrentInventoryRatio {
+		t.Fatalf("positive remaining up-leg should increase the target continuously: %+v", d)
+	}
+	if d.TargetShiftRatio <= 0 || d.TargetShiftRatio > 0.20+1e-12 || d.PivotRegimeQuantityScale <= 0 {
+		t.Fatalf("pivot shift must be bounded and scaled by reliability: %+v", d)
+	}
+	if d.ExecutionReturnBps != 0 {
+		t.Fatalf("pivot geometry must not become an uncalibrated Fast price forecast: %+v", d)
+	}
+}
+
+func TestDynamicInventoryAimPivotRegimeFeeFailureRetainsPolicy(t *testing.T) {
+	in := dynamicInventoryAimInput()
+	in.CurrentInventoryRatio = 0.50
+	in.PolicyTargetRatio = 0.50
+	in.OneWayExecutionCostBps = 20
+	in.PivotRegimeDecision = PivotRegimeDecision{
+		Ready: true, Healthy: true, Direction: -1,
+		RemainingAmplitudeBps: 19, ExpectedLegAmplitudeBps: 100,
+		Reliability: 1, CompletedLegSamples: 4,
+	}
+	in.PivotRegimeDecisionSupplied = true
+	d := EvaluateDynamicInventoryAim(DynamicInventoryAimConfig{
+		Enabled:           true,
+		PivotRegimeTarget: PivotRegimeTargetConfig{Enabled: true, MaxShiftRatio: 0.20},
+	}, in)
+	if d.GatePassed || d.Applied || d.TargetShiftRatio != 0 ||
+		d.AdjustedTargetRatio != in.PolicyTargetRatio {
+		t.Fatalf("remaining leg below fee must shrink to zero without changing policy target: %+v", d)
 	}
 }

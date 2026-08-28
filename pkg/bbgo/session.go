@@ -274,7 +274,20 @@ type ExchangeSession struct {
 
 	priceSolver *pricesolver.SimplePriceSolver
 
+	privateOrderFillLedger PrivateOrderFillLedger
+
 	AccountValueCalculator *AccountValueCalculator `json:"-" yaml:"-"`
+}
+
+// SetPrivateOrderFillLedger attaches the framework audit sink to executors
+// created for this session. It is called during BindSync, before strategies
+// construct their GeneralOrderExecutor instances.
+func (session *ExchangeSession) SetPrivateOrderFillLedger(ledger PrivateOrderFillLedger) {
+	session.privateOrderFillLedger = ledger
+}
+
+func (session *ExchangeSession) privateOrderFillLedgerSink() PrivateOrderFillLedger {
+	return session.privateOrderFillLedger
 }
 
 // NewExchangeSession creates a new exchange session instance

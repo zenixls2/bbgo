@@ -34,8 +34,8 @@ func getTestClientOrSkip(t *testing.T) *RestClient {
 }
 
 func getPublicTestClientOrSkip(t *testing.T) *RestClient {
-	if b, _ := strconv.ParseBool(os.Getenv("CI")); b {
-		t.Skip("skip test for CI")
+	if os.Getenv("TEST_OKEX") != "1" {
+		t.Skip("requires live OKX API; set TEST_OKEX=1 to run")
 	}
 
 	client := NewClient()

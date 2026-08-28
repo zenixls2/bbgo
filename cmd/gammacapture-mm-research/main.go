@@ -118,12 +118,34 @@ func main() {
 	fixedInventorySkew := flag.Float64("fixed-inventory-skew-bps", -1, "evaluate only this inventory skew; negative keeps the training grid")
 	fixedVolatilityMult := flag.Float64("fixed-volatility-multiplier", 0, "evaluate only this volatility multiplier; zero keeps the training grid")
 	productionCompare := flag.Bool("production-compare", false, "compare legacy and horizon-touch policies with the production-state event replay")
+	relativeHoldRiskReplay := flag.Bool("relative-hold-risk-replay", false, "same-symbol matured one-hour paired replay of strategy versus Hold risk metrics")
+	relativeHoldRiskPreloadFrom := flag.String("relative-hold-risk-preload-from", "", "causal shadow preload start for Relative-Hold labels (RFC3339); empty uses the normal model warmup")
+	relativeHoldRiskCheckpoint := flag.String("relative-hold-risk-checkpoint", "", "0600 JSON checkpoint for Relative-Hold sufficient statistics and replay cursor")
+	enableAsymmetricRisk := flag.Bool("enable-asymmetric-risk", false, "research-only enable the corrected per-horizon Asymmetric risk candidate in production replay")
+	asymmetricRiskOnly := flag.Bool("asymmetric-risk-only", false, "research-only run only the paired legacy versus Asymmetric-risk component replay")
+	normalFlowPressureOnly := flag.Bool("normal-flow-pressure-only", false, "research-only run only the paired legacy versus bounded ordinary-flow pressure replay")
+	normalFlowPressureRiskBudgetScale := flag.Float64("normal-flow-pressure-risk-budget-scale", 1.0, "replay-only ordinary-flow quantity scale in (0,1]")
+	feeFreeCounterfactualOnly := flag.Bool("fee-free-counterfactual", false, "research-only compare fee-aware replay with accounting-free and policy-free counterfactuals")
+	regimeExpectedValueSizingOnly := flag.Bool("regime-expected-value-sizing", false, "research-only replace fee-net terminal rejection with continuous regime-conditioned quantity sizing")
+	horizonConditionedUtilitySizingOnly := flag.Bool("horizon-conditioned-utility-sizing", false, "research-only paired strategy replay with pivot-continuation quantity utility")
+	normalFlowPressureDistributionStudy := flag.Bool("normal-flow-pressure-distribution-study", false, "standalone prequential screen of ordinary-flow signal distribution corrections")
+	normalFlowPressureDistributionHorizon := flag.Duration("normal-flow-pressure-distribution-horizon", 15*time.Minute, "forward executable-BBO label horizon for --normal-flow-pressure-distribution-study")
+	normalFlowPressureDistributionInterval := flag.Duration("normal-flow-pressure-distribution-interval", 15*time.Minute, "non-overlapping prediction anchor spacing for --normal-flow-pressure-distribution-study")
+	normalFlowPressureDistributionFlowWindow := flag.Duration("normal-flow-pressure-distribution-flow-window", 5*time.Minute, "causal signed-trade window for --normal-flow-pressure-distribution-study")
 	quoteLifecycleComponentOnly := flag.Bool("quote-lifecycle-component-only", false, "production replay only the legacy and Bellman lifecycle arms")
+	targetActionValueCompare := flag.Bool("target-action-value-compare", false, "paired production replay of the retired stacked target and the single target-relative action value")
+	pivotRegimeTargetCompare := flag.Bool("pivot-regime-target-compare", false, "paired production replay of the current 50% target versus the causal pivot-regime target")
+	causalRegimeInventoryTargetCompare := flag.Bool("causal-regime-inventory-target-compare", false, "paired production replay of the current target versus the full-range causal pivot-regime CE target")
 	replayBBOInterval := flag.Duration("replay-bbo-interval", 0, "replay-only BBO bucket interval; zero keeps every compacted event")
 	macroReversalCompare := flag.Bool("macro-reversal-compare", false, "compare confirmed-only and early-sequential Macro reversal paths")
 	quantityProjectionCompare := flag.Bool("quantity-projection-compare", false, "compare staged and probability-centered quantity policies")
 	quantityProjectionCurrentOnly := flag.Bool("quantity-projection-current-only", false, "run only the current probability-centered policy")
 	dynamicInventoryAimCompare := flag.Bool("dynamic-inventory-aim-compare", false, "paired component replay of baseline versus the fee/risk-gated dynamic inventory aim")
+	priceBetaControlCompare := flag.Bool("price-beta-control-compare", false, "paired replay of current dynamic inventory aim versus a marked-inventory beta target cap")
+	priceBetaTarget := flag.Float64("price-beta-target", 0.35, "research-only marked inventory beta target for --price-beta-control-compare")
+	dynamicPriceBetaTargetStudy := flag.Bool("dynamic-price-beta-target-study", false, "standalone causal screen of the state-dependent chase beta cap")
+	dynamicPriceBetaTargetHorizon := flag.Duration("dynamic-price-beta-target-horizon", 15*time.Minute, "primary causal horizon for --dynamic-price-beta-target-study")
+	dynamicPriceBetaTargetInterval := flag.Duration("dynamic-price-beta-target-interval", time.Minute, "BBO sampling interval for --dynamic-price-beta-target-study")
 	posteriorBaseInventoryTarget := flag.Bool("posterior-base-inventory-target", false, "research-only choose Fast inventory target from the executable-bid terminal-return posterior")
 	enableFastDrift := flag.Bool("enable-fast-drift", false, "research-only enable endogenous causal Fast reservation-price drift")
 	enableDynamicInventoryAim := flag.Bool("dynamic-inventory-aim", false, "research-only enable the unified fee/risk-gated inventory aim and partial-adjustment target")
@@ -133,6 +155,13 @@ func main() {
 	bocpd45SkillOnly := flag.Bool("bocpd45-skill-only", false, "research-only score 45-second executable-BBO BOCPD against a prequential climatology")
 	postFillUtilityCompare := flag.Bool("post-fill-utility-compare", false, "compare current policy with confidence-adjusted post-fill utility")
 	noTradeIOCCompare := flag.Bool("no-trade-ioc-compare", false, "comparison of trend/QV no-trade, legacy Macro, and bounded IOC")
+	continuationFastOnlyWFO := flag.Bool("continuation-fast-only-wfo", false, "paired chronological WFO of fixed-half Fast quotes versus a continuation-posterior target; research-only")
+	continuationWFOBlock := flag.Duration("continuation-wfo-block", 6*time.Hour, "chronological block size for --continuation-fast-only-wfo")
+	continuationWFOBBOInterval := flag.Duration("continuation-wfo-bbo-interval", 5*time.Second, "BBO interval for --continuation-fast-only-wfo; use 1s for final exact replay")
+	continuationWFOPriorStrength := flag.Float64("continuation-wfo-prior-strength", 0, "research-only prior-strength override for --continuation-fast-only-wfo; zero keeps YAML")
+	adaptivePathDecayWFO := flag.Bool("adaptive-path-decay-wfo", false, "paired chronological WFO of fixed versus adaptive path decay; research-only")
+	adaptivePathDecayWFOBlock := flag.Duration("adaptive-path-decay-wfo-block", 6*time.Hour, "chronological block size for --adaptive-path-decay-wfo")
+	adaptivePathDecayWFOBBOInterval := flag.Duration("adaptive-path-decay-wfo-bbo-interval", 5*time.Second, "BBO interval for --adaptive-path-decay-wfo; use 1s for final exact replay")
 	trendQVOnly := flag.Bool("trend-qv-only", false, "with --no-trade-ioc-compare, run only trend-excursion+ioc and qv-only+ioc")
 	continuationQVOnly := flag.Bool("continuation-qv-only", false, "with --no-trade-ioc-compare, run only qv-continuation+ioc and qv-only+ioc")
 	fastVarianceQVOnly := flag.Bool("fast-variance-qv-only", false, "with --no-trade-ioc-compare, run only qv-fast-variance+ioc and qv-only+ioc")
@@ -158,10 +187,59 @@ func main() {
 	rangeWindow := flag.Duration("range-window", 12*time.Hour, "window length for blind ranging-regime selection")
 	rangeStep := flag.Duration("range-step", 6*time.Hour, "candidate step for blind ranging-regime selection")
 	rangeCount := flag.Int("range-count", 6, "maximum non-overlapping ranging windows to report")
+	regimePersistenceStudy := flag.Bool("regime-persistence-study", false, "standalone causal comparison of raw combined regime tags versus slow persistent tags")
+	regimePersistenceHorizon := flag.Duration("regime-persistence-horizon", 15*time.Minute, "forward executable-BBO markout horizon for --regime-persistence-study")
+	regimePersistenceInterval := flag.Duration("regime-persistence-interval", 5*time.Minute, "causal BBO sampling interval for --regime-persistence-study")
+	regimePersistenceSlowLookback := flag.Duration("regime-persistence-slow-lookback", 30*time.Minute, "slow score lookback for --regime-persistence-study")
+	regimePersistenceVolatilityWindow := flag.Duration("regime-persistence-volatility-window", 30*time.Minute, "causal volatility window for --regime-persistence-study")
+	regimePersistenceCost := flag.Float64("regime-persistence-round-trip-cost-bps", 20, "round-trip fee/adverse-selection cost used only for regime markout labels")
+	regimePersistenceHalfLife := flag.Duration("regime-persistence-half-life", 15*time.Minute, "slow-score smoothing half-life for --regime-persistence-study")
+	regimePersistenceEnter := flag.Float64("regime-persistence-enter-threshold", 0.35, "absolute slow-score entry threshold for --regime-persistence-study")
+	regimePersistenceExit := flag.Float64("regime-persistence-exit-threshold", 0.15, "absolute slow-score exit threshold for --regime-persistence-study")
+	regimePersistenceConfirmations := flag.Int("regime-persistence-confirmations", 2, "consecutive model buckets required for a state change")
+	regimePersistenceMinDuration := flag.Duration("regime-persistence-min-duration", 10*time.Minute, "minimum non-neutral regime duration")
+	pivotThresholdStudy := flag.Bool("pivot-threshold-study", false, "standalone causal fit of raw regime thresholds against executable pivot outcomes")
+	pivotThresholdBps := flag.Float64("pivot-threshold-bps", 26, "economic first-passage pivot threshold in bps for --pivot-threshold-study")
+	pivotThresholdTrainTo := flag.String("pivot-threshold-train-to", "", "training split end for --pivot-threshold-study (RFC3339 or date)")
+	pivotThresholdValidationTo := flag.String("pivot-threshold-validation-to", "", "validation split end for --pivot-threshold-study (RFC3339 or date)")
+	pivotRegimeStudy := flag.Bool("pivot-regime-study", false, "standalone causal pivot-source-of-truth regime and sizing replay")
+	pivotRegimeCost := flag.Float64("pivot-regime-cost-bps", 20, "fee/adverse-selection cost for --pivot-regime-study")
+	pivotRegimeRiskPenalty := flag.Float64("pivot-regime-risk-penalty-bps", 0, "additional risk penalty for --pivot-regime-study")
+	pivotRegimeMaxGap := flag.Duration("pivot-regime-max-gap", 15*time.Minute, "maximum BBO gap before the pivot leg resets")
+	pivotRegimeTrainTo := flag.String("pivot-regime-train-to", "", "training split end for --pivot-regime-study (RFC3339 or date)")
+	pivotRegimeValidationTo := flag.String("pivot-regime-validation-to", "", "validation split end for --pivot-regime-study (RFC3339 or date)")
+	causalRegimeInventoryTargetStudy := flag.Bool("causal-regime-inventory-target-study", false, "standalone causal pivot-regime target study; 50% is a soft prior and [0,1] are the only hard bounds")
+	causalRegimeTargetAnchorStep := flag.Duration("causal-regime-target-anchor-step", 15*time.Minute, "non-overlapping anchor spacing for --causal-regime-inventory-target-study")
+	causalRegimeTargetReversalBps := flag.Float64("causal-regime-target-reversal-bps", 26, "economic pivot reversal threshold for --causal-regime-inventory-target-study")
+	causalRegimeTargetMaxGap := flag.Duration("causal-regime-target-max-gap", 15*time.Minute, "maximum BBO gap before the causal pivot state resets")
+	causalRegimeTargetCost := flag.Float64("causal-regime-target-cost-bps", 12, "one-way fee/adverse-selection cost in the causal target objective")
+	causalRegimeTargetRiskAversion := flag.Float64("causal-regime-target-risk-aversion", 0.02, "risk-aversion coefficient in 1/bps for the causal target objective")
+	causalRegimeTargetPriorStrength := flag.Float64("causal-regime-target-prior-strength-bps", 8, "soft 50% prior strength in bps for the causal target objective")
+	terminalWealthPivotStudy := flag.Bool("terminal-wealth-pivot-study", false, "standalone paired terminal-wealth versus pivot-to-pivot validation")
+	terminalWealthPivotReversalBps := flag.Float64("terminal-wealth-pivot-reversal-bps", 26, "pivot reversal threshold for --terminal-wealth-pivot-study")
+	terminalWealthPivotStep := flag.Duration("terminal-wealth-pivot-step", 15*time.Minute, "non-overlapping causal anchor spacing for --terminal-wealth-pivot-study")
+	terminalWealthPivotMaxGap := flag.Duration("terminal-wealth-pivot-max-gap", 15*time.Minute, "maximum BBO gap before pivot state reset for --terminal-wealth-pivot-study")
+	terminalWealthPivotHorizons := flag.String("terminal-wealth-pivot-horizons", "15m,30m", "comma-separated terminal wealth horizons for --terminal-wealth-pivot-study")
+	terminalWealthPivotBBOInterval := flag.Duration("terminal-wealth-pivot-bbo-interval", time.Second, "BBO retention interval for --terminal-wealth-pivot-study; 1s matches the model clock")
+	horizonConditionedUtilityStudy := flag.Bool("horizon-conditioned-utility-study", false, "standalone causal short-terminal plus pivot-continuation quantity utility study")
+	horizonConditionedShortHorizon := flag.Duration("horizon-conditioned-short-horizon", 15*time.Minute, "short executable horizon for --horizon-conditioned-utility-study")
+	horizonConditionedContinuationHorizon := flag.Duration("horizon-conditioned-continuation-horizon", time.Hour, "continuation executable horizon for --horizon-conditioned-utility-study")
+	horizonConditionedAnchorStep := flag.Duration("horizon-conditioned-anchor-step", 15*time.Minute, "non-overlapping causal anchor spacing for --horizon-conditioned-utility-study")
+	horizonConditionedQuoteDistance := flag.Float64("horizon-conditioned-quote-distance-bps", 15, "fixed passive quote distance for --horizon-conditioned-utility-study")
+	horizonConditionedBBOInterval := flag.Duration("horizon-conditioned-bbo-interval", time.Second, "BBO retention interval for --horizon-conditioned-utility-study")
+	causalKlinePivotStudy := flag.Bool("causal-kline-pivot-study", false, "standalone causal delayed-label Kline pivot learner study")
+	causalKlinePivotHorizon := flag.Duration("causal-kline-pivot-horizon", 15*time.Minute, "executable-BBO evaluation horizon for --causal-kline-pivot-study")
+	causalKlinePivotAnchorStep := flag.Duration("causal-kline-pivot-anchor-step", 15*time.Minute, "non-overlapping prediction spacing for --causal-kline-pivot-study")
+	causalKlinePivotCost := flag.Float64("causal-kline-pivot-cost-bps", 26, "complete fee/adverse-selection/residual cost for --causal-kline-pivot-study")
+	causalKlinePivotTrainTo := flag.String("causal-kline-pivot-train-to", "", "training split end for --causal-kline-pivot-study (RFC3339 or date)")
+	causalKlinePivotValidationTo := flag.String("causal-kline-pivot-validation-to", "", "validation split end for --causal-kline-pivot-study (RFC3339 or date)")
 	regimeHorizon := flag.Duration("regime-horizon", 3*time.Hour, "executable first-passage horizon for the standalone regime study")
 	regimeAnchorStep := flag.Duration("regime-anchor-step", 3*time.Hour, "non-overlapping prediction anchor spacing for the standalone regime study")
 	maxDrawdownStopPct := flag.Float64("max-drawdown-stop-pct", 0, "stop production replay when equity drawdown reaches this percentage; zero disables")
 	replayCacheDir := flag.String("replay-cache-dir", "data/gammacapture/state/replay-cache", "deterministic parsed replay cache; empty disables")
+	validationStage := flag.String("validation-stage", "auto", "production replay stage: auto runs full replay but blocks promotion on calibration failure; calibration only; or full")
+	replayMaxRuntime := flag.Duration("replay-max-runtime", 10*time.Minute, "hard wall-clock limit for production replay; zero disables")
+	allowUncalibratedReplay := flag.Bool("allow-uncalibrated-replay", false, "deprecated compatibility flag; uncalibrated full replay is always diagnostic")
 	cpuProfilePath := flag.String("cpu-profile", "", "write a Go CPU profile for replay performance analysis")
 	overrideRiskBudgetRatio := flag.Float64("override-inventory-risk-budget-ratio", -1, "research-only inventory risk budget ratio")
 	overrideRiskZScore := flag.Float64("override-inventory-risk-z-score", -1, "research-only inventory confidence z-score")
@@ -175,6 +253,7 @@ func main() {
 	overrideMacroCarryBudget := flag.Float64("override-macro-carry-risk-budget-ratio", -1, "research-only Macro carry risk budget ratio")
 	overrideMacroBarInterval := flag.Duration("override-macro-bar-interval", -1, "research-only Macro bar interval")
 	disableJointDistanceQuantity := flag.Bool("disable-joint-distance-quantity", false, "research-only disable joint distance/quantity optimizer")
+	disableAdaptivePathDecay := flag.Bool("disable-adaptive-path-decay", false, "research-only compare fixed sqrt(horizon*lookback) path decay")
 	disableConditionalExecution := flag.Bool("disable-conditional-execution", false, "research-only use unconditional crossing/path statistics and outward quotes only")
 	activateJointDistanceQuantity := flag.Bool("activate-joint-distance-quantity", false, "research-only activate joint distance/quantity optimizer even when production is shadow-only")
 	enablePathUtilityHorizon := flag.Bool("enable-path-utility-horizon-selection", false, "research-only select each Fast horizon by its own bilateral terminal path utility")
@@ -184,6 +263,7 @@ func main() {
 	overrideJointDistanceCandidates := flag.Int("override-joint-distance-candidates", -1, "research-only joint distance ladder candidate count")
 	replayFrom := flag.String("replay-from", "", "exact Macro replay start (RFC3339)")
 	replayTo := flag.String("replay-to", "", "exact Macro replay end (RFC3339)")
+	productionWarmupFrom := flag.String("production-warmup-from", "", "research-only exact causal warmup start for production replay (RFC3339); empty derives it from config")
 	configPath := flag.String("config", "config/gammacapture.yaml", "GammaCapture YAML configuration used by production replay")
 	horizonTouchPath := flag.String("horizon-touch-model", "config/gammacapture-horizon-touch-soljpy.json", "accepted horizon-touch artifact used by production replay")
 	pairEquity := flag.Float64("pair-equity-jpy", 7_255, "starting SOLJPY quote-equivalent equity for production replay")
@@ -193,7 +273,7 @@ func main() {
 	calibrationTo := flag.String("calibration-to", "2026-07-25T15:51:30Z", "production replay calibration end (RFC3339 or date)")
 	actualBuyFills := flag.Int("actual-buy-fills", 2, "confirmed maker BUY fills in the calibration interval (overridden by --journal-data)")
 	actualSellFills := flag.Int("actual-sell-fills", 1, "confirmed maker SELL fills in the calibration interval (overridden by --journal-data)")
-	journalData := flag.String("journal-data", "", "exported userspace journal JSONL; reconstructs actual gcmm LIMIT_MAKER lifecycles")
+	journalData := flag.String("journal-data", "", "exported userspace journal JSONL (use - for stdin); reconstructs actual gcmm LIMIT_MAKER lifecycles")
 	lifecycleOnly := flag.Bool("lifecycle-only", false, "report journal maker lifecycles without replaying either quote policy")
 	flag.Parse()
 	activeProductionEarlyStatisticalRealignment = *earlyStatisticalRealignment
@@ -211,6 +291,7 @@ func main() {
 		MacroCarryRiskBudget:          *overrideMacroCarryBudget,
 		MacroBarInterval:              *overrideMacroBarInterval,
 		DisableJointDistanceQuantity:  *disableJointDistanceQuantity,
+		DisableAdaptivePathDecay:      *disableAdaptivePathDecay,
 		DisableConditionalExecution:   *disableConditionalExecution,
 		ActivateJointDistanceQuantity: *activateJointDistanceQuantity,
 		EnablePathUtilityHorizon:      *enablePathUtilityHorizon,
@@ -238,7 +319,7 @@ func main() {
 	}
 	trainStart, trainEnd := parseDate(*trainFrom), parseDate(*trainTo)
 	holdStart, holdEnd := parseDate(*holdoutFrom), parseDate(*holdoutTo)
-	if !trainStart.Before(trainEnd) || !holdStart.Before(holdEnd) || *fee < 0 || *takerFee < 0 || *acquisitionSlippage < 0 || *adverse < 0 || *quoteLifecycleReplacementCost < 0 || *replayBBOInterval < 0 || *inventoryLimit <= 0 || *inventoryTargetRatio < 0 || *inventoryTargetRatio > 1 || *quoteNotional <= 0 || *minOrderNotional <= 0 || *statsQuoteDistance <= 0 || *minTradingWindow <= 0 || *maxTradingWindow < *minTradingWindow {
+	if !trainStart.Before(trainEnd) || !holdStart.Before(holdEnd) || *fee < 0 || *takerFee < 0 || *acquisitionSlippage < 0 || *adverse < 0 || *quoteLifecycleReplacementCost < 0 || *replayBBOInterval < 0 || *replayMaxRuntime < 0 || *inventoryLimit <= 0 || *inventoryTargetRatio < 0 || *inventoryTargetRatio > 1 || *quoteNotional <= 0 || *minOrderNotional <= 0 || *statsQuoteDistance <= 0 || *minTradingWindow <= 0 || *maxTradingWindow < *minTradingWindow {
 		fatalf("invalid date or fee/inventory configuration")
 	}
 	if *volumeTerminalRegimeCompare {
@@ -247,6 +328,24 @@ func main() {
 			ReplayCacheDir: *replayCacheDir, PairEquityJPY: *pairEquity,
 			StartingBase: *startingBase, QueueMultiplier: *queueMultiplier,
 			FillCoverage: *volumeProfileFillCoverage,
+		})
+		return
+	}
+	if *relativeHoldRiskReplay {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--relative-hold-risk-replay requires --replay-from and --replay-to")
+		}
+		if *pairEquity <= 0 || *startingBase < 0 || *regimeHorizon <= 0 {
+			fatalf("relative-hold replay requires positive pair equity, non-negative starting base, and horizon")
+		}
+		runRelativeHoldRiskReplay(relativeHoldRiskReplayInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			PreloadFrom:   parseOptionalTime(*relativeHoldRiskPreloadFrom),
+			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			QueueMultiplier: *queueMultiplier, ReplayCacheDir: *replayCacheDir,
+			BBOInterval: *replayBBOInterval, Horizon: *regimeHorizon,
+			MaxDrawdownStopPct: *maxDrawdownStopPct, CheckpointPath: *relativeHoldRiskCheckpoint,
 		})
 		return
 	}
@@ -286,6 +385,177 @@ func main() {
 			DataPath: *bboData, Symbol: *symbol, From: parseTime(*replayFrom), To: parseTime(*replayTo),
 			Window: *rangeWindow, Step: *rangeStep, MaximumWindows: *rangeCount,
 			EconomicPivotBps: 2*(*fee+*adverse) + *minimumEdge,
+		})
+		return
+	}
+	if *regimePersistenceStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--regime-persistence-study requires --replay-from and --replay-to")
+		}
+		runRegimePersistenceStudy(regimePersistenceStudyInput{
+			DataPath: *bboData, Symbol: *symbol, From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			SampleInterval: *regimePersistenceInterval, Horizon: *regimePersistenceHorizon,
+			SlowLookback: *regimePersistenceSlowLookback, VolatilityWindow: *regimePersistenceVolatilityWindow,
+			RoundTripCostBps: *regimePersistenceCost,
+			FilterConfig: gammacapture.RegimePersistenceConfig{
+				UpdateInterval: *regimePersistenceInterval, SmoothingHalfLife: *regimePersistenceHalfLife,
+				EnterThreshold: *regimePersistenceEnter, ExitThreshold: *regimePersistenceExit,
+				MinConfirmations: *regimePersistenceConfirmations, MinStateDuration: *regimePersistenceMinDuration,
+				MaxGap: 2 * (*regimePersistenceInterval),
+			},
+		})
+		return
+	}
+	if *pivotThresholdStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--pivot-threshold-study requires --replay-from and --replay-to")
+		}
+		pivotFrom, pivotTo := parseTime(*replayFrom), parseTime(*replayTo)
+		trainTo := parseOptionalTime(*pivotThresholdTrainTo)
+		validationTo := parseOptionalTime(*pivotThresholdValidationTo)
+		if trainTo.IsZero() || validationTo.IsZero() {
+			duration := pivotTo.Sub(pivotFrom)
+			trainTo = pivotFrom.Add(duration / 2)
+			validationTo = pivotFrom.Add(3 * duration / 4)
+		}
+		if *pivotThresholdBps <= 0 {
+			fatalf("--pivot-threshold-bps must be positive")
+		}
+		runPivotThresholdStudy(pivotThresholdStudyInput{
+			DataPath: *bboData, Symbol: *symbol, From: pivotFrom, To: pivotTo,
+			TrainTo: trainTo, ValidationTo: validationTo,
+			SampleInterval: *regimePersistenceInterval, SlowLookback: *regimePersistenceSlowLookback,
+			VolatilityWind: *regimePersistenceVolatilityWindow, Horizon: *regimePersistenceHorizon,
+			PivotBps: *pivotThresholdBps, CostBps: *regimePersistenceCost,
+		})
+		return
+	}
+	if *pivotRegimeStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--pivot-regime-study requires --replay-from and --replay-to")
+		}
+		if *pivotRegimeCost < 0 || *pivotRegimeRiskPenalty < 0 || *pivotRegimeMaxGap <= 0 {
+			fatalf("--pivot-regime-study requires non-negative cost/risk and positive max gap")
+		}
+		pivotFrom, pivotTo := parseTime(*replayFrom), parseTime(*replayTo)
+		pivotTrainTo := parseOptionalTime(*pivotRegimeTrainTo)
+		pivotValidationTo := parseOptionalTime(*pivotRegimeValidationTo)
+		runPivotRegimeStudy(pivotRegimeStudyInput{
+			DataPath: *bboData, Symbol: *symbol,
+			From: pivotFrom, TrainTo: pivotTrainTo, ValidationTo: pivotValidationTo, To: pivotTo,
+			SampleInterval: *regimePersistenceInterval, Horizon: *regimePersistenceHorizon,
+			CostBps: *pivotRegimeCost, RiskPenaltyBps: *pivotRegimeRiskPenalty, MaxGap: *pivotRegimeMaxGap,
+		})
+		return
+	}
+	if *causalRegimeInventoryTargetStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--causal-regime-inventory-target-study requires --replay-from and --replay-to")
+		}
+		if *causalRegimeTargetAnchorStep <= 0 || *causalRegimeTargetReversalBps <= 0 ||
+			*causalRegimeTargetMaxGap <= 0 || *causalRegimeTargetCost < 0 ||
+			*causalRegimeTargetRiskAversion <= 0 || *causalRegimeTargetPriorStrength <= 0 {
+			fatalf("invalid causal regime inventory target study parameters")
+		}
+		causalFrom, causalTo := parseTime(*replayFrom), parseTime(*replayTo)
+		causalTrainTo := parseOptionalTime(*pivotRegimeTrainTo)
+		causalValidationTo := parseOptionalTime(*pivotRegimeValidationTo)
+		runCausalRegimeInventoryTargetStudy(causalRegimeInventoryTargetStudyInput{
+			DataPath: *bboData, Symbol: *symbol, From: causalFrom,
+			TrainTo: causalTrainTo, ValidationTo: causalValidationTo, To: causalTo,
+			AnchorStep:       *causalRegimeTargetAnchorStep,
+			PivotReversalBps: *causalRegimeTargetReversalBps,
+			PivotMaxGap:      *causalRegimeTargetMaxGap,
+			OneWayCostBps:    *causalRegimeTargetCost,
+			RiskAversion:     *causalRegimeTargetRiskAversion,
+			PriorStrengthBps: *causalRegimeTargetPriorStrength,
+		})
+		return
+	}
+	if *terminalWealthPivotStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--terminal-wealth-pivot-study requires --replay-from and --replay-to")
+		}
+		if *terminalWealthPivotReversalBps <= 0 || *terminalWealthPivotStep <= 0 || *terminalWealthPivotMaxGap <= 0 || *terminalWealthPivotBBOInterval <= 0 {
+			fatalf("--terminal-wealth-pivot-study requires positive pivot and sampling parameters")
+		}
+		horizons := parseDurationList(*terminalWealthPivotHorizons)
+		if len(horizons) == 0 {
+			fatalf("--terminal-wealth-pivot-horizons must contain at least one positive duration")
+		}
+		terminalFrom, terminalTo := parseTime(*replayFrom), parseTime(*replayTo)
+		runTerminalWealthPivotStudy(terminalWealthPivotStudyInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: terminalFrom, To: terminalTo, AnchorStep: *terminalWealthPivotStep,
+			PivotReversalBps: *terminalWealthPivotReversalBps, PivotMaxGap: *terminalWealthPivotMaxGap,
+			Horizons: horizons, PairEquityJPY: *pairEquity, BBOInterval: *terminalWealthPivotBBOInterval,
+		})
+		return
+	}
+	if *horizonConditionedUtilityStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--horizon-conditioned-utility-study requires --replay-from and --replay-to")
+		}
+		if *horizonConditionedShortHorizon <= 0 ||
+			*horizonConditionedContinuationHorizon <= *horizonConditionedShortHorizon ||
+			*horizonConditionedAnchorStep <= 0 || *horizonConditionedQuoteDistance <= 0 ||
+			*horizonConditionedBBOInterval <= 0 {
+			fatalf("invalid --horizon-conditioned-utility-study horizon, step, distance, or BBO interval")
+		}
+		utilityFrom, utilityTo := parseTime(*replayFrom), parseTime(*replayTo)
+		runHorizonConditionedUtilityStudy(horizonConditionedUtilityStudyInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: utilityFrom, To: utilityTo,
+			ShortHorizon:        *horizonConditionedShortHorizon,
+			ContinuationHorizon: *horizonConditionedContinuationHorizon,
+			AnchorStep:          *horizonConditionedAnchorStep,
+			PivotReversalBps:    *terminalWealthPivotReversalBps,
+			PivotMaxGap:         *terminalWealthPivotMaxGap,
+			QuoteDistanceBps:    *horizonConditionedQuoteDistance,
+			PairEquityJPY:       *pairEquity, BBOInterval: *horizonConditionedBBOInterval,
+		})
+		return
+	}
+	if *causalKlinePivotStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--causal-kline-pivot-study requires --replay-from and --replay-to")
+		}
+		if *causalKlinePivotHorizon <= 0 || *causalKlinePivotAnchorStep <= 0 || *causalKlinePivotCost < 0 {
+			fatalf("--causal-kline-pivot-study requires positive horizon/anchor step and non-negative cost")
+		}
+		klineFrom, klineTo := parseTime(*replayFrom), parseTime(*replayTo)
+		klineTrainTo := parseOptionalTime(*causalKlinePivotTrainTo)
+		klineValidationTo := parseOptionalTime(*causalKlinePivotValidationTo)
+		runCausalKlinePivotStudy(causalKlinePivotStudyInput{
+			DataPath: *bboData, Symbol: *symbol, From: klineFrom,
+			TrainTo: klineTrainTo, ValidationTo: klineValidationTo, To: klineTo,
+			Horizon: *causalKlinePivotHorizon, AnchorStep: *causalKlinePivotAnchorStep,
+			CostBps: *causalKlinePivotCost, Intervals: []time.Duration{3 * time.Minute, 5 * time.Minute},
+		})
+		return
+	}
+	if *dynamicPriceBetaTargetStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--dynamic-price-beta-target-study requires --replay-from and --replay-to")
+		}
+		runDynamicPriceBetaTargetStudy(dynamicPriceBetaTargetStudyInput{
+			DataPath: *bboData, Symbol: *symbol, From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			Horizon: *dynamicPriceBetaTargetHorizon, SampleInterval: *dynamicPriceBetaTargetInterval,
+			History: 6 * time.Hour, ReplayCacheDir: *replayCacheDir,
+		})
+		return
+	}
+	if *normalFlowPressureDistributionStudy {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--normal-flow-pressure-distribution-study requires --replay-from and --replay-to")
+		}
+		runNormalFlowPressureDistributionStudy(normalFlowPressureDistributionStudyInput{
+			DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			Horizon:        *normalFlowPressureDistributionHorizon,
+			SampleInterval: *normalFlowPressureDistributionInterval,
+			FlowWindow:     *normalFlowPressureDistributionFlowWindow,
+			ReplayCacheDir: *replayCacheDir, BBOInterval: *replayBBOInterval,
 		})
 		return
 	}
@@ -458,6 +728,38 @@ func main() {
 		})
 		return
 	}
+	if *continuationFastOnlyWFO {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--continuation-fast-only-wfo requires --replay-from and --replay-to")
+		}
+		if *pairEquity <= 0 || *startingBase < 0 || *queueMultiplier < 0 || *continuationWFOBlock <= 0 || *continuationWFOBBOInterval <= 0 {
+			fatalf("--continuation-fast-only-wfo requires positive balances, queue, block, and BBO interval")
+		}
+		runContinuationFastOnlyWFO(continuationFastOnlyWFOInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			QueueMultiplier: *queueMultiplier, ContinuationPriorStrength: *continuationWFOPriorStrength, ReplayCacheDir: *replayCacheDir,
+			Block: *continuationWFOBlock, BBOInterval: *continuationWFOBBOInterval,
+		})
+		return
+	}
+	if *adaptivePathDecayWFO {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--adaptive-path-decay-wfo requires --replay-from and --replay-to")
+		}
+		if *pairEquity <= 0 || *startingBase < 0 || *queueMultiplier < 0 || *adaptivePathDecayWFOBlock <= 0 || *adaptivePathDecayWFOBBOInterval <= 0 {
+			fatalf("--adaptive-path-decay-wfo requires positive balances, queue, block, and BBO interval")
+		}
+		runAdaptivePathDecayWFO(adaptivePathDecayWFOInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			QueueMultiplier: *queueMultiplier, ReplayCacheDir: *replayCacheDir,
+			Block: *adaptivePathDecayWFOBlock, BBOInterval: *adaptivePathDecayWFOBBOInterval,
+		})
+		return
+	}
 	if *bocpd45SkillOnly {
 		if *replayFrom == "" || *replayTo == "" {
 			fatalf("--bocpd45-skill-only requires --replay-from and --replay-to")
@@ -509,6 +811,23 @@ func main() {
 		})
 		return
 	}
+	if *priceBetaControlCompare {
+		if *replayFrom == "" || *replayTo == "" {
+			fatalf("--price-beta-control-compare requires --replay-from and --replay-to")
+		}
+		if *priceBetaTarget <= 0 || *priceBetaTarget > 1 {
+			fatalf("--price-beta-target must be in (0,1]")
+		}
+		runDynamicInventoryAimComparison(dynamicInventoryAimComparisonInput{
+			ConfigPath: *configPath, DataPath: *bboData, Symbol: *symbol,
+			From: parseTime(*replayFrom), To: parseTime(*replayTo),
+			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			QueueMultiplier: *queueMultiplier, ReplayCacheDir: *replayCacheDir,
+			BBOInterval: *replayBBOInterval, MaxDrawdownStopPct: *maxDrawdownStopPct,
+			PriceBetaControlOnly: true, PriceBetaTarget: *priceBetaTarget,
+		})
+		return
+	}
 	if *symmetricHorizonCompare {
 		if *replayFrom == "" || *replayTo == "" {
 			fatalf("--symmetric-horizon-action-compare requires --replay-from and --replay-to")
@@ -535,9 +854,12 @@ func main() {
 		})
 		return
 	}
-	if *productionCompare || *quoteLifecycleComponentOnly {
+	if *productionCompare || *quoteLifecycleComponentOnly || *targetActionValueCompare || *pivotRegimeTargetCompare || *causalRegimeInventoryTargetCompare || *normalFlowPressureOnly || *feeFreeCounterfactualOnly || *regimeExpectedValueSizingOnly || *horizonConditionedUtilitySizingOnly {
 		if *pairEquity <= 0 || *startingBase < 0 || *actualBuyFills < 0 || *actualSellFills < 0 {
 			fatalf("invalid production replay balance or fill calibration")
+		}
+		if *normalFlowPressureOnly && (*normalFlowPressureRiskBudgetScale <= 0 || *normalFlowPressureRiskBudgetScale > 1) {
+			fatalf("--normal-flow-pressure-risk-budget-scale must be in (0,1]")
 		}
 		productionFrom, productionTo := holdStart, holdEnd
 		// Date flags remain the default for the long canonical holdout, while
@@ -553,17 +875,39 @@ func main() {
 				fatalf("production replay start must be before end")
 			}
 		}
-		runProductionComparison(productionComparisonInput{
+		calibrationFromTime, calibrationToTime := selectProductionCalibrationRange(
+			productionFrom, productionTo, parseTime(*calibrationFrom), parseTime(*calibrationTo),
+			*replayFrom != "" || *replayTo != "", flagProvided("calibration-from"), flagProvided("calibration-to"))
+		if !calibrationFromTime.Before(calibrationToTime) {
+			fatalf("calibration start must be before calibration end")
+		}
+		productionReplayInput := productionComparisonInput{
 			ConfigPath: *configPath, ModelPath: *horizonTouchPath, DataPath: *bboData,
 			Symbol: *symbol, From: productionFrom, To: productionTo,
-			PairEquityJPY: *pairEquity, StartingBase: *startingBase,
+			ValidationStage: *validationStage,
+			WarmupFrom:      parseOptionalTime(*productionWarmupFrom),
+			PairEquityJPY:   *pairEquity, StartingBase: *startingBase,
 			QueueMultiplier: *queueMultiplier,
-			CalibrationFrom: parseTime(*calibrationFrom), CalibrationTo: parseTime(*calibrationTo),
+			CalibrationFrom: calibrationFromTime, CalibrationTo: calibrationToTime,
 			ActualBuyFills: *actualBuyFills, ActualSellFills: *actualSellFills,
-			JournalPath:    *journalData,
-			ReplayCacheDir: *replayCacheDir,
-			BBOInterval:    *replayBBOInterval,
-			ComponentOnly:  *quoteLifecycleComponentOnly,
+			JournalPath:                       *journalData,
+			ReplayCacheDir:                    *replayCacheDir,
+			BBOInterval:                       *replayBBOInterval,
+			ComponentOnly:                     *quoteLifecycleComponentOnly,
+			TargetActionValueOnly:             *targetActionValueCompare,
+			PivotRegimeTargetOnly:             *pivotRegimeTargetCompare,
+			CausalRegimeInventoryTargetOnly:   *causalRegimeInventoryTargetCompare,
+			EnableAsymmetricRisk:              *enableAsymmetricRisk,
+			AsymmetricRiskOnly:                *asymmetricRiskOnly,
+			NormalFlowPressureOnly:            *normalFlowPressureOnly,
+			NormalFlowPressureRiskBudgetScale: *normalFlowPressureRiskBudgetScale,
+			FeeFreeCounterfactualOnly:         *feeFreeCounterfactualOnly,
+			RegimeExpectedValueSizingOnly:     *regimeExpectedValueSizingOnly,
+			HorizonConditionedUtilityOnly:     *horizonConditionedUtilitySizingOnly,
+			AllowUncalibratedReplay:           *allowUncalibratedReplay,
+		}
+		runWithWallClockLimit(*replayMaxRuntime, func() {
+			runProductionComparison(productionReplayInput)
 		})
 		return
 	}
@@ -860,6 +1204,30 @@ func parseTime(v string) time.Time {
 		return t
 	}
 	return parseDate(v)
+}
+
+func parseOptionalTime(v string) time.Time {
+	if v == "" {
+		return time.Time{}
+	}
+	return parseTime(v)
+}
+
+func flagProvided(name string) bool {
+	provided := false
+	flag.CommandLine.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			provided = true
+		}
+	})
+	return provided
+}
+
+func selectProductionCalibrationRange(productionFrom, productionTo, configuredFrom, configuredTo time.Time, bounded, fromExplicit, toExplicit bool) (time.Time, time.Time) {
+	if bounded && !fromExplicit && !toExplicit {
+		return productionFrom, productionTo
+	}
+	return configuredFrom, configuredTo
 }
 
 func max(a, b int) int {

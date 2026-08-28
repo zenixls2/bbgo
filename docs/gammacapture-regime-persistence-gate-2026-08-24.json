@@ -1,0 +1,21 @@
+{
+  "name": "gammacapture-regime-persistence-slow-state-ethjpy-holdout",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 278.6558836225,
+  "minimum_effective_samples": 24.0,
+  "incremental_mean_bps": -1.9163433037,
+  "incremental_standard_error_bps": 2.2517989622,
+  "incremental_cost_bps": 0.0,
+  "risk_penalty_bps": 0.0,
+  "candidate_tests": 6,
+  "alpha": 0.05,
+  "positive_blocks": 4,
+  "total_blocks": 8,
+  "minimum_positive_blocks": 5,
+  "raw_eligible_pairs": 576,
+  "variance_inflation_factor": 2.0670656313,
+  "autocorrelation_lag": 12,
+  "dependence_window": "1h0m0s",
+  "effective_sample_method": "Bartlett HAC effective sample on paired incremental values"
+}

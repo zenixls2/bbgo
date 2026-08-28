@@ -13,18 +13,73 @@ import (
 )
 
 type makerStartupWarmupStats struct {
-	Files         int
-	TradeFiles    int
-	BBOUpdates    int
-	TradeUpdates  int
-	PendingTrades int
-	First         time.Time
-	Last          time.Time
+	Files                    int
+	TradeFiles               int
+	BBOUpdates               int
+	TradeUpdates             int
+	PendingTrades            int
+	PrivateCalibrationEvents int
+	RelativeHoldPrivateFills int
+	RelativeHoldLabels       int
+	RelativeHoldPreloadUsed  bool
+	First                    time.Time
+	Last                     time.Time
 }
 
 type makerStartupTrade struct {
 	when  time.Time
 	trade types.Trade
+}
+
+const makerStartupWarmupBBOInterval = time.Second
+
+// makerStartupBBOAccumulator keeps only the final observable BBO in each
+// warm-up second.  Model state is causal at the second close, so intermediate
+// quote churn cannot improve the rolling 10/15/30-minute estimators but does
+// multiply parsing and model-update work.  The gap flag is OR-ed across the
+// bucket so a reconnect marker is never lost by compaction.
+type makerStartupBBOAccumulator struct {
+	pending   bool
+	bucket    time.Time
+	at        time.Time
+	ticker    types.BookTicker
+	gapBefore bool
+	emit      func(time.Time, types.BookTicker, bool)
+}
+
+func (a *makerStartupBBOAccumulator) add(at time.Time, ticker types.BookTicker, gapBefore bool) {
+	bucket := at.Truncate(makerStartupWarmupBBOInterval)
+	if !a.pending {
+		a.pending = true
+		a.bucket = bucket
+		a.at = at
+		a.ticker = ticker
+		a.gapBefore = gapBefore
+		return
+	}
+	if !bucket.Equal(a.bucket) {
+		a.flush()
+		a.pending = true
+		a.bucket = bucket
+		a.at = at
+		a.ticker = ticker
+		a.gapBefore = gapBefore
+		return
+	}
+	a.at = at
+	a.ticker = ticker
+	a.gapBefore = a.gapBefore || gapBefore
+}
+
+func (a *makerStartupBBOAccumulator) flush() {
+	if !a.pending {
+		return
+	}
+	if a.emit != nil {
+		a.emit(a.at, a.ticker, a.gapBefore)
+	}
+	a.pending = false
+	a.gapBefore = false
 }
 
 // restoreAndWarmMakerModelsFromBinanceCapture restores the bounded live
@@ -34,9 +89,13 @@ type makerStartupTrade struct {
 // must survive a live restart even when aggTradeWarmup is disabled.
 //
 // If a compatible checkpoint is unavailable, the same causal BBO pipeline is
-// rebuilt from a bounded local-capture interval. Orders are reconciled only
+// rebuilt from a bounded local-capture interval. When Binance private trade
+// history is available, the Relative-Hold equity labels are reconstructed in
+// that same interval before the first live quote. Orders are reconciled only
 // after this method returns, so a restart never cancels the previous quotes and
-// then waits cold for model evidence.
+// then waits cold for model evidence. Relative-Hold uses the same
+// one-second causal BBO accumulator as the research preload, not a coarser
+// 5-minute aggregate.
 func (s *Strategy) restoreAndWarmMakerModelsFromBinanceCapture(now time.Time) error {
 	if !s.MarketMaker.Enabled {
 		return nil
@@ -67,10 +126,16 @@ func (s *Strategy) restoreAndWarmMakerModelsFromBinanceCapture(now time.Time) er
 		cursor = now.Add(-lookback)
 		tradeCursor = cursor
 	}
+	relativeHoldPreload := s.prepareRelativeHoldRiskLivePreload(cursor, now, restored)
 
 	stats, err := s.replayMakerCapture(cursor, tradeCursor, now, restored)
 	if err != nil {
 		return err
+	}
+	stats.RelativeHoldPrivateFills = relativeHoldPreload.PrivateTrades
+	stats.RelativeHoldPreloadUsed = relativeHoldPreload.Used
+	if s.makerRelativeHoldRisk != nil {
+		stats.RelativeHoldLabels = s.makerRelativeHoldRisk.SnapshotAt(now).MaturedLabels
 	}
 	if !restored && stats.BBOUpdates == 0 {
 		return fmt.Errorf("no valid Binance BBO observations in bounded startup window %s to %s", cursor, now)
@@ -90,34 +155,83 @@ func (s *Strategy) restoreAndWarmMakerModelsFromBinanceCapture(now time.Time) er
 	}
 	snapshot := s.model.Snapshot(now)
 	fast := s.adaptiveFastSnapshot(now)
+	relativeHold := RelativeHoldRiskState{Reason: "relative-hold risk disabled"}
+	if s.makerRelativeHoldRisk != nil {
+		relativeHold = s.makerRelativeHoldRisk.SnapshotAt(now)
+	}
 	bocpd45 := BOCPD45Snapshot{}
 	if s.makerBOCPD45 != nil {
-		bocpd45 = s.makerBOCPD45.Snapshot()
+		bocpd45 = s.makerBOCPD45.SnapshotAt(now)
 	}
+	privateFill := PrivateFillCalibrationSnapshot{Reason: "private-fill calibration disabled"}
+	if s.makerPrivateFillCalibration != nil {
+		privateFill = s.makerPrivateFillCalibration.SnapshotAt(now)
+	}
+	causalKlineDecision := s.makerCausalKlineDecision
+	causalKlineSnapshot := CausalKlinePivotSnapshot{}
+	if s.makerCausalKlinePivot != nil {
+		causalKlineSnapshot = s.makerCausalKlinePivot.Snapshot()
+	}
+	pivotTarget := s.MarketMaker.DynamicInventoryAim.PivotRegimeTarget
 	log.WithFields(map[string]interface{}{
-		"symbol":             s.Symbol,
-		"checkpointRestored": restored,
-		"replayAfter":        cursor,
-		"captureFiles":       stats.Files,
-		"tradeFiles":         stats.TradeFiles,
-		"bboUpdates":         stats.BBOUpdates,
-		"tradeUpdates":       stats.TradeUpdates,
-		"pendingTrades":      stats.PendingTrades,
-		"firstBBO":           stats.First,
-		"lastBBO":            stats.Last,
-		"slowHealth":         snapshot.Health,
-		"slowUp":             snapshot.Up,
-		"slowDown":           snapshot.Down,
-		"selectedFastWindow": fast.Window,
-		"fastHealth":         fast.Model.Health,
-		"fastUp":             fast.Model.Up,
-		"fastDown":           fast.Model.Down,
-		"fastEvidenceHealth": fast.Evidence.Health,
-		"bocpd45Enabled":     bocpd45.Enabled, "bocpd45Ready": bocpd45.Ready,
-		"bocpd45Calibration":        bocpd45.Calibration,
-		"bocpd45CalibrationReady":   bocpd45.CalibrationReady,
-		"bocpd45CalibrationSamples": bocpd45.CalibrationSamples,
-		"bocpd45MaturedLabels":      bocpd45.MaturedLabels,
+		"symbol":                       s.Symbol,
+		"checkpointRestored":           restored,
+		"replayAfter":                  cursor,
+		"captureFiles":                 stats.Files,
+		"tradeFiles":                   stats.TradeFiles,
+		"bboUpdates":                   stats.BBOUpdates,
+		"tradeUpdates":                 stats.TradeUpdates,
+		"pendingTrades":                stats.PendingTrades,
+		"privateFillCalibrationEvents": stats.PrivateCalibrationEvents,
+		"relativeHoldPreloadSource":    relativeHoldPreload.Source,
+		"relativeHoldPreloadFrom":      relativeHoldPreload.From,
+		"relativeHoldPreloadTo":        relativeHoldPreload.To,
+		"relativeHoldPrivateFills":     stats.RelativeHoldPrivateFills,
+		"relativeHoldPreloadUsed":      stats.RelativeHoldPreloadUsed,
+		"relativeHoldPreloadReason":    relativeHoldPreload.Reason,
+		"relativeHoldPreloadLabels":    stats.RelativeHoldLabels,
+		"firstBBO":                     stats.First,
+		"lastBBO":                      stats.Last,
+		"slowHealth":                   snapshot.Health,
+		"slowUp":                       snapshot.Up,
+		"slowDown":                     snapshot.Down,
+		"selectedFastWindow":           fast.Window,
+		"fastHealth":                   fast.Model.Health,
+		"fastUp":                       fast.Model.Up,
+		"fastDown":                     fast.Model.Down,
+		"fastEvidenceHealth":           fast.Evidence.Health,
+		"relativeHoldEnabled":          s.MarketMaker.RelativeHoldRisk.Enabled,
+		"relativeHoldReady":            relativeHold.Ready,
+		"relativeHoldMaturedLabels":    relativeHold.MaturedLabels,
+		"relativeHoldEffectiveSamples": relativeHold.EffectiveSamples,
+		"relativeHoldReason":           relativeHold.Reason,
+		"bocpd45Enabled":               bocpd45.Enabled, "bocpd45Ready": bocpd45.Ready,
+		"bocpd45Calibration":                   bocpd45.Calibration,
+		"bocpd45CalibrationReady":              bocpd45.CalibrationReady,
+		"bocpd45CalibrationSamples":            bocpd45.CalibrationSamples,
+		"bocpd45MaturedLabels":                 bocpd45.MaturedLabels,
+		"privateFillCalibrationEnabled":        privateFill.Enabled,
+		"privateFillCalibrationReady":          privateFill.Ready,
+		"privateFillCalibrationTouchReady":     privateFill.TouchReady,
+		"privateFillCalibrationStale":          privateFill.Stale,
+		"privateFillCalibrationFills":          privateFill.Fills,
+		"privateFillCalibrationEffectiveFills": privateFill.EffectiveFills,
+		"privateFillCalibrationReason":         privateFill.Reason,
+		"causalKlinePivotEnabled":              s.MarketMaker.CausalKlinePivot.Enabled,
+		"causalKlinePivotBars":                 len(causalKlineSnapshot.Bars),
+		"causalKlinePivotMaturedLabels":        causalKlineSnapshot.MaturedLabels,
+		"causalKlinePivotPredictionReady":      causalKlineDecision.PredictionReady,
+		"causalKlinePivotModelReady":           causalKlineDecision.ModelReady,
+		"causalKlinePivotReason":               causalKlineDecision.Reason,
+		"pivotRegimeEnabled":                   pivotTarget.Enabled || pivotTarget.CausalCEEnabled,
+		"pivotRegimeCausalCEEnabled":           pivotTarget.CausalCEEnabled,
+		"pivotRegimeReady":                     s.makerPivotRegimeDecision.Ready,
+		"pivotRegimeHealthy":                   s.makerPivotRegimeDecision.Healthy,
+		"pivotRegimeDirection":                 s.makerPivotRegimeDecision.Direction,
+		"pivotRegimeCompletedLegSamples":       s.makerPivotRegimeDecision.CompletedLegSamples,
+		"pivotRegimeRemainingBps":              s.makerPivotRegimeDecision.RemainingAmplitudeBps,
+		"pivotRegimeExpectedBps":               s.makerPivotRegimeDecision.ExpectedLegAmplitudeBps,
+		"pivotRegimeReason":                    s.makerPivotRegimeDecision.Reason,
 	}).Info("restored and warmed gamma-capture models from Binance capture")
 	return nil
 }
@@ -149,6 +263,29 @@ func (c MarketMakerConfig) RequiredStartupWarmup() time.Duration {
 	if c.MacroInventory.Enabled {
 		if candidate := c.MacroInventory.requiredHistory(); candidate > warmup {
 			warmup = candidate
+		}
+	}
+	if c.RelativeHoldRisk.Enabled {
+		requirement := c.RelativeHoldRisk.WarmupRequirement(time.Duration(c.HorizonUpdateInterval))
+		if requirement.Feasible && requirement.RequiredDuration > warmup {
+			warmup = requirement.RequiredDuration
+		}
+	}
+	if c.PrivateFillCalibration.Enabled {
+		// Include the fill-label horizon so a cold rebuild can mature private
+		// fills from the earliest replay point without reading future BBO data.
+		if horizon := time.Duration(c.PrivateFillCalibration.Horizon); horizon > warmup {
+			warmup = horizon
+		}
+	}
+	pivotTarget := c.DynamicInventoryAim.PivotRegimeTarget
+	if pivotTarget.CausalCEEnabled {
+		// The CE owner needs completed same-direction legs, not merely a
+		// healthy short-horizon quote model. Keep this bounded and explicit;
+		// the replay remains O(number of captured BBO rows) and is compacted to
+		// one causal observation per second before model updates.
+		if pivotWarmup := time.Duration(pivotTarget.StartupWarmup); pivotWarmup > warmup {
+			warmup = pivotWarmup
 		}
 	}
 	return warmup
@@ -185,7 +322,38 @@ func (s *Strategy) resetMakerLearningState() {
 	s.makerExecutableCrossingModel = NewExecutableCrossingModel(s.Symbol, s.Barrier, s.Intensity)
 	s.makerCheckpointCaptureFiles = nil
 	s.makerLastPublicTradeAt = time.Time{}
+	s.makerPrivateLedgerReplayOffset = 0
 	s.makerStartupPendingTrades = nil
+	s.makerRelativeHoldPrivateTrades = nil
+	s.makerRelativeHoldPrivateIndex = 0
+	s.makerRelativeHoldShadowBase = 0
+	s.makerRelativeHoldShadowQuote = 0
+	s.makerRelativeHoldShadowReady = false
+	s.makerRelativeHoldPreloadSource = ""
+	s.makerRelativeHoldInitialAt = time.Time{}
+	s.makerRelativeHoldInitialBase = 0
+	s.makerRelativeHoldInitialQuote = 0
+	s.makerRelativeHoldAnchor = nil
+	if s.MarketMaker.CausalKlinePivot.Enabled {
+		s.makerCausalKlineBuilder = NewCausalKlineBuilder(time.Duration(s.MarketMaker.CausalKlinePivot.Interval))
+		s.makerCausalKlinePivot = NewCausalKlinePivotLearner(s.MarketMaker.CausalKlinePivot)
+		s.makerCausalKlineDecision = CausalKlinePivotDecision{Reason: "causal Kline pivot learner warming"}
+	} else {
+		s.makerCausalKlineBuilder = nil
+		s.makerCausalKlinePivot = nil
+		s.makerCausalKlineDecision = CausalKlinePivotDecision{Reason: "causal Kline pivot learner disabled"}
+	}
+	pivotTarget := s.MarketMaker.DynamicInventoryAim.PivotRegimeTarget
+	if pivotTarget.Enabled || pivotTarget.CausalCEEnabled {
+		pivotTarget.setDefaults()
+		s.makerPivotRegimeFilter = NewPivotRegimeFilter(pivotTarget.filterConfig())
+		s.makerPivotRegimeDecision = PivotRegimeDecision{Reason: "pivot regime warming"}
+		s.makerCausalRegimeTargetDecision = CausalRegimeInventoryTargetDecision{Reason: "causal regime target warming"}
+	} else {
+		s.makerPivotRegimeFilter = nil
+		s.makerPivotRegimeDecision = PivotRegimeDecision{Reason: "pivot regime target disabled"}
+		s.makerCausalRegimeTargetDecision = CausalRegimeInventoryTargetDecision{Reason: "causal regime target disabled"}
+	}
 }
 
 func (s *Strategy) replayMakerCapture(bboCutoff, tradeCutoff, now time.Time, deltaOnly bool) (makerStartupWarmupStats, error) {
@@ -207,7 +375,18 @@ func (s *Strategy) replayMakerCapture(bboCutoff, tradeCutoff, now time.Time, del
 	stats := makerStartupWarmupStats{Files: len(files), TradeFiles: tradeFiles}
 	config := s.MarketMaker
 	config.setDefaults()
+	productionVersion := config.PrivateOrderFillLedger.ProductionVersion
+	if productionVersion == "" && s.EnvironmentRef != nil {
+		productionVersion = s.EnvironmentRef.ProductionVersion()
+	}
+	privateEvents, err := loadPrivateFillCalibrationLedger(
+		config.PrivateOrderFillLedger, s.Symbol, productionVersion, bboCutoff, now, deltaOnly,
+		s.makerPrivateLedgerReplayOffset)
+	if err != nil {
+		return makerStartupWarmupStats{}, err
+	}
 	tradeIndex := 0
+	privateEventIndex := 0
 	observeTradesBefore := func(before time.Time) {
 		for tradeIndex < len(trades) && trades[tradeIndex].when.Before(before) {
 			s.observeMakerReplayTrade(trades[tradeIndex], config)
@@ -215,10 +394,24 @@ func (s *Strategy) replayMakerCapture(bboCutoff, tradeCutoff, now time.Time, del
 			tradeIndex++
 		}
 	}
+	observePrivateEventsBefore := func(before time.Time) {
+		for privateEventIndex < len(privateEvents) && privateEvents[privateEventIndex].At.Before(before) {
+			s.observePrivateFillCalibrationLedgerEvent(privateEvents[privateEventIndex])
+			stats.PrivateCalibrationEvents++
+			privateEventIndex++
+		}
+	}
 	for _, filename := range files {
-		if err := s.replayMakerBBOFile(filename, bboCutoff, now, deltaOnly, config, &stats, observeTradesBefore); err != nil {
+		if err := s.replayMakerBBOFile(filename, bboCutoff, now, deltaOnly, config, &stats, observeTradesBefore, observePrivateEventsBefore); err != nil {
 			return stats, err
 		}
+	}
+	// Consume private events that arrived after the last captured BBO. Their
+	// adverse labels remain pending until the next live BBO; using a future
+	// price here would violate causality.
+	observePrivateEventsBefore(now.Add(time.Nanosecond))
+	if size := privateFillLedgerSize(config.PrivateOrderFillLedger, s.Symbol); size >= 0 {
+		s.makerPrivateLedgerReplayOffset = size
 	}
 	if tradeIndex < len(trades) {
 		s.makerStartupPendingTrades = append(
@@ -293,6 +486,7 @@ func (s *Strategy) replayMakerBBOFile(
 	config MarketMakerConfig,
 	stats *makerStartupWarmupStats,
 	observeTradesBefore func(time.Time),
+	observePrivateEventsBefore func(time.Time),
 ) error {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -303,9 +497,27 @@ func (s *Strategy) replayMakerBBOFile(
 	if err != nil {
 		return fmt.Errorf("read Binance BBO capture header %s: %w", filename, err)
 	}
+	compactWarmup := !deltaOnly
+	var compacted makerStartupBBOAccumulator
+	if compactWarmup {
+		compacted.emit = func(at time.Time, ticker types.BookTicker, gapBefore bool) {
+			observeTradesBefore(at)
+			observePrivateEventsBefore(at)
+			s.observeRelativeHoldRiskPreloadBBO(at, ticker)
+			s.observeMakerReplayBBO(at, ticker, gapBefore, config)
+			if stats.First.IsZero() {
+				stats.First = at
+			}
+			stats.Last = at
+			stats.BBOUpdates++
+		}
+	}
 	for {
 		record, readErr := reader.Read()
 		if readErr == io.EOF {
+			if compactWarmup {
+				compacted.flush()
+			}
 			return nil
 		}
 		if readErr != nil || len(record) < 5 {
@@ -333,7 +545,13 @@ func (s *Strategy) replayMakerBBOFile(
 			}
 		}
 		ticker := types.BookTicker{Symbol: s.Symbol, Buy: bid, BuySize: bidSize, Sell: ask, SellSize: askSize}
+		if compactWarmup {
+			compacted.add(when, ticker, gapBefore)
+			continue
+		}
 		observeTradesBefore(when)
+		observePrivateEventsBefore(when)
+		s.observeRelativeHoldRiskPreloadBBO(when, ticker)
 		s.observeMakerReplayBBO(when, ticker, gapBefore, config)
 		if stats.First.IsZero() {
 			stats.First = when
@@ -374,19 +592,37 @@ func (s *Strategy) drainMakerStartupTrades(before time.Time, config MarketMakerC
 func (s *Strategy) observeMakerReplayBBO(at time.Time, ticker types.BookTicker, gapBefore bool, config MarketMakerConfig) {
 	bid, ask := ticker.Buy.Float64(), ticker.Sell.Float64()
 	mid := (bid + ask) / 2
+	// Keep startup replay identical to the live causal source: pivot Klines are
+	// built from BBO/2, never from one executable side and never from a future
+	// label. This runs before the first live quote is allowed.
+	s.observeMakerCausalKlinePivot(at, mid, config)
+	// The pivot-regime source of truth is also midpoint based and must be
+	// advanced during startup prefill. Otherwise enabling the target after a
+	// restart would leave it cold until enough new BBO events arrived.
+	if config.DynamicInventoryAim.PivotRegimeTarget.Enabled ||
+		config.DynamicInventoryAim.PivotRegimeTarget.CausalCEEnabled {
+		s.observeMakerPivotRegime(at, mid, config)
+	}
+	if s.makerPrivateFillCalibration != nil {
+		// Ledger events strictly before this BBO have already been replayed by
+		// replayMakerBBOFile. This event is therefore the next causal executable
+		// price and can mature labels at or before its timestamp.
+		s.makerPrivateFillCalibration.ObserveBBO(at, bid, ask)
+	}
 	s.makerHorizonModel.ObserveBookWithSizesAndGap(
 		at, bid, ticker.BuySize.Float64(), ask, ticker.SellSize.Float64(),
 		config, gapBefore)
 	if config.AsymmetricOscillationRisk.Enabled {
-		riskHorizon := time.Duration(config.FastWindow)
 		windows := config.FastModelWindows()
-		if len(windows) > 0 {
-			riskHorizon = windows[0]
+		if len(windows) == 0 {
+			windows = []time.Duration{time.Duration(config.FastWindow)}
 		}
-		// Warm the same causal online alpha used by the live quote loop. The
-		// selected Fast horizon is unavailable during raw replay; using the
-		// shortest configured window is deterministic and keeps startup bounded.
-		s.observeAsymmetricOscillationRisk(at, bid, ask, riskHorizon, gapBefore)
+		// Warm every causal online alpha used by the live quote loop. The
+		// selected Fast horizon is unavailable during raw replay, so each
+		// configured window gets its own pending label and variance state.
+		for _, riskHorizon := range windows {
+			s.observeAsymmetricOscillationRisk(at, bid, ask, riskHorizon, gapBefore)
+		}
 	}
 	if s.makerBOCPD45 != nil {
 		s.makerBOCPD45.Observe(at, bid, ask, gapBefore)

@@ -128,6 +128,8 @@ type Strategy struct {
 
 	session                        *bbgo.ExchangeSession
 	executor                       *bbgo.GeneralOrderExecutor
+	makerPrivateOrderFillLedger    *PrivateOrderFillLedger
+	makerPrivateFillCalibration    *PrivateFillCalibrationModel
 	model                          *IntensityModel
 	fastModel                      *IntensityModel // primary/legacy alias
 	fastModels                     map[time.Duration]*IntensityModel
@@ -179,11 +181,15 @@ type Strategy struct {
 	makerQuotedFastReservationBps      float64
 	makerQuotedTargetSet               bool
 	// Pivot regime is observed on each real BBO event and is intentionally
-	// separate from the legacy bucketed regime state. The adapter remains
-	// available for research-only tests, but production quoting no longer calls
-	// it after DynamicInventoryAim was retired.
+	// separate from the legacy bucketed regime state. The causal Kline learner
+	// below is the production target-only adapter; the older directional-change
+	// actuator remains isolated for compatibility/research.
 	makerPivotRegimeFilter           *PivotRegimeFilter
 	makerPivotRegimeDecision         PivotRegimeDecision
+	makerCausalRegimeTargetDecision  CausalRegimeInventoryTargetDecision
+	makerCausalKlinePivot            *CausalKlinePivotLearner
+	makerCausalKlineBuilder          *CausalKlineBuilder
+	makerCausalKlineDecision         CausalKlinePivotDecision
 	makerHorizonModel                MarketMakerHorizonModel
 	makerQuoteLifecycleHazard        *QuoteLifecycleHazardModel
 	makerMacroInventoryModel         MacroInventoryModel
@@ -192,6 +198,7 @@ type Strategy struct {
 	makerLastCheckpointSync          time.Time
 	makerCheckpointReplayAfter       time.Time
 	makerLastPublicTradeAt           time.Time
+	makerPrivateLedgerReplayOffset   int64
 	makerStartupPendingTrades        []makerStartupTrade
 	makerCheckpointCaptureFiles      map[string]captureFileCheckpoint
 	makerMacroInventorySyncPending   bool
@@ -211,6 +218,7 @@ type Strategy struct {
 	makerResetCooldownUntil          time.Time
 	makerFillRefreshPending          bool
 	makerFillRefreshScheduled        bool
+	makerQuoteAdmissionDisabled      atomic.Bool
 	makerFillRefreshSide             types.SideType
 	makerFillRefreshAt               time.Time
 	makerFillRefreshGeneration       uint64
@@ -220,18 +228,19 @@ type Strategy struct {
 	// from turning an inventory-headroom correction into a cancel/submit loop.
 	// A headroom correction cancels first and waits for the order book to
 	// reflect the cancellation before a replacement quote is submitted.
-	makerHeadroomCancelAt          time.Time
-	makerLastAcquisitionStartLogAt time.Time
-	makerLastNoSubmissionLogAt     time.Time
-	makerReplacementRetryAfter     time.Time
-	makerNoOrderReferenceBid       float64
-	makerNoOrderReferenceAsk       float64
-	makerLastGateLogAt             time.Time
-	makerLastBookLogAt             time.Time
-	makerLastPipelineLogAt         time.Time
-	makerLastBOCPD45LogAt          time.Time
-	makerLastAsymmetricRiskLogAt   time.Time
-	makerBookEvents                uint64
+	makerHeadroomCancelAt              time.Time
+	makerLastAcquisitionStartLogAt     time.Time
+	makerLastNoSubmissionLogAt         time.Time
+	makerReplacementRetryAfter         time.Time
+	makerNoOrderReferenceBid           float64
+	makerNoOrderReferenceAsk           float64
+	makerLastGateLogAt                 time.Time
+	makerLastBookLogAt                 time.Time
+	makerLastPipelineLogAt             time.Time
+	makerLastTerminalFillDeferralLogAt time.Time
+	makerLastBOCPD45LogAt              time.Time
+	makerLastAsymmetricRiskLogAt       time.Time
+	makerBookEvents                    uint64
 	// Expected cancellations are tracked so an intentional cancel/requote does
 	// not recursively trigger the external-cancel replenisher.
 	makerExpectedCancelMu       sync.Mutex
@@ -245,6 +254,10 @@ type Strategy struct {
 func (s *Strategy) ID() string                       { return ID }
 func (s *Strategy) InstanceID() string               { return ID + ":" + s.Symbol }
 func (s *Strategy) CurrentPosition() *types.Position { return s.Position }
+
+func makerQuoteAdmissionAllowed(runtime RuntimeState, status types.StrategyStatus) bool {
+	return status == types.StrategyStatusRunning && runtime != StateSuspended && runtime != StateHalted
+}
 
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 	s.setDefaults()
@@ -275,8 +288,65 @@ func (s *Strategy) ClosePosition(ctx context.Context, percentage fixedpoint.Valu
 	if s.Market.IsDustQuantity(quantity, s.lastPrice()) {
 		return nil
 	}
-	_, err := s.executor.SubmitOrders(ctx, types.SubmitOrder{Symbol: s.Symbol, Market: s.Market, Side: types.SideTypeSell, Type: types.OrderTypeMarket, Quantity: quantity, Tag: "gammacapture-exit"})
+	_, err := s.submitOrders(ctx, types.SubmitOrder{Symbol: s.Symbol, Market: s.Market, Side: types.SideTypeSell, Type: types.OrderTypeMarket, Quantity: quantity, Tag: "gammacapture-exit"})
 	return err
+}
+
+func (s *Strategy) privateOrderFillLedgerContext() PrivateOrderFillLedgerContext {
+	if s == nil {
+		return PrivateOrderFillLedgerContext{}
+	}
+	s.bookMu.RLock()
+	context := PrivateOrderFillLedgerContext{
+		BBOAt:   s.bestBookAt,
+		BestBid: s.bestBid,
+		BestAsk: s.bestAsk,
+	}
+	s.bookMu.RUnlock()
+	return context
+}
+
+// submitOrders is the single strategy-side order API boundary. Recording the
+// intent before the exchange call and the returned order/error after it makes
+// rejected submissions visible without changing the executor's retry behavior.
+func (s *Strategy) submitOrders(ctx context.Context, submits ...types.SubmitOrder) (types.OrderSlice, error) {
+	if s.makerPrivateOrderFillLedger != nil {
+		context := s.privateOrderFillLedgerContext()
+		for _, submit := range submits {
+			if err := s.makerPrivateOrderFillLedger.RecordSubmitIntent(
+				s.Symbol, ID, s.InstanceID(), submit, context); err != nil {
+				log.WithError(err).WithField("symbol", s.Symbol).Warn("private order ledger submit intent failed")
+			}
+		}
+	}
+	orders, err := s.executor.SubmitOrders(ctx, submits...)
+	if s.makerPrivateFillCalibration != nil {
+		for index := range orders {
+			order := orders[index]
+			if !isOwnedMarketMakerOrder(order) {
+				continue
+			}
+			at := order.CreationTime.Time()
+			if at.IsZero() {
+				at = time.Now()
+			}
+			s.makerPrivateFillCalibration.ObserveOrder(order.OrderID, order.Side, order.Price.Float64(), at)
+		}
+	}
+	if s.makerPrivateOrderFillLedger != nil {
+		context := s.privateOrderFillLedgerContext()
+		for index, submit := range submits {
+			var order *types.Order
+			if index < len(orders) {
+				order = &orders[index]
+			}
+			if ledgerErr := s.makerPrivateOrderFillLedger.RecordSubmitResult(
+				s.Symbol, ID, s.InstanceID(), index, submit, order, err, context); ledgerErr != nil {
+				log.WithError(ledgerErr).WithField("symbol", s.Symbol).Warn("private order ledger submit result failed")
+			}
+		}
+	}
+	return orders, err
 }
 
 func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
@@ -303,11 +373,32 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 	if s.MarketMaker.Enabled {
 		s.makerExecutableCrossingModel = NewExecutableCrossingModel(s.Symbol, s.Barrier, s.Intensity)
 		s.makerQuoteLifecycleHazard = NewQuoteLifecycleHazardModel(s.MarketMaker.QuoteLifecycleAction.Hazard)
-		// DynamicInventoryAim, including its pivot/regime adapters, is retained
-		// only for compatibility and isolated research. Production target
-		// selection uses PosteriorInventoryRiskTarget below.
-		s.makerPivotRegimeFilter = nil
-		s.makerPivotRegimeDecision = PivotRegimeDecision{Reason: "dynamic inventory aim retired"}
+		causalKlineConfig := s.MarketMaker.CausalKlinePivot
+		if causalKlineConfig.Enabled {
+			s.makerCausalKlineBuilder = NewCausalKlineBuilder(time.Duration(causalKlineConfig.Interval))
+			s.makerCausalKlinePivot = NewCausalKlinePivotLearner(causalKlineConfig)
+			s.makerCausalKlineDecision = CausalKlinePivotDecision{Reason: "causal Kline pivot learner warming"}
+		} else {
+			s.makerCausalKlineBuilder = nil
+			s.makerCausalKlinePivot = nil
+			s.makerCausalKlineDecision = CausalKlinePivotDecision{Reason: "causal Kline pivot learner disabled"}
+		}
+		// Pivot regime is a target-only actuator. The legacy bounded actuator
+		// still requires its parent controller, while the CE target owner may be
+		// enabled independently. The downstream quote optimizer still owns price,
+		// quantity, and admission.
+		pivotTarget := s.MarketMaker.DynamicInventoryAim.PivotRegimeTarget
+		if pivotTarget.Enabled || pivotTarget.CausalCEEnabled {
+			pivotConfig := s.MarketMaker.DynamicInventoryAim.PivotRegimeTarget
+			pivotConfig.setDefaults()
+			s.makerPivotRegimeFilter = NewPivotRegimeFilter(pivotConfig.filterConfig())
+			s.makerPivotRegimeDecision = PivotRegimeDecision{Reason: "pivot regime warming"}
+			s.makerCausalRegimeTargetDecision = CausalRegimeInventoryTargetDecision{Reason: "causal regime target warming"}
+		} else {
+			s.makerPivotRegimeFilter = nil
+			s.makerPivotRegimeDecision = PivotRegimeDecision{Reason: "pivot regime target disabled"}
+			s.makerCausalRegimeTargetDecision = CausalRegimeInventoryTargetDecision{Reason: "causal regime target disabled"}
+		}
 		if s.MarketMaker.MacroInventory.Enabled && s.State.MacroInventory == nil {
 			s.State.MacroInventory = &MacroInventoryState{}
 		}
@@ -347,8 +438,13 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 		s.makerHorizonTouchModel = nil
 		s.makerQuoteLifecycleHazard = nil
 		s.makerExecutableCrossingModel = nil
+		s.makerPrivateFillCalibration = nil
+		s.makerCausalKlinePivot = nil
+		s.makerCausalKlineBuilder = nil
+		s.makerCausalKlineDecision = CausalKlinePivotDecision{Reason: "causal Kline pivot learner disabled"}
 		s.makerPivotRegimeFilter = nil
 		s.makerPivotRegimeDecision = PivotRegimeDecision{Reason: "pivot regime target disabled"}
+		s.makerCausalRegimeTargetDecision = CausalRegimeInventoryTargetDecision{Reason: "causal regime target disabled"}
 	}
 	if s.GateStats == nil {
 		s.GateStats = &GateStats{}
@@ -377,6 +473,23 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 		}
 	}
 	s.executor = bbgo.NewGeneralOrderExecutor(session, s.Symbol, ID, s.InstanceID(), s.Position)
+	if s.MarketMaker.Enabled && s.MarketMaker.PrivateOrderFillLedger.Enabled {
+		ledgerConfig := s.MarketMaker.PrivateOrderFillLedger
+		if ledgerConfig.ProductionVersion == "" && s.EnvironmentRef != nil {
+			ledgerConfig.ProductionVersion = s.EnvironmentRef.ProductionVersion()
+		}
+		ledger, err := OpenPrivateOrderFillLedger(ledgerConfig, s.Symbol)
+		if err != nil {
+			return fmt.Errorf("open private order/fill ledger: %w", err)
+		}
+		s.makerPrivateOrderFillLedger = ledger
+		go func() {
+			<-ctx.Done()
+			if err := ledger.Close(); err != nil {
+				log.WithError(err).WithField("path", ledger.Path()).Warn("close private order/fill ledger failed")
+			}
+		}()
+	}
 	if s.EnvironmentRef != nil {
 		s.executor.BindEnvironment(s.EnvironmentRef)
 	}
@@ -393,6 +506,30 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 			if !isOwnedMarketMakerTrade(trade, order, ok) {
 				return
 			}
+			if s.makerPrivateFillCalibration != nil {
+				at := trade.Time.Time()
+				if at.IsZero() {
+					at = s.privateOrderFillLedgerContext().BBOAt
+				}
+				if at.IsZero() {
+					at = time.Now()
+				}
+				side := trade.Side
+				if side == "" {
+					side = order.Side
+				}
+				s.makerPrivateFillCalibration.ObserveFill(PrivateFillCalibrationObservation{
+					At: at, TradeID: trade.ID, OrderID: trade.OrderID, Side: side,
+					Price: trade.Price.Float64(),
+				})
+			}
+			if s.makerPrivateOrderFillLedger != nil {
+				if err := s.makerPrivateOrderFillLedger.RecordFill(
+					s.Symbol, ID, s.InstanceID(), trade, &order,
+					s.privateOrderFillLedgerContext()); err != nil {
+					log.WithError(err).WithField("symbol", s.Symbol).Warn("private fill ledger write failed")
+				}
+			}
 			go s.onMakerTradeFilled(ctx, trade)
 		})
 	}
@@ -404,11 +541,46 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 			if !isOwnedMarketMakerOrder(order) {
 				return
 			}
+			if s.makerPrivateFillCalibration != nil {
+				at := order.UpdateTime.Time()
+				if at.IsZero() {
+					at = time.Now()
+				}
+				s.makerPrivateFillCalibration.ObserveOrderEnd(order.OrderID, at, true)
+			}
 			s.makerTerminalFillObservedAt.Store(time.Now().UnixNano())
 			s.makerTerminalFillSequence.Add(1)
 		})
 	}
 	s.executor.Bind()
+	if s.makerPrivateOrderFillLedger != nil || s.makerPrivateFillCalibration != nil {
+		// Register after executor.Bind so OrderStore has received the update when
+		// the ledger callback snapshots the order. The ledger still records the
+		// raw exchange status and never relies on log parsing.
+		session.UserDataStream.OnOrderUpdate(func(order types.Order) {
+			if !isOwnedMarketMakerOrder(order) || order.Symbol != s.Symbol {
+				return
+			}
+			if s.makerPrivateFillCalibration != nil {
+				at := order.UpdateTime.Time()
+				if at.IsZero() {
+					at = time.Now()
+				}
+				s.makerPrivateFillCalibration.ObserveOrder(order.OrderID, order.Side, order.Price.Float64(), at)
+				if order.Status.Closed() {
+					s.makerPrivateFillCalibration.ObserveOrderEnd(order.OrderID, at, order.ExecutedQuantity.Sign() > 0)
+				}
+			}
+			if s.makerPrivateOrderFillLedger == nil {
+				return
+			}
+			if err := s.makerPrivateOrderFillLedger.RecordOrderUpdate(
+				s.Symbol, ID, s.InstanceID(), order,
+				s.privateOrderFillLedgerContext()); err != nil {
+				log.WithError(err).WithField("symbol", s.Symbol).Warn("private order ledger update failed")
+			}
+		})
+	}
 	if s.MarketMaker.Enabled && s.Environment != "backtest" && s.Environment != "replay" &&
 		!s.makerCheckpointReplayAfter.IsZero() && s.State.ModelCheckpoint != nil {
 		// Persist the freshly rebuilt/advanced checkpoint before stale orders are
@@ -428,12 +600,22 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 		}
 	}
 	s.Status = types.StrategyStatusRunning
+	s.makerQuoteAdmissionDisabled.Store(false)
 	if s.MarketMaker.Enabled && s.Environment != "backtest" && s.Environment != "replay" {
 		go s.runMarketMakerAccountSync(ctx)
 	}
-	s.OnSuspend(func() { s.State.Runtime = StateSuspended; bbgo.Sync(ctx, s) })
-	s.OnResume(func() { s.State.Runtime = StateWarmingUp; bbgo.Sync(ctx, s) })
+	s.OnSuspend(func() {
+		s.makerQuoteAdmissionDisabled.Store(true)
+		s.State.Runtime = StateSuspended
+		bbgo.Sync(ctx, s)
+	})
+	s.OnResume(func() {
+		s.State.Runtime = StateWarmingUp
+		s.makerQuoteAdmissionDisabled.Store(false)
+		bbgo.Sync(ctx, s)
+	})
 	s.OnEmergencyStop(func() {
+		s.makerQuoteAdmissionDisabled.Store(true)
 		s.State.Runtime = StateHalted
 		_ = s.gracefulCancelMaker(ctx, "emergency-stop")
 		_ = s.ClosePosition(ctx, fixedpoint.One)
@@ -539,8 +721,23 @@ func (s *Strategy) reconcileMarketMakerOrders(ctx context.Context) error {
 		"symbol": s.Symbol,
 		"orders": len(stale),
 	}).Warn("market-maker cancelling stale startup orders")
-	if err := s.session.Exchange.CancelOrders(reconcileCtx, stale...); err != nil {
-		return fmt.Errorf("market-maker startup stale order cancellation failed: %w", err)
+	if s.makerPrivateOrderFillLedger != nil {
+		if err := s.makerPrivateOrderFillLedger.RecordCancelRequest(
+			s.Symbol, ID, s.InstanceID(), "startup-stale-order-reconciliation", stale,
+			s.privateOrderFillLedgerContext()); err != nil {
+			log.WithError(err).WithField("symbol", s.Symbol).Warn("private cancel ledger write failed")
+		}
+	}
+	cancelErr := s.session.Exchange.CancelOrders(reconcileCtx, stale...)
+	if s.makerPrivateOrderFillLedger != nil {
+		if err := s.makerPrivateOrderFillLedger.RecordCancelResult(
+			s.Symbol, ID, s.InstanceID(), "startup-stale-order-reconciliation", stale,
+			cancelErr, s.privateOrderFillLedgerContext()); err != nil {
+			log.WithError(err).WithField("symbol", s.Symbol).Warn("private cancel result ledger write failed")
+		}
+	}
+	if cancelErr != nil {
+		return fmt.Errorf("market-maker startup stale order cancellation failed: %w", cancelErr)
 	}
 
 	remaining, err := retry.QueryOpenOrdersUntilSuccessfulLite(reconcileCtx, s.session.Exchange, s.Symbol)
@@ -733,6 +930,19 @@ func makerTerminalFillDefersReplacement(requestedGeneration, initialSequence, cu
 	return now.Before(observedAt) || now.Sub(observedAt) <= makerTerminalFillDeferralWindow
 }
 
+func (s *Strategy) logMakerTerminalFillDeferral(now time.Time, stage string) {
+	if !s.makerLastTerminalFillDeferralLogAt.IsZero() &&
+		now.Sub(s.makerLastTerminalFillDeferralLogAt) < 10*time.Second {
+		return
+	}
+	s.makerLastTerminalFillDeferralLogAt = now
+	log.WithFields(logrus.Fields{
+		"symbol":       s.Symbol,
+		"fillSequence": s.makerTerminalFillSequence.Load(),
+		"stage":        stage,
+	}).Info("market-maker replacement deferred to terminal-fill rebalance")
+}
+
 // gracefulCancelMaker records the current maker order IDs before an intentional
 // cancel. The cancel callback can therefore distinguish a normal reprice from
 // an external cancel and avoid recursively cancelling/recreating the same quote.
@@ -763,6 +973,13 @@ func (s *Strategy) gracefulCancelMakerOrders(ctx context.Context, reason string,
 		s.makerExpectedCancelIDs[order.OrderID] = reason
 	}
 	s.makerExpectedCancelMu.Unlock()
+	if s.makerPrivateOrderFillLedger != nil {
+		if err := s.makerPrivateOrderFillLedger.RecordCancelRequest(
+			s.Symbol, ID, s.InstanceID(), reason, orders,
+			s.privateOrderFillLedgerContext()); err != nil {
+			log.WithError(err).WithField("symbol", s.Symbol).Warn("private cancel ledger write failed")
+		}
+	}
 	if len(orders) > 0 {
 		orderIDs := make([]uint64, 0, len(orders))
 		for _, order := range orders {
@@ -774,6 +991,13 @@ func (s *Strategy) gracefulCancelMakerOrders(ctx context.Context, reason string,
 	}
 	startedAt := time.Now()
 	err := s.executor.GracefulCancel(ctx, orders...)
+	if s.makerPrivateOrderFillLedger != nil {
+		if ledgerErr := s.makerPrivateOrderFillLedger.RecordCancelResult(
+			s.Symbol, ID, s.InstanceID(), reason, orders, err,
+			s.privateOrderFillLedgerContext()); ledgerErr != nil {
+			log.WithError(ledgerErr).WithField("symbol", s.Symbol).Warn("private cancel result ledger write failed")
+		}
+	}
 	if len(orders) > 0 {
 		fields := logrus.Fields{
 			"symbol": s.Symbol, "reason": reason, "orders": len(orders),
@@ -791,12 +1015,21 @@ func (s *Strategy) gracefulCancelMakerOrders(ctx context.Context, reason string,
 
 // onMakerOrderCanceled rebuilds a missing side after a cancellation. Ordinary
 // external cancellations replan immediately; intentional inventory-headroom
-// cancellations replan after the final expected cancel is confirmed. The short
-// delay lets account/order callbacks settle, while the scheduled flag coalesces
-// simultaneous bid/ask cancellation updates.
+// cancellations replan after the final expected cancel is confirmed. A true
+// joint no-order cancellation also wakes one fresh, balance-aware evaluation
+// after the final cancel, so the no-order lease cannot hide a newly executable
+// quote. The short delay lets account/order callbacks settle, while the
+// scheduled flag coalesces simultaneous bid/ask cancellation updates.
 func (s *Strategy) onMakerOrderCanceled(ctx context.Context, order types.Order) {
 	if !isOwnedMarketMakerOrder(order) {
 		return
+	}
+	if s.makerPrivateFillCalibration != nil {
+		at := order.UpdateTime.Time()
+		if at.IsZero() {
+			at = time.Now()
+		}
+		s.makerPrivateFillCalibration.ObserveOrderEnd(order.OrderID, at, order.ExecutedQuantity.Sign() > 0)
 	}
 	s.makerExpectedCancelMu.Lock()
 	reason, expected := s.makerExpectedCancelIDs[order.OrderID]
@@ -814,17 +1047,17 @@ func (s *Strategy) onMakerOrderCanceled(ctx context.Context, order types.Order) 
 		// replan against a fresh BBO. Waiting for the previous model window
 		// leaves the strategy unquoted even though the safety transition has
 		// already completed.
-		if reason == "inventory-headroom-exceeded" {
+		if reason == "inventory-headroom-exceeded" || reason == "Fast fee-value rejection" {
 			s.makerExpectedCancelMu.Lock()
-			pendingHeadroomCancel := false
+			pendingIntentionalCancel := false
 			for _, pendingReason := range s.makerExpectedCancelIDs {
-				if pendingReason == "inventory-headroom-exceeded" {
-					pendingHeadroomCancel = true
+				if pendingReason == reason {
+					pendingIntentionalCancel = true
 					break
 				}
 			}
 			s.makerExpectedCancelMu.Unlock()
-			if !pendingHeadroomCancel && s.executor != nil && s.executor.ActiveMakerOrders().NumOfOrders() == 0 {
+			if !pendingIntentionalCancel && s.executor != nil && s.executor.ActiveMakerOrders().NumOfOrders() == 0 {
 				s.scheduleMakerCancelReplan(ctx, order)
 			}
 		}
@@ -1304,7 +1537,7 @@ func (s *Strategy) processReference(ctx context.Context, now time.Time, price fi
 	}
 	s.GateStats.Quantity++
 	s.State.Runtime = StateEntryPending
-	if _, err := s.executor.SubmitOrders(ctx, types.SubmitOrder{Symbol: s.Symbol, Market: s.Market, Side: types.SideTypeBuy, Type: types.OrderTypeMarket, Quantity: quantity, Tag: "gammacapture-entry"}); err != nil {
+	if _, err := s.submitOrders(ctx, types.SubmitOrder{Symbol: s.Symbol, Market: s.Market, Side: types.SideTypeBuy, Type: types.OrderTypeMarket, Quantity: quantity, Tag: "gammacapture-entry"}); err != nil {
 		s.State.LastDecision = "entry rejected: " + err.Error()
 		s.State.Runtime = StateDisarmed
 		return
@@ -1343,7 +1576,7 @@ func (s *Strategy) onMarketMakerBook(ctx context.Context, ticker types.BookTicke
 // reuses an already observed BBO rather than representing a new market event.
 func (s *Strategy) observeMakerPivotRegime(now time.Time, mid float64, config MarketMakerConfig) PivotRegimeDecision {
 	pivotConfig := config.DynamicInventoryAim.PivotRegimeTarget
-	if !pivotConfig.Enabled {
+	if !pivotConfig.Enabled && !pivotConfig.CausalCEEnabled {
 		return PivotRegimeDecision{At: now, Reason: "pivot regime target disabled"}
 	}
 	pivotConfig.setDefaults()
@@ -1357,6 +1590,24 @@ func (s *Strategy) observeMakerPivotRegime(now time.Time, mid float64, config Ma
 	return decision
 }
 
+// observeMakerCausalKlinePivot advances the live 3-minute Kline learner from
+// the executable BBO midpoint. It is O(1) per BBO event: the builder keeps one
+// open bar and the learner keeps only its bounded feature history. A current
+// prediction is retained between bar closes, so quote refresh frequency cannot
+// turn a single prediction into repeated training samples.
+func (s *Strategy) observeMakerCausalKlinePivot(at time.Time, mid float64, config MarketMakerConfig) {
+	if s.makerCausalKlinePivot == nil || s.makerCausalKlineBuilder == nil ||
+		!config.CausalKlinePivot.Enabled || at.IsZero() || mid <= 0 ||
+		!finiteCausalKlineValue(mid) {
+		return
+	}
+	bar, closed := s.makerCausalKlineBuilder.Observe(at, mid)
+	if !closed {
+		return
+	}
+	s.makerCausalKlineDecision = s.makerCausalKlinePivot.ObserveBar(bar)
+}
+
 func shouldLogBOCPD45Status(last, now time.Time) bool {
 	return last.IsZero() || now.Before(last) || now.Sub(last) >= time.Minute
 }
@@ -1365,7 +1616,7 @@ func (s *Strategy) logBOCPD45Status(now time.Time) {
 	if s.makerBOCPD45 == nil || !shouldLogBOCPD45Status(s.makerLastBOCPD45LogAt, now) {
 		return
 	}
-	snapshot := s.makerBOCPD45.Snapshot()
+	snapshot := s.makerBOCPD45.SnapshotAt(now)
 	log.WithFields(logrus.Fields{
 		"symbol":                  s.Symbol,
 		"calibration":             snapshot.Calibration,
@@ -1390,7 +1641,14 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	if ticker.Symbol != s.Symbol || s.executor == nil || ticker.Buy.Sign() <= 0 || ticker.Sell.Sign() <= 0 || ticker.Sell.Compare(ticker.Buy) <= 0 {
 		return
 	}
+	if s.makerQuoteAdmissionDisabled.Load() {
+		return
+	}
 	s.marketMakerMu.Lock()
+	if s.makerQuoteAdmissionDisabled.Load() || s.State == nil || !makerQuoteAdmissionAllowed(s.State.Runtime, s.Status) {
+		s.marketMakerMu.Unlock()
+		return
+	}
 	if !makerFillRebalanceQuoteAllowed(s.makerFillRefreshScheduled, s.makerFillRefreshGeneration, fillRebalanceGeneration) {
 		s.marketMakerMu.Unlock()
 		return
@@ -1398,6 +1656,12 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	defer s.marketMakerMu.Unlock()
 	fillRebalanceObservationOnly := fillRebalanceGeneration == 0 && s.makerFillRefreshScheduled
 	now := time.Now()
+	if s.makerPrivateFillCalibration != nil {
+		// This is O(active owned orders), not O(ledger history). It also runs
+		// during observation-only refreshes so private-fill labels keep maturing
+		// even when the quote planner is temporarily leased.
+		s.makerPrivateFillCalibration.ObserveBBO(now, ticker.Buy.Float64(), ticker.Sell.Float64())
+	}
 	if observeEvidence {
 		s.drainMakerStartupTrades(now, s.MarketMaker)
 	}
@@ -1427,13 +1691,50 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	inventoryBase := quoteBalances.TotalBase.Float64()
 	quoteableQuote := quoteBalances.QuoteableQuote
 	mid := (ticker.Buy.Float64() + ticker.Sell.Float64()) / 2
+	// The causal pivot learner uses BBO/2 as its observable price source. It is
+	// advanced even during observation-only fill refreshes, but its output is
+	// applied later only as a bounded inventory-target overlay.
+	s.observeMakerCausalKlinePivot(now, mid, s.MarketMaker)
 	// Feed the causal Relative-Hold label clock before any empty-book retry.
 	// Both strategy and Hold wealth are marked at the executable bid; account
 	// balances already include realized fees.
 	s.observeRelativeHoldRiskEquity(
 		now, ticker.Buy.Float64(), quoteBalances.TotalBase.Float64(), quoteBalances.TotalQuote.Float64())
-	relativeHoldRiskInput := s.relativeHoldRiskInput()
+	relativeHoldRiskInput := s.relativeHoldRiskInput(now)
 	quoteConfig, feeSource := marketMakerConfigWithSessionFees(s.MarketMaker, s.session)
+	pivotRegimeDecision := s.makerPivotRegimeDecision
+	if observeEvidence && (quoteConfig.DynamicInventoryAim.PivotRegimeTarget.Enabled ||
+		quoteConfig.DynamicInventoryAim.PivotRegimeTarget.CausalCEEnabled) {
+		pivotRegimeDecision = s.observeMakerPivotRegime(now, mid, quoteConfig)
+	}
+	privateFillCalibration := PrivateFillCalibrationSnapshot{Reason: "private-fill calibration disabled"}
+	privateFillAdverseApplied := false
+	privateFillTouchApplied := false
+	if s.makerPrivateFillCalibration != nil {
+		privateFillCalibration = s.makerPrivateFillCalibration.SnapshotAt(now)
+		if privateFillCalibration.Ready && !privateFillCalibration.ShadowOnly {
+			// Use a one-sided upper confidence bound for adverse selection. A
+			// ready private estimate may raise protection but never lower the
+			// explicit production floor or suppress the quote by itself.
+			if privateFillCalibration.RecommendedAdverseSelectionBps > quoteConfig.AdverseSelectionBps {
+				quoteConfig.AdverseSelectionBps = privateFillCalibration.RecommendedAdverseSelectionBps
+				privateFillAdverseApplied = true
+			}
+			quoteConfig.MinimumHalfSpreadBps = math.Max(quoteConfig.MinimumHalfSpreadBps,
+				quoteConfig.MakerFeeBps+quoteConfig.AdverseSelectionBps+quoteConfig.MinimumNetEdgeBps/2)
+		}
+		if privateFillCalibration.TouchReady && !privateFillCalibration.ShadowOnly &&
+			quoteConfig.HorizonTouchModel.Enabled {
+			// The lower confidence bound is a conservative replacement for the
+			// generic touch-to-fill haircut. Lower fill probability means lower
+			// modeled arrival, never an additional no-order gate.
+			if privateFillCalibration.RecommendedTouchToFillHaircut > 0 &&
+				privateFillCalibration.RecommendedTouchToFillHaircut < quoteConfig.HorizonTouchModel.TouchToFillHaircut {
+				quoteConfig.HorizonTouchModel.TouchToFillHaircut = privateFillCalibration.RecommendedTouchToFillHaircut
+				privateFillTouchApplied = true
+			}
+		}
+	}
 	fastRiskAversion := fastRiskAversionOrDefault(quoteConfig, quoteConfig.FastRiskAversion)
 	if observeEvidence {
 		s.makerHorizonModel.ObserveBookWithSizes(
@@ -1535,7 +1836,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	direction := rawFastDirection * directionCoverage
 	bocpd45 := BOCPD45Snapshot{}
 	if s.makerBOCPD45 != nil {
-		bocpd45 = s.makerBOCPD45.Snapshot()
+		bocpd45 = s.makerBOCPD45.SnapshotAt(now)
 		if bocpd45.Ready {
 			fastConfidence := math.Max(0, math.Min(1,
 				fastInference.DirectionConfidence*directionCoverage))
@@ -1934,6 +2235,60 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			mid, pairEquityJPY, macroDecision.CapitalFloorRatio,
 			inventoryBand.TargetRatio, macroDecision.CapitalCapRatio)
 	}
+	causalRegimeTargetEnabled := quoteConfig.DynamicInventoryAim.PivotRegimeTarget.CausalCEEnabled
+	causalRegimeTargetApplied := false
+	causalRegimeTarget := CausalRegimeInventoryTargetDecision{
+		CurrentWeight: inventoryBase * mid / math.Max(pairEquityJPY, 1e-12),
+		PriorWeight:   quoteConfig.InventoryCapitalTargetRatio,
+		TargetWeight:  effectiveInventoryTargetRatio,
+		Reason:        "causal regime target waiting for pivot evidence",
+	}
+	if causalRegimeTargetEnabled && s.makerPivotRegimeFilter != nil && pairEquityJPY > 0 {
+		pivotTargetConfig := quoteConfig.DynamicInventoryAim.PivotRegimeTarget
+		causalTargetConfig := CausalRegimeInventoryTargetConfig{
+			RiskAversion:     pivotTargetConfig.CausalRiskAversion,
+			PriorStrengthBps: pivotTargetConfig.CausalPriorStrengthBps,
+		}
+		currentWeight := inventoryBase * mid / pairEquityJPY
+		hardMinimumRatio := hardInventoryBand.MinInventory * mid / pairEquityJPY
+		hardMaximumRatio := hardInventoryBand.MaxInventory * mid / pairEquityJPY
+		pivotInput, ready := BuildCausalRegimeInventoryTargetInputFromPivot(
+			pivotRegimeDecision, currentWeight, quoteConfig.InventoryCapitalTargetRatio,
+			hardMinimumRatio, hardMaximumRatio,
+			s.makerPivotRegimeFilter.CompletedLegVarianceBps2(pivotRegimeDecision.Direction),
+			quoteConfig.MakerFeeBps+quoteConfig.AdverseSelectionBps)
+		if ready {
+			causalRegimeTarget = EvaluateCausalRegimeInventoryTarget(causalTargetConfig, pivotInput)
+			if causalRegimeTarget.Ready {
+				// The CE target owns only the expected inventory center. The
+				// configured capital bounds remain hard, so a 100% target is
+				// possible when the regime evidence justifies it but cannot
+				// bypass account/headroom safety.
+				inventoryBand = quoteConfig.InventoryBandFromPolicyRatios(
+					mid, pairEquityJPY, hardMinimumRatio,
+					causalRegimeTarget.TargetWeight, hardMaximumRatio)
+				inventoryControl.Band = inventoryBand
+				inventoryControl.FastTradingZone = false
+				inventoryControl.LongHorizonAdjustment = true
+				inventoryControl.Reason = "causal pivot-regime CE target owns inventory center"
+				longHorizonInventoryAdjustment = true
+				effectiveInventoryTargetRatio = causalRegimeTarget.TargetWeight
+				causalRegimeTargetApplied = true
+				hardInventoryBand = quoteConfig.HardInventoryBand(inventoryBand, mid, pairEquityJPY)
+			}
+		} else {
+			causalRegimeTarget.Reason = "causal regime target waiting for pivot evidence: " + pivotRegimeDecision.Reason
+		}
+	}
+	if causalRegimeTargetApplied {
+		// Keep the strategy snapshot and the quote config aligned with the
+		// target owner.  Otherwise downstream size fallbacks could still read
+		// the stale 50% band even though projection used the causal target.
+		s.makerInventoryBand = inventoryBand
+		quoteConfig.InventoryTarget = inventoryBand.Target
+		quoteConfig.InventoryLimit = inventoryBand.Limit
+	}
+	s.makerCausalRegimeTargetDecision = causalRegimeTarget
 	fastBuyHoldingRiskHorizon := FastReservationRiskHorizon(
 		inventoryVariationHorizon, macroDecision.NoTrade.ForecastObservation)
 	fastReservationConfidenceZ := quoteConfig.InventoryRiskZScore
@@ -2105,19 +2460,90 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	posteriorInventoryTarget := PosteriorInventoryTargetDecision{
 		Reason: "disabled", TargetBase: projectionTargetBase, UpProbability: 0.5,
 	}
-	if quoteConfig.PosteriorInventoryTarget {
+	dynamicInventoryAim := DynamicInventoryAimDecision{
+		Reason: "disabled", GateReason: "disabled",
+		CurrentInventoryRatio: inventoryBase * mid / math.Max(1, pairEquityJPY),
+		PolicyTargetRatio:     inventoryBand.Target * mid / math.Max(1, pairEquityJPY),
+		HardMinimumRatio:      hardInventoryBand.MinInventory * mid / math.Max(1, pairEquityJPY),
+		HardMaximumRatio:      hardInventoryBand.MaxInventory * mid / math.Max(1, pairEquityJPY),
+		AimTargetRatio:        inventoryBand.Target * mid / math.Max(1, pairEquityJPY),
+		AdjustedTargetRatio:   inventoryBand.Target * mid / math.Max(1, pairEquityJPY),
+	}
+	if !causalRegimeTargetEnabled &&
+		(quoteConfig.PosteriorInventoryTarget || quoteConfig.DynamicInventoryAim.Enabled) {
 		pathStats := s.makerHorizonModel.JointPathPayoffStatistics(
 			now, quoteConfig, horizon, plan.BidTouchDistanceBps, plan.AskTouchDistanceBps)
-		posteriorInventoryTarget = PosteriorInventoryRiskTarget(
-			inventoryBand.Target, hardInventoryBand.MinInventory,
-			hardInventoryBand.MaxInventory, pathStats)
-		projectionTargetBase = posteriorInventoryTarget.TargetBase
+		if quoteConfig.PosteriorInventoryTarget {
+			posteriorInventoryTarget = PosteriorInventoryRiskTarget(
+				inventoryBand.Target, hardInventoryBand.MinInventory,
+				hardInventoryBand.MaxInventory, pathStats)
+			projectionTargetBase = posteriorInventoryTarget.TargetBase
+		}
+		if quoteConfig.DynamicInventoryAim.Enabled {
+			inventorySamples := pathStats.InventoryTargetEffectiveSamples
+			if inventorySamples <= 0 {
+				inventorySamples = pathStats.EffectiveSamples
+			}
+			predictiveVariance := pathStats.InventoryTarget.InventoryDirectionalVarBps2
+			if inventorySamples > 0 {
+				predictiveVariance += predictiveVariance / inventorySamples
+			}
+			dynamicInventoryAim = EvaluateDynamicInventoryAim(
+				quoteConfig.DynamicInventoryAim,
+				DynamicInventoryAimInput{
+					CurrentInventoryRatio:       inventoryBase * mid / math.Max(1, pairEquityJPY),
+					PolicyTargetRatio:           inventoryBand.Target * mid / math.Max(1, pairEquityJPY),
+					HardMinimumRatio:            hardInventoryBand.MinInventory * mid / math.Max(1, pairEquityJPY),
+					HardMaximumRatio:            hardInventoryBand.MaxInventory * mid / math.Max(1, pairEquityJPY),
+					GrossInventoryReturnBps:     pathStats.InventoryTarget.InventoryDirectionalMeanBps,
+					PredictiveVarianceBps2:      predictiveVariance,
+					EffectiveSamples:            inventorySamples,
+					ForecastHorizon:             horizon,
+					ExecutionHorizon:            horizon,
+					AdjustmentPeriod:            time.Duration(quoteConfig.HorizonUpdateInterval),
+					RiskAversion:                math.Max(fastRiskAversion, 1e-6),
+					OneWayExecutionCostBps:      quoteConfig.MakerFeeBps + quoteConfig.AdverseSelectionBps,
+					EvidencePriorSamples:        quoteConfig.DynamicInventoryAim.EvidencePriorSamples,
+					PivotRegimeDecision:         pivotRegimeDecision,
+					PivotRegimeDecisionSupplied: s.makerPivotRegimeFilter != nil,
+				},
+			)
+			if dynamicInventoryAim.GatePassed && !quoteConfig.DynamicInventoryAim.ShadowOnly {
+				projectionTargetBase = dynamicInventoryAim.AdjustedTargetRatio * pairEquityJPY / mid
+				posteriorInventoryTarget.Enabled = true
+				posteriorInventoryTarget.TargetBase = projectionTargetBase
+				posteriorInventoryTarget.InventoryReturnMean = dynamicInventoryAim.ExecutionReturnBps
+				posteriorInventoryTarget.InventoryPredictiveSD = dynamicInventoryAim.PredictiveStdDevBps
+				posteriorInventoryTarget.DirectionConfidence = dynamicInventoryAim.SignalStrength
+			}
+		}
+	}
+	causalKlinePivotTarget := CausalKlinePivotTargetDecision{
+		Reason:          "causal Kline pivot target unavailable",
+		BaseTargetRatio: projectionTargetBase * mid / math.Max(pairEquityJPY, 1e-12),
+		TargetRatio:     projectionTargetBase * mid / math.Max(pairEquityJPY, 1e-12),
+	}
+	if quoteConfig.CausalKlinePivot.Enabled && !causalRegimeTargetEnabled && pairEquityJPY > 0 && mid > 0 {
+		// The inventory band is stored in base units, while the safety cap is a
+		// fraction of pair equity. Convert only at this boundary so the learner
+		// remains a dimensionless target overlay and hard base-unit limits are
+		// still enforced by the existing projection bounds.
+		baseTargetRatio := projectionTargetBase * mid / pairEquityJPY
+		hardMinimumRatio := hardInventoryBand.MinInventory * mid / pairEquityJPY
+		hardMaximumRatio := hardInventoryBand.MaxInventory * mid / pairEquityJPY
+		causalKlinePivotTarget = EvaluateCausalKlinePivotTarget(
+			quoteConfig.CausalKlinePivot, s.makerCausalKlineDecision,
+			baseTargetRatio, hardMinimumRatio, hardMaximumRatio)
+		if causalKlinePivotTarget.Applied {
+			projectionTargetBase = causalKlinePivotTarget.TargetRatio * pairEquityJPY / mid
+		}
 	}
 	fastTargetSwitching := FastTargetSwitchingDecision{
 		Reason:              "Fast target switching has no previous quoted target",
 		CandidateTargetBase: projectionTargetBase, SelectedTargetBase: projectionTargetBase,
 	}
-	if quoteConfig.FastTargetSwitching.Enabled && s.makerQuotedTargetSet {
+	if !dynamicInventoryAim.Applied && !causalRegimeTargetEnabled &&
+		quoteConfig.FastTargetSwitching.Enabled && s.makerQuotedTargetSet {
 		previousTargetBase := s.makerQuotedFastTargetRatio * pairEquityJPY / mid
 		fastTargetSwitching = EvaluateFastTargetSwitching(
 			quoteConfig.FastTargetSwitching,
@@ -2221,7 +2647,8 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 		base.Float64()*mid, fastQuantityCapacity.PathModelSellCapJPY)
 	probabilityProjection := ProbabilityCenteredQuoteDecision{Reason: "disabled"}
 	jointQuoteDecision := JointDistanceQuantityDecision{Reason: "disabled", Plan: plan}
-	fastValueRejected := false
+	jointPairRejected := false
+	jointNoOrder := false
 	if quoteConfig.ProbabilityCenteredQuantity.Enabled {
 		probabilityProjection = ProbabilityCenteredQuoteNotionals(projectionInput)
 		if quoteConfig.JointDistanceQuantity.Enabled {
@@ -2291,20 +2718,18 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 						orderReviewDuration = sellOrderKeepDecision.Duration
 					}
 				}
-			} else if jointQuoteDecision.AuthoritativeRejection &&
+			} else if targetCEAuthoritativeRejection(jointQuoteDecision) &&
 				!quoteConfig.JointDistanceQuantity.ShadowOnly {
-				// A completed-path Fast rejection is the optimizer's no-order
-				// action. Do not let the probability-only quantity fallback recreate
-				// the fee-negative candidate that Fast just removed.
-				plan.AllowBid = false
-				plan.AllowAsk = false
-				plan.BidQuoteNotional = 0
-				plan.AskQuoteNotional = 0
-				probabilityProjection = ProbabilityCenteredQuoteDecision{
-					Enabled: true,
-					Reason:  jointQuoteDecision.Reason,
-				}
-				fastValueRejected = true
+				// The rejected object represents the complete pair, not an explicit
+				// side-level decision. Keep only the target-restoring side from the
+				// already computed Fast plan. If the joint optimizer later returns an
+				// applied one-sided plan, its AllowAsk/AllowBid flags remain authoritative
+				// and may clear SELL deliberately.
+				plan = targetRestoringPlanAfterJointRejection(
+					plan, inventoryBase, projectionTargetBase,
+					jointQuoteDecision.FallbackBuySupported,
+					jointQuoteDecision.FallbackSellSupported)
+				jointPairRejected = true
 			}
 		}
 	}
@@ -2312,6 +2737,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 		!quoteConfig.ProbabilityCenteredQuantity.ShadowOnly
 	fastQuantityFallbackUsed := quoteConfig.ProbabilityCenteredQuantity.Enabled &&
 		!quoteConfig.ProbabilityCenteredQuantity.ShadowOnly && !probabilityProjectionUsed
+	targetAwareFallback := TargetAwareFallbackQuoteDecision{Reason: "disabled"}
 	unrestrainedFastBuyNotionalJPY := 0.0
 	unrestrainedFastSellNotionalJPY := 0.0
 	if plan.BidPrice > 0 {
@@ -2326,17 +2752,24 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 		plan.AllowBid = plan.AllowBid && plan.BidQuoteNotional > 0
 		plan.AllowAsk = plan.AllowAsk && plan.AskQuoteNotional > 0
 	} else if fastQuantityFallbackUsed {
-		if plan.BidPrice > 0 {
-			plan.BidQuoteNotional = math.Min(plan.BidQuoteNotional,
-				riskUtilizationSizing.BuyNotionalCapJPY*plan.BidPrice/mid)
-		}
-		if plan.AskPrice > 0 {
-			plan.AskQuoteNotional = math.Min(plan.AskQuoteNotional,
-				riskUtilizationSizing.SellNotionalCapJPY*plan.AskPrice/mid)
-		}
+		targetAwareFallback = TargetAwareFallbackQuoteNotionals(TargetAwareFallbackQuoteInput{
+			CurrentInventoryNotionalJPY:   inventoryBase * mid,
+			TargetInventoryNotionalJPY:    projectionTargetBase * mid,
+			HardLowerInventoryNotionalJPY: hardInventoryBand.MinInventory * mid,
+			HardUpperInventoryNotionalJPY: hardInventoryBand.MaxInventory * mid,
+			BuyNotionalCapJPY: math.Min(
+				riskUtilizationSizing.BuyNotionalCapJPY, unrestrainedFastBuyNotionalJPY),
+			SellNotionalCapJPY: math.Min(
+				riskUtilizationSizing.SellNotionalCapJPY, unrestrainedFastSellNotionalJPY),
+			MinBuyNotionalJPY:  projectionInput.MinBuyNotionalJPY,
+			MinSellNotionalJPY: projectionInput.MinSellNotionalJPY,
+		})
+		plan.BidQuoteNotional = targetAwareFallback.BuyNotionalJPY * plan.BidPrice / mid
+		plan.AskQuoteNotional = targetAwareFallback.SellNotionalJPY * plan.AskPrice / mid
 		plan.AllowBid = plan.AllowBid && plan.BidQuoteNotional > 0
 		plan.AllowAsk = plan.AllowAsk && plan.AskQuoteNotional > 0
 	}
+	jointNoOrder = jointPairRejected && !plan.AllowBid && !plan.AllowAsk
 
 	buyQuoteNotional := fixedpoint.NewFromFloat(plan.BidQuoteNotional)
 	sellQuoteNotional := fixedpoint.NewFromFloat(plan.AskQuoteNotional)
@@ -2437,14 +2870,19 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	macroActiveExecution := MacroActiveExecutionDecision{
 		Reason: "long-horizon target integrated into Fast inventory control",
 	}
+	fastTargetExecutionEvidence := BuildFastTargetExecutionEvidence(
+		causalRegimeTargetApplied, causalRegimeTarget,
+		dynamicInventoryAim, posteriorInventoryTarget)
 	fastTargetExecution := FastTargetExecutionDecision{Reason: "disabled"}
 	// FastTargetExecution is an execution actuator for the already-selected
-	// inventory target; it must not invent a target when the posterior/dynamic
-	// target evidence is unavailable. Keep the readiness predicate explicit so
-	// a disabled IOC path is observable instead of looking like a silent quote
-	// failure.
-	fastTargetExecutionModelReady := posteriorInventoryTarget.Enabled
-	if quoteConfig.FastTargetExecution.Enabled && fastTargetExecutionModelReady {
+	// inventory target. Its readiness comes from the target owner's executable
+	// forecast, not from the legacy posterior target flag. This lets causal CE,
+	// dynamic aim, and posterior targets share the same fee/risk IOC evaluator.
+	fastTargetExecutionEvidenceReady := fastTargetExecutionEvidence.Ready
+	if quoteConfig.FastTargetExecution.Enabled && !fastTargetExecutionEvidenceReady {
+		fastTargetExecution.Reason = fastTargetExecutionEvidence.Reason
+	}
+	if quoteConfig.FastTargetExecution.Enabled && fastTargetExecutionEvidenceReady {
 		fastTargetHorizonDecision := horizonDecision
 		if earlyBumpDecision.Apply {
 			buyDistance, sellDistance, grossEdge := MakerTouchDistances(
@@ -2462,12 +2900,12 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			fastTargetDirection = -1
 		}
 		passiveQuotePrice := plan.BidPrice
-		passiveAvailable := !fastValueRejected && plan.AllowBid && passiveQuotePrice > 0
+		passiveAvailable := plan.AllowBid && passiveQuotePrice > 0
 		touchProbability := fastTargetHorizonDecision.BuyTouchProbability
 		touchStdError := fastTargetHorizonDecision.BuyTouchStdError
 		if fastTargetDirection < 0 {
 			passiveQuotePrice = plan.AskPrice
-			passiveAvailable = !fastValueRejected && plan.AllowAsk && passiveQuotePrice > 0
+			passiveAvailable = plan.AllowAsk && passiveQuotePrice > 0
 			touchProbability = fastTargetHorizonDecision.SellTouchProbability
 			touchStdError = fastTargetHorizonDecision.SellTouchStdError
 		}
@@ -2500,10 +2938,10 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 				BestAsk: ticker.Sell.Float64(), BestAskSize: ticker.SellSize.Float64(),
 				PassiveQuotePrice: passiveQuotePrice, PassiveAvailable: passiveAvailable,
 				TouchProbability: touchProbability, TouchStdError: touchStdError,
-				InventoryReturnMeanBps:        posteriorInventoryTarget.InventoryReturnMean,
-				InventoryReturnSEBps:          posteriorInventoryTarget.InventoryReturnSE,
-				InventoryPredictiveSDBps:      posteriorInventoryTarget.InventoryPredictiveSD,
-				DirectionConfidence:           posteriorInventoryTarget.DirectionConfidence,
+				InventoryReturnMeanBps:        fastTargetExecutionEvidence.InventoryReturnMeanBps,
+				InventoryReturnSEBps:          fastTargetExecutionEvidence.InventoryReturnSEBps,
+				InventoryPredictiveSDBps:      fastTargetExecutionEvidence.InventoryPredictiveSDBps,
+				DirectionConfidence:           fastTargetExecutionEvidence.DirectionConfidence,
 				PersistentDownsideActive:      downside.Active,
 				PersistentDownsideEValue:      downside.DownEValue,
 				PersistentDownsideForecastBps: downside.BidForecastBps,
@@ -2518,7 +2956,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 				MinimumNotionalJPY:  s.Market.MinNotional.Float64(),
 			})
 		if fillRebalanceGeneration == 0 && fastTargetExecution.Trigger {
-			if s.executeFastTargetIOC(ctx, ticker, modelUpdatedAt, fastTargetExecution) {
+			if s.executeFastTargetIOC(ctx, ticker, modelUpdatedAt, fastTargetExecution, fastTargetExecutionEvidence.Source) {
 				return
 			}
 		}
@@ -2657,7 +3095,9 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	sideMismatch := false
 	hasBid, hasAsk := false, false
 	activeMakerOrders := s.executor.ActiveMakerOrders().Orders()
-	inventoryHeadroomExceeded := makerOrdersExceedInventoryBand(activeMakerOrders, inventoryBase, hardInventoryBand)
+	inventoryHeadroomBuyExceeded, inventoryHeadroomSellExceeded :=
+		makerOrderInventoryBandViolations(activeMakerOrders, inventoryBase, hardInventoryBand)
+	inventoryHeadroomExceeded := inventoryHeadroomBuyExceeded || inventoryHeadroomSellExceeded
 	if !s.lastMakerQuoteAt.IsZero() && (elapsed >= minRefreshInterval || fillRefreshPending) {
 		for _, order := range activeMakerOrders {
 			if order.Side == types.SideTypeBuy {
@@ -2683,7 +3123,10 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	}
 	fastEdgeLeaseExpired := fastEdgeImprovementBps >= quoteConfig.RefreshMoveBps
 	statisticalRealignment := false
-	oneSidedTargetRealignment := false
+	inventoryTargetReprice := targetRestoringQuoteRepriceRequired(
+		inventoryBase, projectionTargetBase, plan, activeBidPrice, activeAskPrice,
+		quoteConfig.RefreshMoveBps)
+	oneSidedTargetRealignment := inventoryTargetReprice
 	oneSidedTargetRiskRealignment := false
 	oneSidedCandidateCEJPY, oneSidedActiveCEJPY := 0.0, 0.0
 	statisticalScoreImprovement := 0.0
@@ -2918,31 +3361,52 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	// Do not cancel and submit in the same callback: the exchange/user-data
 	// cancel is asynchronous, so the old order can still be visible on the
 	// next BBO event. Repeated callbacks are rate-limited until that state
-	// settles, preventing duplicate replacement orders.
+	// settles, preventing duplicate replacement orders. Cancel only the side
+	// that worsens the violated edge; the opposite corrective side must retain
+	// its queue position.
 	if inventoryHeadroomExceeded {
+		violatingOrders := makerOrdersForInventoryBandViolations(
+			activeMakerOrders, inventoryBase, hardInventoryBand)
 		s.logMakerQuoteGate(now, "inventory-headroom-exceeded", logrus.Fields{
-			"activeMakerOrders": len(activeMakerOrders), "inventory": base,
+			"activeMakerOrders": len(activeMakerOrders), "violatingOrders": len(violatingOrders),
+			"inventory":    base,
 			"inventoryMin": hardInventoryBand.MinInventory, "inventoryMax": hardInventoryBand.MaxInventory,
+			"buyViolation": inventoryHeadroomBuyExceeded, "sellViolation": inventoryHeadroomSellExceeded,
 		})
-		if makerHeadroomCancelDue(now, s.makerHeadroomCancelAt, minRefreshInterval) {
-			if err := s.gracefulCancelMaker(ctx, "inventory-headroom-exceeded"); err != nil {
+		if len(violatingOrders) > 0 && makerHeadroomCancelDue(now, s.makerHeadroomCancelAt, minRefreshInterval) {
+			if err := s.gracefulCancelMakerOrders(ctx, "inventory-headroom-exceeded", violatingOrders...); err != nil {
 				log.WithError(err).Warn("market-maker headroom cancellation failed")
 				s.retryMakerFillRebalanceLocked(fillRebalanceGeneration)
 				return
 			}
 			s.makerHeadroomCancelAt = now
-			s.lastMakerQuoteAt = time.Time{}
-			s.makerTradingWindowStartedAt = time.Time{}
-			s.makerTradingWindowEndsAt = time.Time{}
-			s.lastMakerBid = fixedpoint.Zero
-			s.lastMakerAsk = fixedpoint.Zero
+			survivingBid := makerOrderSidePresent(activeMakerOrders, types.SideTypeBuy) &&
+				!inventoryHeadroomBuyExceeded
+			survivingAsk := makerOrderSidePresent(activeMakerOrders, types.SideTypeSell) &&
+				!inventoryHeadroomSellExceeded
+			if inventoryHeadroomBuyExceeded {
+				s.lastMakerBid = fixedpoint.Zero
+			}
+			if inventoryHeadroomSellExceeded {
+				s.lastMakerAsk = fixedpoint.Zero
+				s.makerAskSince = time.Time{}
+				s.makerAskAnchorMid = 0
+			}
+			if !survivingBid && !survivingAsk {
+				s.lastMakerQuoteAt = time.Time{}
+				s.makerTradingWindowStartedAt = time.Time{}
+				s.makerTradingWindowEndsAt = time.Time{}
+			}
 		}
 		return
 	}
 	// A failed exchange-feasibility projection is stable across adjacent BBO
 	// callbacks. Keep safety checks above active, but avoid rebuilding the same
 	// impossible replacement on every book event.
-	if makerEmptyBookRetryPending(
+	targetRestoringSideAvailable :=
+		(inventoryBase > projectionTargetBase+1e-12 && plan.AllowAsk && sellQuoteNotional.Sign() > 0) ||
+			(inventoryBase+1e-12 < projectionTargetBase && plan.AllowBid && buyQuoteNotional.Sign() > 0)
+	if !targetRestoringSideAvailable && makerEmptyBookRetryPending(
 		now, s.makerReplacementRetryAfter, len(activeMakerOrders), fillRebalanceGeneration,
 		s.makerNoOrderReferenceBid, s.makerNoOrderReferenceAsk,
 		ticker.Buy.Float64(), ticker.Sell.Float64(), quoteConfig.RefreshMoveBps,
@@ -3020,6 +3484,10 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	}
 	if s.lastMakerDiagnosticAt.IsZero() || now.Sub(s.lastMakerDiagnosticAt) >= 10*time.Second {
 		evidence := fastEvidence
+		diagnosticPlanReason := plan.Reason
+		if jointNoOrder {
+			diagnosticPlanReason = "no-order-joint-rejection"
+		}
 		log.WithFields(logrus.Fields{
 			"bid": ticker.Buy, "ask": ticker.Sell,
 			"availableBase": quoteBalances.AvailableBase, "quoteableBase": base,
@@ -3027,15 +3495,59 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"base": base, "quoteNotional": quoteNotional, "minNotional": s.Market.MinNotional,
 			"buyQuoteNotional": buyQuoteNotional, "sellQuoteNotional": sellQuoteNotional,
 			"posteriorInventoryTargetEnabled": posteriorInventoryTarget.Enabled, "posteriorInventoryTargetReason": posteriorInventoryTarget.Reason,
-			"fastTargetExecutionModelReady": fastTargetExecutionModelReady,
-			"posteriorInventoryTargetBase":  posteriorInventoryTarget.TargetBase, "posteriorInventoryUpProbability": posteriorInventoryTarget.UpProbability,
+			"posteriorInventoryTargetBase": posteriorInventoryTarget.TargetBase, "posteriorInventoryUpProbability": posteriorInventoryTarget.UpProbability,
 			"posteriorInventoryDirectionConfidence": posteriorInventoryTarget.DirectionConfidence,
 			"posteriorInventoryReturnMeanBps":       posteriorInventoryTarget.InventoryReturnMean, "posteriorInventoryReturnSEBps": posteriorInventoryTarget.InventoryReturnSE,
-			"posteriorInventoryPredictiveSDBps": posteriorInventoryTarget.InventoryPredictiveSD,
-			// DynamicInventoryAim is retained only for compatibility/research; it is
-			// no longer evaluated by the production quote path.
-			"dynamicInventoryAimEnabled":          false,
-			"dynamicInventoryAimReason":           "production actuator retired; posterior inventory target is authoritative",
+			"posteriorInventoryPredictiveSDBps":   posteriorInventoryTarget.InventoryPredictiveSD,
+			"causalKlinePivotEnabled":             quoteConfig.CausalKlinePivot.Enabled,
+			"causalKlinePivotShadowOnly":          quoteConfig.CausalKlinePivot.ShadowOnly,
+			"causalKlinePivotPredictionReady":     causalKlinePivotTarget.PredictionReady,
+			"causalKlinePivotModelReady":          causalKlinePivotTarget.ModelReady,
+			"causalKlinePivotTargetReady":         causalKlinePivotTarget.Ready,
+			"causalKlinePivotTargetApplied":       causalKlinePivotTarget.Applied,
+			"causalKlinePivotTargetReason":        causalKlinePivotTarget.Reason,
+			"causalKlinePivotTargetSignal":        causalKlinePivotTarget.Signal,
+			"causalKlinePivotTargetShrinkage":     causalKlinePivotTarget.Shrinkage,
+			"causalKlinePivotTargetShiftRatio":    causalKlinePivotTarget.ShiftRatio,
+			"causalKlinePivotBaseTargetRatio":     causalKlinePivotTarget.BaseTargetRatio,
+			"causalKlinePivotSelectedTargetRatio": causalKlinePivotTarget.TargetRatio,
+			"causalKlinePivotMaturedLabels":       causalKlinePivotTarget.MaturedLabels,
+			"causalKlinePivotPredictedKind":       s.makerCausalKlineDecision.PredictedKind.String(),
+			"causalKlinePivotPredictedDirection":  s.makerCausalKlineDecision.PredictedDirection,
+			"causalKlinePivotProbabilityHigh":     causalKlinePivotTarget.ProbabilityHigh,
+			"causalKlinePivotProbabilityLow":      causalKlinePivotTarget.ProbabilityLow,
+			"causalKlinePivotProbabilityNeutral":  causalKlinePivotTarget.ProbabilityNeutral,
+			"dynamicInventoryAimEnabled":          quoteConfig.DynamicInventoryAim.Enabled,
+			"dynamicInventoryAimReason":           dynamicInventoryAim.Reason,
+			"dynamicInventoryAimGateReason":       dynamicInventoryAim.GateReason,
+			"dynamicInventoryAimApplied":          dynamicInventoryAim.Applied,
+			"dynamicInventoryAimGatePassed":       dynamicInventoryAim.GatePassed,
+			"dynamicInventoryAimTargetShiftRatio": dynamicInventoryAim.TargetShiftRatio,
+			"causalRegimeTargetEnabled":           causalRegimeTargetEnabled,
+			"causalRegimeTargetApplied":           causalRegimeTargetApplied,
+			"causalRegimeTargetReady":             causalRegimeTarget.Ready,
+			"causalRegimeTargetReason":            causalRegimeTarget.Reason,
+			"causalRegimeTargetCurrentWeight":     causalRegimeTarget.CurrentWeight,
+			"causalRegimeTargetPriorWeight":       causalRegimeTarget.PriorWeight,
+			"causalRegimeTargetWeight":            causalRegimeTarget.TargetWeight,
+			"causalRegimeTargetDeltaWeight":       causalRegimeTarget.TargetDeltaWeight,
+			"causalRegimeTargetGrossReturnBps":    causalRegimeTarget.GrossExpectedReturnBps,
+			"causalRegimeTargetShrunkReturnBps":   causalRegimeTarget.ShrunkExpectedReturnBps,
+			"causalRegimeTargetVarianceBps2":      causalRegimeTarget.PredictiveVarianceBps2,
+			"causalRegimeTargetOneWayCostBps":     causalRegimeTarget.OneWayCostBps,
+			"causalRegimeTargetOptimalCEBps":      causalRegimeTarget.OptimalCEBps,
+			"pivotRegimeTargetEnabled":            quoteConfig.DynamicInventoryAim.PivotRegimeTarget.Enabled || quoteConfig.DynamicInventoryAim.PivotRegimeTarget.CausalCEEnabled,
+			"pivotRegimeCausalCEEnabled":          quoteConfig.DynamicInventoryAim.PivotRegimeTarget.CausalCEEnabled,
+			// Report the source-of-truth pivot filter here. The legacy
+			// DynamicInventoryAim actuator is intentionally disabled in the live
+			// profile, so its copied fields would falsely report the CE pivot as
+			// cold even after successful prefill.
+			"pivotRegimeReady":                    pivotRegimeDecision.Ready,
+			"pivotRegimeHealthy":                  pivotRegimeDecision.Healthy,
+			"pivotRegimeDirection":                pivotRegimeDecision.Direction,
+			"pivotRegimeRemainingBps":             pivotRegimeDecision.RemainingAmplitudeBps,
+			"pivotRegimeExpectedBps":              pivotRegimeDecision.ExpectedLegAmplitudeBps,
+			"pivotRegimeQuantityScale":            dynamicInventoryAim.PivotRegimeQuantityScale,
 			"fastTargetSwitchingEnabled":          quoteConfig.FastTargetSwitching.Enabled,
 			"fastTargetSwitchingShadowOnly":       quoteConfig.FastTargetSwitching.ShadowOnly,
 			"fastTargetSwitchingApplied":          fastTargetSwitching.Applied,
@@ -3055,33 +3567,50 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"fastDriftValidationSamples": fastDrift.ValidationSamples, "fastDriftPrequentialSkill": fastDrift.PrequentialSkill,
 			"fastDriftValidationGainBps2": fastDrift.ValidationGainBps2, "fastDriftValidationGainSEBps2": fastDrift.ValidationGainSEBps2,
 			"fastDriftValidationProbability": fastDrift.ValidationProbability, "fastDriftStrength": fastDrift.Strength,
-			"fastDriftBBOStateTag":                 fastDriftBBOStateTag,
-			"asymmetricOscillationRiskEnabled":     quoteConfig.AsymmetricOscillationRisk.Enabled,
-			"asymmetricOscillationRiskShadowOnly":  quoteConfig.AsymmetricOscillationRisk.ShadowOnly,
-			"asymmetricOscillationRiskMultiplier":  asymmetricRiskDecision.RiskMultiplier,
-			"asymmetricOscillationRiskScore":       asymmetricRiskDecision.OscillationScore,
-			"asymmetricOscillationRiskAsymmetry":   asymmetricRiskDecision.AsymmetryScore,
-			"asymmetricOscillationRiskReady":       asymmetricRiskDecision.AsymmetryReady,
-			"asymmetricOscillationRiskUpSamples":   asymmetricRiskDecision.UpSamples,
-			"asymmetricOscillationRiskDownSamples": asymmetricRiskDecision.DownSamples,
-			"asymmetricOscillationRiskReason":      asymmetricRiskDecision.Reason,
-			"relativeHoldRiskEnabled":              relativeHoldRiskInput.Enabled,
-			"relativeHoldRiskShadowOnly":           relativeHoldRiskInput.ShadowOnly,
-			"relativeHoldRiskReady":                relativeHoldRiskInput.State.Ready,
-			"relativeHoldRiskDownsideReady":        relativeHoldRiskInput.State.DownsideReady,
-			"relativeHoldRiskMaturedLabels":        relativeHoldRiskInput.State.MaturedLabels,
-			"relativeHoldRiskEffectiveSamples":     relativeHoldRiskInput.State.EffectiveSamples,
-			"relativeHoldRiskDownsideSamples":      relativeHoldRiskInput.State.DownsideEffectiveSamples,
-			"relativeHoldRiskMeanExcessBps":        relativeHoldRiskInput.State.MeanExcessReturnBps,
-			"relativeHoldRiskTrackingErrorBps":     relativeHoldRiskInput.State.TrackingErrorBps,
-			"relativeHoldRiskDownsideBeta":         relativeHoldRiskInput.State.DownsideBeta,
-			"relativeHoldRiskReason":               relativeHoldRiskInput.State.Reason,
-			"fastDriftAskMeanBps":                  fastDrift.AskMeanBps, "fastDriftBidMeanBps": fastDrift.BidMeanBps,
+			"fastDriftBBOStateTag":                    fastDriftBBOStateTag,
+			"asymmetricOscillationRiskEnabled":        quoteConfig.AsymmetricOscillationRisk.Enabled,
+			"asymmetricOscillationRiskShadowOnly":     quoteConfig.AsymmetricOscillationRisk.ShadowOnly,
+			"asymmetricOscillationRiskMultiplier":     asymmetricRiskDecision.RiskMultiplier,
+			"asymmetricOscillationRiskScore":          asymmetricRiskDecision.OscillationScore,
+			"asymmetricOscillationRiskAsymmetry":      asymmetricRiskDecision.AsymmetryScore,
+			"asymmetricOscillationRiskReady":          asymmetricRiskDecision.AsymmetryReady,
+			"asymmetricOscillationRiskUpSamples":      asymmetricRiskDecision.UpSamples,
+			"asymmetricOscillationRiskDownSamples":    asymmetricRiskDecision.DownSamples,
+			"asymmetricOscillationRiskReason":         asymmetricRiskDecision.Reason,
+			"relativeHoldRiskEnabled":                 relativeHoldRiskInput.Enabled,
+			"relativeHoldRiskShadowOnly":              relativeHoldRiskInput.ShadowOnly,
+			"relativeHoldRiskReady":                   relativeHoldRiskInput.State.Ready,
+			"relativeHoldRiskDownsideReady":           relativeHoldRiskInput.State.DownsideReady,
+			"privateFillCalibrationEnabled":           privateFillCalibration.Enabled,
+			"privateFillCalibrationShadowOnly":        privateFillCalibration.ShadowOnly,
+			"privateFillCalibrationReady":             privateFillCalibration.Ready,
+			"privateFillCalibrationTouchReady":        privateFillCalibration.TouchReady,
+			"privateFillCalibrationStale":             privateFillCalibration.Stale,
+			"privateFillCalibrationReason":            privateFillCalibration.Reason,
+			"privateFillCalibrationFills":             privateFillCalibration.Fills,
+			"privateFillCalibrationEffectiveFills":    privateFillCalibration.EffectiveFills,
+			"privateFillCalibrationAge":               privateFillCalibration.Age,
+			"privateFillCalibrationMeanAdverseBps":    privateFillCalibration.MeanAdverseSelectionBps,
+			"privateFillCalibrationUpperAdverseBps":   privateFillCalibration.AdverseSelectionUpperBps,
+			"privateFillCalibrationTouchObservations": privateFillCalibration.TouchObservations,
+			"privateFillCalibrationTouchFills":        privateFillCalibration.TouchFills,
+			"privateFillCalibrationTouchToFill":       privateFillCalibration.TouchToFillProbability,
+			"privateFillCalibrationTouchLower":        privateFillCalibration.TouchToFillLowerBound,
+			"privateFillCalibrationAdverseApplied":    privateFillAdverseApplied,
+			"privateFillCalibrationTouchApplied":      privateFillTouchApplied,
+			"relativeHoldRiskMaturedLabels":           relativeHoldRiskInput.State.MaturedLabels,
+			"relativeHoldRiskEffectiveSamples":        relativeHoldRiskInput.State.EffectiveSamples,
+			"relativeHoldRiskDownsideSamples":         relativeHoldRiskInput.State.DownsideEffectiveSamples,
+			"relativeHoldRiskMeanExcessBps":           relativeHoldRiskInput.State.MeanExcessReturnBps,
+			"relativeHoldRiskTrackingErrorBps":        relativeHoldRiskInput.State.TrackingErrorBps,
+			"relativeHoldRiskDownsideBeta":            relativeHoldRiskInput.State.DownsideBeta,
+			"relativeHoldRiskReason":                  relativeHoldRiskInput.State.Reason,
+			"fastDriftAskMeanBps":                     fastDrift.AskMeanBps, "fastDriftBidMeanBps": fastDrift.BidMeanBps,
 			"fastDriftRawCenterMeanBps": fastDrift.RawCenterMeanBps, "fastDriftCenterMeanBps": fastDrift.CenterMeanBps,
 			"fastDriftCenterVarianceBps2": fastDrift.CenterVarianceBps2,
 			"buyQuoteFactor":              plan.BidQuoteFactor, "sellQuoteFactor": plan.AskQuoteFactor,
 			"minQuantity": s.Market.MinQuantity, "canBuy": canBuy, "canSell": canSell,
-			"plan": plan.Reason, "allowBid": plan.AllowBid, "allowAsk": plan.AllowAsk,
+			"plan": diagnosticPlanReason, "allowBid": plan.AllowBid, "allowAsk": plan.AllowAsk,
 			"modelHealth": modelSnapshot.Health, "modelUp": modelSnapshot.Up,
 			"modelDown": modelSnapshot.Down, "modelEventAge": modelSnapshot.Age,
 			"fastHealth": fastSnapshot.Health, "fastWindowSelected": selectedFastWindow,
@@ -3101,6 +3630,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"multiscaleDirectionApplied":        multiscaleDirectionApplied,
 			"fastEdgeLeaseExpired":              fastEdgeLeaseExpired, "fastEdgeImprovementBps": fastEdgeImprovementBps,
 			"statisticalRealignment":                       statisticalRealignment,
+			"inventoryTargetReprice":                       inventoryTargetReprice,
 			"oneSidedTargetRealignment":                    oneSidedTargetRealignment,
 			"oneSidedTargetRiskRealignment":                oneSidedTargetRiskRealignment,
 			"oneSidedTargetCandidateCEJPY":                 oneSidedCandidateCEJPY,
@@ -3423,6 +3953,10 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"macroActiveExecutionMaximumImpactBps":       macroActiveExecution.MaximumImpactBps,
 			"macroActiveExecutionWorstPrice":             macroActiveExecution.WorstPrice,
 			"fastTargetExecutionEnabled":                 quoteConfig.FastTargetExecution.Enabled,
+			"fastTargetExecutionEvidenceReady":           fastTargetExecutionEvidenceReady,
+			"fastTargetExecutionReferenceHorizonReady":   fastTargetExecution.ReferenceHorizonReady,
+			"fastTargetExecutionReferenceMaturityAt":     fastTargetExecution.ReferenceMaturityAt,
+			"fastTargetExecutionDecisionEvaluated":       fastTargetExecution.DecisionEvaluated,
 			"fastTargetExecutionTrigger":                 fastTargetExecution.Trigger,
 			"fastTargetExecutionReason":                  fastTargetExecution.Reason,
 			"fastTargetExecutionDirection":               fastTargetExecution.Direction,
@@ -3489,6 +4023,11 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"quantityProjectionShadowOnly":               quoteConfig.ProbabilityCenteredQuantity.ShadowOnly,
 			"fastQuantityOwner":                          "probability-centered-fast",
 			"fastQuantityFallbackUsed":                   fastQuantityFallbackUsed,
+			"targetAwareFallbackEnabled":                 targetAwareFallback.Enabled,
+			"targetAwareFallbackReason":                  targetAwareFallback.Reason,
+			"targetAwareFallbackDirection":               targetAwareFallback.CorrectiveDirection,
+			"targetAwareFallbackBuyJPY":                  targetAwareFallback.BuyNotionalJPY,
+			"targetAwareFallbackSellJPY":                 targetAwareFallback.SellNotionalJPY,
 			"fastQuantityBaselineBuyCapJPY":              fastQuantityCapacity.BaselineBuyCapJPY,
 			"fastQuantityBaselineSellCapJPY":             fastQuantityCapacity.BaselineSellCapJPY,
 			"fastQuantityPathModelBuyCapJPY":             fastQuantityCapacity.PathModelBuyCapJPY,
@@ -3681,9 +4220,13 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			"inventoryResetUpRatePerHour":      inventoryResetUpRatePerHour,
 			"inventoryResetFillIntensityValid": inventoryResetFillIntensityValid,
 			"adverseAskMoveBps":                adverseAskMoveBps, "adverseBidMoveBps": adverseBidMoveBps,
-			"adverseRepriceBps":    quoteConfig.AdverseRepriceBps,
-			"inventoryExposureAge": exposureAge,
-			"refreshMin":           minRefreshInterval, "refreshMax": refreshInterval,
+			"adverseRepriceBps":              quoteConfig.AdverseRepriceBps,
+			"inventoryExposureAge":           exposureAge,
+			"inventoryHeadroomBuyViolation":  inventoryHeadroomBuyExceeded,
+			"inventoryHeadroomSellViolation": inventoryHeadroomSellExceeded,
+			"jointPairRejected":              jointPairRejected,
+			"jointNoOrder":                   jointNoOrder,
+			"refreshMin":                     minRefreshInterval, "refreshMax": refreshInterval,
 			"modelReferenceAge": now.Sub(s.State.LastReferenceTime),
 		}).Info("market-maker quote evaluation")
 		s.lastMakerDiagnosticAt = now
@@ -3755,54 +4298,14 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			submits = append(submits, types.SubmitOrder{Symbol: s.Symbol, Market: s.Market, Side: types.SideTypeSell, Type: types.OrderTypeLimitMaker, Price: price, Quantity: qty, ClientOrderID: marketMakerClientOrderID(types.SideTypeSell), Tag: "gammacapture-mm-ask"})
 		}
 	}
-	if fastValueRejected {
-		// A no-order action is different from an exchange-infeasible replacement.
-		// Preserve an already-resting bilateral pair only when every independent
-		// safety/refresh condition says that the old quotes are still valid. This
-		// avoids an empty-book interval caused solely by rejecting a new candidate,
-		// while crossed, expired, adverse, inventory, lifecycle, and fill-refresh
-		// states still fail closed below.
-		if preserveActiveTwoSidedQuotesAfterFastRejection(
-			quoteConfig.JointDistanceQuantity,
-			activeBid, activeAsk, fillRefreshPending,
-			quoteCrossed, adverseMove, materialMove, materialImbalance,
-			windowExpired, inventoryHeadroomExceeded, fastEdgeLeaseExpired,
-			statisticalRealignment, oneSidedTargetRealignment,
-			macroTargetRealignment, fastTargetRealignment, reservationRiskRealignment,
-			earlyBumpDecision.Refresh, lifecycleReplace,
-		) {
-			modelUpdateInterval := time.Duration(quoteConfig.HorizonUpdateInterval)
-			if modelUpdateInterval <= 0 {
-				modelUpdateInterval = windowDuration
-			}
-			if modelUpdateInterval <= 0 {
-				modelUpdateInterval = time.Minute
-			}
-			s.lastMakerQuoteAt = now
-			s.lastMakerMid = mid
-			s.lastMakerBestBid = ticker.Buy.Float64()
-			s.lastMakerBestAsk = ticker.Sell.Float64()
-			s.lastMakerImbalance = imbalance
-			s.lastMakerBid = fixedpoint.NewFromFloat(activeBidPrice)
-			s.lastMakerAsk = fixedpoint.NewFromFloat(activeAskPrice)
-			s.makerTradingWindowStartedAt = now
-			s.makerTradingWindowEndsAt = now.Add(modelUpdateInterval)
-			s.makerReplacementRetryAfter = now.Add(modelUpdateInterval)
-			s.makerNoOrderReferenceBid = 0
-			s.makerNoOrderReferenceAsk = 0
-			s.State.LastDecision = "Fast rejection: retained safe bilateral maker quotes"
-			log.WithFields(logrus.Fields{
-				"symbol": s.Symbol, "reason": jointQuoteDecision.Reason,
-				"activeBid": activeBidPrice, "activeAsk": activeAskPrice,
-				"window": modelUpdateInterval,
-			}).Info("market-maker Fast rejection retained safe bilateral quotes")
-			return
-		}
-		// No safe continuity floor is available. A no-order action is different
-		// from an exchange-infeasible replacement: keeping the old maker orders
-		// would execute the opportunity that the Fast value model just rejected.
-		// Cancel only; do not manufacture a replacement or invoke the ordinary
-		// ten-second retry loop.
+	if jointNoOrder {
+		// The joint optimizer is allowed to produce a genuine no-order decision,
+		// including clearing SELL.  This branch is reached only when the rejected
+		// pair had no target-restoring side admitted by side-level fallback; a
+		// rejected pair with an admitted target-restoring side is handled by the
+		// normal side-aware replace path above. Do not apply a bilateral continuity
+		// floor here: an applied joint plan remains authoritative when it deliberately
+		// clears SELL.
 		if len(activeMakerOrders) > 0 {
 			if err := s.gracefulCancelMakerOrders(
 				ctx, "Fast fee-value rejection", activeMakerOrders...); err != nil {
@@ -3819,6 +4322,8 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 		s.makerTradingWindowEndsAt = now.Add(modelUpdateInterval)
 		s.lastMakerBid = fixedpoint.Zero
 		s.lastMakerAsk = fixedpoint.Zero
+		s.makerAskSince = time.Time{}
+		s.makerAskAnchorMid = 0
 		s.makerReplacementRetryAfter = now.Add(modelUpdateInterval)
 		s.makerNoOrderReferenceBid = ticker.Buy.Float64()
 		s.makerNoOrderReferenceAsk = ticker.Sell.Float64()
@@ -3830,6 +4335,42 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	// temporarily unexecutable near the inventory target; destroying a safe
 	// opposite-side quote in that state creates a needless empty-book interval.
 	if len(submits) == 0 {
+		// A side that the current plan explicitly disallows must still be removed
+		// even when the allowed side has no exchange-valid replacement. This is
+		// especially important for an applied joint plan that deliberately clears
+		// SELL. It is separate from the no-replacement case, where an allowed
+		// resting side is retained rather than cancelled.
+		disallowedOrders := makerOrdersForDisallowedSides(
+			activeMakerOrders, plan.AllowBid, plan.AllowAsk)
+		if len(disallowedOrders) > 0 && (sideMismatch || jointPairRejected) {
+			reason := "quote-policy-side-clear"
+			if jointPairRejected {
+				reason = "joint-rejection-side-clear"
+			}
+			if err := s.gracefulCancelMakerOrders(ctx, reason, disallowedOrders...); err != nil {
+				log.WithError(err).Warn("market-maker disallowed-side cancellation failed")
+				s.retryMakerFillRebalanceLocked(fillRebalanceGeneration)
+				return
+			}
+			cancelBid := makerOrderSidePresent(disallowedOrders, types.SideTypeBuy)
+			cancelAsk := makerOrderSidePresent(disallowedOrders, types.SideTypeSell)
+			if cancelBid {
+				s.lastMakerBid = fixedpoint.Zero
+			}
+			if cancelAsk {
+				s.lastMakerAsk = fixedpoint.Zero
+				s.makerAskSince = time.Time{}
+				s.makerAskAnchorMid = 0
+			}
+			survivingBid := makerOrderSidePresent(activeMakerOrders, types.SideTypeBuy) && !cancelBid
+			survivingAsk := makerOrderSidePresent(activeMakerOrders, types.SideTypeSell) && !cancelAsk
+			if !survivingBid && !survivingAsk {
+				s.lastMakerQuoteAt = time.Time{}
+				s.makerTradingWindowStartedAt = time.Time{}
+				s.makerTradingWindowEndsAt = time.Time{}
+			}
+			return
+		}
 		const noReplacementRetryDelay = 10 * time.Second
 		s.makerReplacementRetryAfter = now.Add(noReplacementRetryDelay)
 		s.makerNoOrderReferenceBid = 0
@@ -3858,9 +4399,7 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	if makerTerminalFillDefersReplacement(
 		fillRebalanceGeneration, terminalFillSequenceAtStart,
 		s.makerTerminalFillSequence.Load(), terminalFillObservedAt, time.Now()) {
-		log.WithFields(logrus.Fields{
-			"symbol": s.Symbol, "fillSequence": s.makerTerminalFillSequence.Load(),
-		}).Info("market-maker normal refresh deferred to terminal-fill rebalance")
+		s.logMakerTerminalFillDeferral(now, "pre-cancel")
 		return
 	}
 	// Cancel only sides that have an executable replacement. A fixed-price side
@@ -3878,13 +4417,11 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 	if makerTerminalFillDefersReplacement(
 		fillRebalanceGeneration, terminalFillSequenceAtStart,
 		s.makerTerminalFillSequence.Load(), terminalFillObservedAt, time.Now()) {
-		log.WithFields(logrus.Fields{
-			"symbol": s.Symbol, "fillSequence": s.makerTerminalFillSequence.Load(),
-		}).Info("market-maker post-cancel submission deferred to terminal-fill rebalance")
+		s.logMakerTerminalFillDeferral(now, "post-cancel")
 		return
 	}
 	if len(submits) > 0 {
-		if _, err := s.executor.SubmitOrders(ctx, submits...); err != nil {
+		if _, err := s.submitOrders(ctx, submits...); err != nil {
 			s.State.LastDecision = "maker quote rejected: " + err.Error()
 			log.WithError(err).Error("market-maker quote submission failed")
 			s.retryMakerFillRebalanceLocked(fillRebalanceGeneration)
@@ -3899,11 +4436,20 @@ func (s *Strategy) onMarketMakerBookWithEvidence(ctx context.Context, ticker typ
 			}
 			log.WithFields(logrus.Fields{
 				"orders":                  len(submits),
+				"executionPath":           "resting-maker-quote",
+				"orderType":               "LIMIT_MAKER",
+				"timeInForce":             "GTC",
+				"submittedBidPrice":       submittedBidPrice,
+				"submittedAskPrice":       submittedAskPrice,
 				"submittedBidQuantity":    submittedBidQuantity,
 				"submittedAskQuantity":    submittedAskQuantity,
 				"submittedBidNotionalJPY": submittedBidQuantity.Mul(submittedBidPrice),
 				"submittedAskNotionalJPY": submittedAskQuantity.Mul(submittedAskPrice),
 				"inventoryBandOrderSize":  inventoryBand.OrderSize,
+				"inventoryTargetRatio":    effectiveInventoryTargetRatio,
+				"selectedTargetRatio":     selectedProjectionTargetRatio,
+				"inventoryControlReason":  inventoryControl.Reason,
+				"actuationDirection":      actuation.Direction,
 			}).Info("market-maker quotes submitted")
 			s.makerReplacementRetryAfter = time.Time{}
 			s.makerNoOrderReferenceBid = 0
@@ -3993,7 +4539,27 @@ func makerMinimumExecutableQuantity(market types.Market, price fixedpoint.Value)
 	quantity := market.AdjustQuantityByMinNotional(fixedpoint.Zero, price)
 	quantity = market.AdjustQuantityByMinQuantity(quantity)
 	quantity = market.RoundUpByStepSize(quantity)
-	return market.GreaterThanMinimalOrderQuantity(types.SideTypeSell, price, quantity)
+	// Market.TruncateQuantity currently converts the fixed-point value through
+	// float64 before truncating. At an exact step boundary (for example,
+	// ETHJPY 0.00026 * 100000 can become 25.999999999999996), that conversion
+	// can drop the candidate one lot below the minimum notional and falsely
+	// report that the exchange minimum is unavailable. Probe a bounded number
+	// of subsequent lots; the returned quantity is still the same validator's
+	// truncated, submission-ready quantity. This keeps the correction local to
+	// the minimum-ticket probe without changing the framework validator's
+	// behavior for ordinary order sizing.
+	step := market.StepSize
+	for attempts := 0; attempts < 4; attempts++ {
+		if executable, ok := market.GreaterThanMinimalOrderQuantity(
+			types.SideTypeSell, price, quantity); ok {
+			return executable, true
+		}
+		if step.Sign() <= 0 {
+			break
+		}
+		quantity = quantity.Add(step)
+	}
+	return fixedpoint.Zero, false
 }
 
 // makerMinimumExecutableBuyCapacity returns the smallest quote capacity that
@@ -4099,9 +4665,13 @@ func targetCenteredInventoryOrderCaps(band InventoryBand, inventory, price, maxL
 	return TargetCenteredInventoryOrderCaps(band, inventory, price, maxLevels)
 }
 
-func makerOrdersExceedInventoryBand(orders types.OrderSlice, inventory float64, band InventoryBand) bool {
+// makerOrderInventoryBandViolations identifies which reservation side breaches
+// the hard inventory band. Keeping the side identity is essential: an
+// inventory-reducing SELL remains safe when an inventory-increasing BUY
+// reservation is over the upper edge, and vice versa.
+func makerOrderInventoryBandViolations(orders types.OrderSlice, inventory float64, band InventoryBand) (buy, sell bool) {
 	if band.MaxInventory <= band.MinInventory {
-		return false
+		return false, false
 	}
 	var remainingBuy, remainingSell float64
 	for _, order := range orders {
@@ -4125,8 +4695,62 @@ func makerOrdersExceedInventoryBand(orders types.OrderSlice, inventory float64, 
 	// no resting orders. Reject only an order reservation that would breach (or
 	// further worsen) its corresponding edge; ordinary quote planning below
 	// will independently disable the risk-increasing side.
-	return (remainingBuy > quantityTolerance && inventory+remainingBuy > band.MaxInventory+quantityTolerance) ||
-		(remainingSell > quantityTolerance && inventory-remainingSell < band.MinInventory-quantityTolerance)
+	buy = remainingBuy > quantityTolerance && inventory+remainingBuy > band.MaxInventory+quantityTolerance
+	sell = remainingSell > quantityTolerance && inventory-remainingSell < band.MinInventory-quantityTolerance
+	return buy, sell
+}
+
+func makerOrdersExceedInventoryBand(orders types.OrderSlice, inventory float64, band InventoryBand) bool {
+	buy, sell := makerOrderInventoryBandViolations(orders, inventory, band)
+	return buy || sell
+}
+
+func makerOrdersForInventoryBandViolations(
+	orders types.OrderSlice, inventory float64, band InventoryBand,
+) types.OrderSlice {
+	buyViolation, sellViolation := makerOrderInventoryBandViolations(orders, inventory, band)
+	if !buyViolation && !sellViolation {
+		return nil
+	}
+	violating := make(types.OrderSlice, 0, len(orders))
+	for _, order := range orders {
+		if order.GetRemainingQuantity().Sign() <= 0 {
+			continue
+		}
+		if (order.Side == types.SideTypeBuy && buyViolation) ||
+			(order.Side == types.SideTypeSell && sellViolation) {
+			violating = append(violating, order)
+		}
+	}
+	return violating
+}
+
+func makerOrdersForDisallowedSides(
+	orders types.OrderSlice, allowBid, allowAsk bool,
+) types.OrderSlice {
+	if allowBid && allowAsk {
+		return nil
+	}
+	result := make(types.OrderSlice, 0, len(orders))
+	for _, order := range orders {
+		if order.GetRemainingQuantity().Sign() <= 0 {
+			continue
+		}
+		if (order.Side == types.SideTypeBuy && !allowBid) ||
+			(order.Side == types.SideTypeSell && !allowAsk) {
+			result = append(result, order)
+		}
+	}
+	return result
+}
+
+func makerOrderSidePresent(orders types.OrderSlice, side types.SideType) bool {
+	for _, order := range orders {
+		if order.Side == side && order.GetRemainingQuantity().Sign() > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func inventoryRiskVolatility(slow, fast float64, fastHealth ModelHealth) float64 {
@@ -4228,6 +4852,31 @@ func makerAdverseBBOChangeBps(referenceBid, referenceAsk, currentBid, currentAsk
 		bidBps = math.Log(currentBid/referenceBid) * 10_000
 	}
 	return askBps, bidBps
+}
+
+// targetRestoringQuoteRepriceRequired detects a materially stranded corrective
+// side. Ordinary quote refresh waits for the modeled first-passage lease, but a
+// target-restoring order that the new plan has moved materially closer to the
+// executable BBO must not remain at the old, unreachable price while inventory
+// is already away from target. The threshold is the configured transport move
+// threshold, so this remains O(1) and does not introduce another fitted gate.
+func targetRestoringQuoteRepriceRequired(
+	currentInventoryBase, targetInventoryBase float64,
+	plan MarketMakerQuotePlan, activeBidPrice, activeAskPrice, moveThresholdBps float64,
+) bool {
+	if moveThresholdBps <= 0 || math.IsNaN(moveThresholdBps) || math.IsInf(moveThresholdBps, 0) {
+		return false
+	}
+	tolerance := math.Max(1e-12, math.Abs(targetInventoryBase)*1e-12)
+	if currentInventoryBase > targetInventoryBase+tolerance && plan.AllowAsk &&
+		activeAskPrice > 0 && plan.AskPrice > 0 && plan.AskPrice < activeAskPrice {
+		return math.Log(activeAskPrice/plan.AskPrice)*10_000 >= moveThresholdBps
+	}
+	if currentInventoryBase < targetInventoryBase-tolerance && plan.AllowBid &&
+		activeBidPrice > 0 && plan.BidPrice > activeBidPrice {
+		return math.Log(plan.BidPrice/activeBidPrice)*10_000 >= moveThresholdBps
+	}
+	return false
 }
 
 // makerHeadroomCancelDue rate-limits cancellation-only headroom corrections while
@@ -4518,7 +5167,7 @@ func marketableIOCPriceWithReference(market types.Market, side types.SideType, t
 	}
 }
 
-func (s *Strategy) executeFastTargetIOC(ctx context.Context, ticker types.BookTicker, modelUpdatedAt time.Time, decision FastTargetExecutionDecision) bool {
+func (s *Strategy) executeFastTargetIOC(ctx context.Context, ticker types.BookTicker, modelUpdatedAt time.Time, decision FastTargetExecutionDecision, evidenceSource string) bool {
 	if !decision.Trigger || decision.Direction == 0 || decision.Quantity <= 0 || decision.WorstPrice <= 0 {
 		return false
 	}
@@ -4606,7 +5255,7 @@ func (s *Strategy) executeFastTargetIOC(ctx context.Context, ticker types.BookTi
 		}).Warn("Fast target execution rebased IOC fell below exchange quantity filters")
 		return false
 	}
-	_, err := s.executor.SubmitOrders(ctx, types.SubmitOrder{
+	_, err := s.submitOrders(ctx, types.SubmitOrder{
 		Symbol: s.Symbol, Market: s.Market, Side: side,
 		Type: types.OrderTypeLimit, TimeInForce: types.TimeInForceIOC,
 		Price: price, Quantity: quantity,
@@ -4622,7 +5271,12 @@ func (s *Strategy) executeFastTargetIOC(ctx context.Context, ticker types.BookTi
 		bbgo.Sync(ctx, s)
 	}
 	log.WithFields(logrus.Fields{
-		"side": side, "quantity": quantity, "price": price, "iocPriceClampedToPercentFilter": priceClamped,
+		"side": side, "quantity": quantity, "price": price,
+		"executionPath": "fast-target-ioc", "orderType": "LIMIT", "timeInForce": "IOC",
+		"evidenceSource":                    evidenceSource,
+		"referenceHorizonReady":             decision.ReferenceHorizonReady,
+		"referenceMaturityAt":               decision.ReferenceMaturityAt,
+		"iocPriceClampedToPercentFilter":    priceClamped,
 		"iocPriceRebasedAfterCancel":        priceRebasedAfterCancel,
 		"targetGapBase":                     decision.TargetGapBase,
 		"residualMakerGapBase":              decision.ResidualMakerGapBase,
@@ -4696,7 +5350,7 @@ func (s *Strategy) executeMacroActiveIOC(ctx context.Context, ticker types.BookT
 			return false
 		}
 	}
-	_, err := s.executor.SubmitOrders(ctx, types.SubmitOrder{
+	_, err := s.submitOrders(ctx, types.SubmitOrder{
 		Symbol: s.Symbol, Market: s.Market, Side: side,
 		Type: types.OrderTypeLimit, TimeInForce: types.TimeInForceIOC,
 		Price: price, Quantity: quantity,
@@ -4756,7 +5410,7 @@ func (s *Strategy) executeInventoryReset(ctx context.Context, ticker types.BookT
 		return
 	}
 
-	_, err := s.executor.SubmitOrders(ctx, types.SubmitOrder{
+	_, err := s.submitOrders(ctx, types.SubmitOrder{
 		Symbol: s.Symbol, Market: s.Market, Side: types.SideTypeSell,
 		Type: types.OrderTypeLimit, TimeInForce: types.TimeInForceIOC,
 		Price: price, Quantity: quantity, Tag: "gammacapture-inventory-reset",
@@ -4821,7 +5475,7 @@ func (s *Strategy) executeAcquisitionReset(ctx context.Context, ticker types.Boo
 		log.WithError(err).Warn("acquisition reset cancel failed")
 		return
 	}
-	_, err := s.executor.SubmitOrders(ctx, types.SubmitOrder{
+	_, err := s.submitOrders(ctx, types.SubmitOrder{
 		Symbol: s.Symbol, Market: s.Market, Side: types.SideTypeBuy,
 		Type: types.OrderTypeLimit, TimeInForce: types.TimeInForceIOC,
 		Price: price, Quantity: quantity, Tag: "gammacapture-acquisition-reset",

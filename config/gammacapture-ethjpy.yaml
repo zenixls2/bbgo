@@ -27,11 +27,17 @@ sync:
   userDataStream:
     trades: true
     orders: true
+    privateOrderFillLedger: true
   sessions:
     - binance
   symbols:
     - session: binance
       symbol: ETHJPY
+
+environment:
+  # Immutable deployment label written to every framework private event.
+  # Change this when the production strategy/configuration bundle changes.
+  productionVersion: gammacapture-ethjpy-2026-08-27-pivot-ce-v1
 
 # Persist fee-adjusted position cost and reset cooldowns across service restarts.
 persistence:
@@ -129,6 +135,31 @@ exchangeStrategies:
         # Refresh authenticated balances so external JPY/base changes are
         # reflected in position sizing without restarting BBGO.
         accountSyncInterval: 60s
+        # Append-only authenticated order/fill evidence for private queue and
+        # adverse-selection calibration. This is observation-only and does not
+        # participate in quote decisions. Keep the path per symbol.
+        privateOrderFillLedger:
+          enabled: true
+          path: data/gammacapture/state/private-ledger/ETHJPY.jsonl
+          productionVersion: gammacapture-ethjpy-2026-08-27-pivot-ce-v1
+          # fsync on every callback is safer but adds disk latency to order
+          # callbacks; regular writes plus close-time sync are the live default.
+          syncEachEvent: false
+        # Causal private-fill calibration. It only raises adverse-selection
+        # protection or lowers touch-to-fill probability after matured,
+        # timestamped private observations reach the EW sample thresholds.
+        # Warming is diagnostic-only and never blocks an otherwise valid quote.
+        privateFillCalibration:
+          enabled: true
+          shadowOnly: false
+          horizon: 5m
+          halfLife: 24h
+          minimumFills: 32
+          minimumTouchObservations: 32
+          confidenceZScore: 1.645
+          maxAdverseSelectionBps: 50
+          maxPendingFills: 4096
+          maxTrackedOrders: 256
         # Conservative fee floors: authenticated session/account rates may
         # raise these values, but cannot lower the configured budget.
         makerFeeBps: 10
@@ -152,15 +183,26 @@ exchangeStrategies:
         # Macro inventory controller.  Changing Macro risk does not retune
         # Fast quantity, target switching, or IOC decisions.
         fastRiskAversion: 1.0
-        # Center Fast quantity and terminal inventory risk on one same-horizon
-        # executable-BBO posterior. Neutral evidence retains the 50% strategic
-        # target; supported upside/downside moves the bounded aim toward the
-        # configured hard capital limits. Price drift does not disable it.
-        posteriorInventoryTarget: true
-        # Retained for YAML/checkpoint compatibility and isolated research;
-        # the DynamicInventoryAim production actuator has been retired after
-        # negative next-pivot PnL identification. PosteriorInventoryTarget is
-        # now the sole same-horizon target source in the live quote path.
+        # The causal pivot CE owner is the sole same-horizon inventory target.
+        # Two independent target owners would make the inventory decision
+        # non-causal and could silently overwrite a pivot-derived target.
+        posteriorInventoryTarget: false
+        # Keep the separate delayed-label Kline overlay off so it cannot
+        # compete with or overwrite the pivot-regime decision.
+        causalKlinePivot:
+          enabled: false
+          shadowOnly: false
+          interval: 3m
+          minimumTrainingLabels: 32
+          learningRate: 0.05
+          l2: 0.001
+          minReversalBps: 0
+          maxTargetShiftRatio: 0.05
+          minimumProbabilityEdge: 0.10
+          priorLabels: 32
+        # Retained for YAML/checkpoint compatibility and isolated research.
+        # The causal pivot CE owner below is now the sole same-horizon
+        # inventory target source in the live quote path.
         dynamicInventoryAim:
           enabled: false
           shadowOnly: false
@@ -173,25 +215,31 @@ exchangeStrategies:
           # live profile until an untouched same-symbol walk-forward confirms
           # the P&L/correlation trade-off.
           # priceBetaTarget: 0.35
-          # Research-only single regime-conditioned target shift. The causal
-          # Keep disabled in production: the original replay compared an
-          # implicitly disabled candidate arm, and the corrected paired replay
-          # still failed private-fill calibration and worsened drawdown. The
-          # retained implementation uses terminal side-BBO drift only after
-          # the fee/risk confidence bound; crossing arrival rates never enter
-          # the inventory target.
+          # Retained research-only regime-conditioned target shift. Keep it
+          # disabled: the corrected paired replay did not justify promotion.
           regimeConditionedTarget:
             enabled: false
             kappa: 0.20
             maxShiftRatio: 0.20
             priorEffectiveSamples: 8
-          # Pivot-first causal directional-change target. The code path is
-          # integrated and replay-testable, but remains disabled until private
-          # fill/queue calibration demonstrates positive active-leg value.
+          # Pivot-first causal directional-change target. The CE owner below
+          # is promoted by explicit operator request. Private-fill calibration
+          # remains an outstanding release risk and is monitored separately;
+          # it must never turn target warm-up into a quote admission gate.
           pivotRegimeTarget:
             enabled: false
+            # Sole production target owner. It uses the pivot leg as the
+            # source of truth and charges maker fee plus adverse selection in
+            # the CE objective; it does not block quotes while warming.
+            causalCEEnabled: true
+            causalRiskAversion: 0.02
+            causalPriorStrengthBps: 8
             reversalBps: 26
             maxGap: 15m
+            # The CE owner requires longer causal pivot context than the
+            # six-hour Fast horizon. Startup extends only the bounded replay
+            # window; BBO updates are compacted to one observation/second.
+            startupWarmup: 24h
             minLegSamples: 2
             priorLegSamples: 2
             maxShiftRatio: 0.20
@@ -247,7 +295,10 @@ exchangeStrategies:
           # this live because it improves mixed/downside behavior without
           # creating range IOC turnover.
           shadowOnly: false
-        # Same-horizon Fast active execution. The empirical maker-touch
+        # Same-horizon Fast active execution. The target owner (posterior,
+        # dynamic aim, or causal pivot CE) supplies the target and its
+        # executable forecast; this IOC actuator is deliberately independent
+        # of the posteriorInventoryTarget flag. The empirical maker-touch
         # probability (with its calibration error) and the terminal inventory
         # posterior decide whether expected waiting loss exceeds the exact
         # maker-to-IOC cost. No fixed BPS trigger or Poisson arrival assumption
@@ -355,10 +406,10 @@ exchangeStrategies:
           confidenceZScore: 1.645
           candidateCount: 8 # numerical price-grid resolution; not an inventory-risk weight
 
-        # Portfolio policy bounds: 50% ETH / 50% JPY is the strategic prior,
-        # while 0% and 100% are hard outer limits. Fast alone derives price,
-        # quantity, expected 50/50 correction, and whole-position risk within
-        # these limits; remaining balance/inventory headroom is authoritative.
+        # Portfolio policy bounds: 50% ETH / 50% JPY is a soft strategic prior,
+        # not a safety target. The causal pivot CE controller may move the
+        # inventory center anywhere inside the 0%..100% hard outer limits;
+        # remaining balance/inventory headroom is authoritative.
         inventoryTargetRatio: 0.5 # fallback when pair-equity balances are unavailable
         inventoryCapitalMinRatio: 0.0
         inventoryCapitalTargetRatio: 0.50

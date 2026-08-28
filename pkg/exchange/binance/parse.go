@@ -154,6 +154,10 @@ func (e *ExecutionReportEvent) Order(isMargin, isIsolated bool) (*types.Order, e
 	}
 
 	orderCreationTime := e.OrderCreationTime.Time()
+	averagePrice := fixedpoint.Zero
+	if e.CumulativeFilledQuantity.Sign() > 0 && e.CumulativeQuoteAssetTransactedQuantity.Sign() > 0 {
+		averagePrice = e.CumulativeQuoteAssetTransactedQuantity.Div(e.CumulativeFilledQuantity)
+	}
 	return &types.Order{
 		SubmitOrder: types.SubmitOrder{
 			ClientOrderID: e.ClientOrderID,
@@ -162,6 +166,7 @@ func (e *ExecutionReportEvent) Order(isMargin, isIsolated bool) (*types.Order, e
 			Type:          toGlobalOrderType(binance.OrderType(e.OrderType)),
 			Quantity:      e.OrderQuantity,
 			Price:         e.OrderPrice,
+			AveragePrice:  averagePrice,
 			StopPrice:     e.StopPrice,
 			TimeInForce:   types.TimeInForce(e.TimeInForce),
 			ReduceOnly:    false,

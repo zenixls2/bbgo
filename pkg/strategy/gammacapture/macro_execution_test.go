@@ -179,3 +179,27 @@ func TestMacroMarketableIOCPriceUsesSideAwareEconomicRounding(t *testing.T) {
 		t.Fatalf("SELL worst price did not ceil safely: price=%s ok=%t", sell, ok)
 	}
 }
+
+func TestMarketableIOCPriceClampsPercentPriceBySide(t *testing.T) {
+	market := types.Market{
+		TickSize:                      fixedpoint.MustNewFromString("0.1"),
+		PercentPriceBidMultiplierDown: fixedpoint.MustNewFromString("0.98"),
+		PercentPriceBidMultiplierUp:   fixedpoint.MustNewFromString("1.02"),
+		PercentPriceAskMultiplierDown: fixedpoint.MustNewFromString("0.98"),
+		PercentPriceAskMultiplierUp:   fixedpoint.MustNewFromString("1.02"),
+	}
+	ref := fixedpoint.MustNewFromString("100")
+	touch := fixedpoint.MustNewFromString("100")
+	buy, ok, clamped := marketableIOCPriceWithReference(market, types.SideTypeBuy, touch, 105, ref)
+	if !ok || !clamped || buy.String() != "102" {
+		t.Fatalf("BUY IOC should be clamped to side-aware upper bound: price=%s ok=%t clamped=%t", buy, ok, clamped)
+	}
+	sell, ok, clamped := marketableIOCPriceWithReference(market, types.SideTypeSell, touch, 95, ref)
+	if !ok || !clamped || sell.String() != "98" {
+		t.Fatalf("SELL IOC should be clamped to side-aware lower bound: price=%s ok=%t clamped=%t", sell, ok, clamped)
+	}
+	market.PercentPriceBidMultiplierUp = fixedpoint.MustNewFromString("0.99")
+	if _, ok, _ := marketableIOCPriceWithReference(market, types.SideTypeBuy, touch, 100, ref); ok {
+		t.Fatalf("BUY should fail closed when exchange upper bound is below the ask touch")
+	}
+}

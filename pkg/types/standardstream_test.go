@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,9 @@ import (
 // helper to start a minimal gorilla/websocket server for tests
 func startTestWSServer(t *testing.T, onConn func(*websocket.Conn)) (wsURL string, closeFn func()) {
 	t.Helper()
+	if os.Getenv("TEST_LOCAL_NETWORK") != "1" {
+		t.Skip("requires local listener; set TEST_LOCAL_NETWORK=1 to run")
+	}
 	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := upgrader.Upgrade(w, r, nil)
@@ -69,7 +73,9 @@ func TestStandardStream_RawMessage_NoParser(t *testing.T) {
 }
 
 func TestStandardStream_ParserAndDispatcher(t *testing.T) {
-	type ev struct{ X int `json:"x"` }
+	type ev struct {
+		X int `json:"x"`
+	}
 	serverURL, closeServer := startTestWSServer(t, func(c *websocket.Conn) {
 		defer c.Close()
 		_ = c.WriteMessage(websocket.TextMessage, []byte(`{"x":42}`))

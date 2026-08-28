@@ -1,6 +1,7 @@
 package bbgo
 
 import (
+	"fmt"
 	"runtime"
 	"testing"
 	"time"
@@ -11,6 +12,15 @@ import (
 	. "github.com/c9s/bbgo/pkg/testing/testhelper"
 	"github.com/c9s/bbgo/pkg/types"
 )
+
+func TestIsAlreadyTerminalOrderError(t *testing.T) {
+	if !isAlreadyTerminalOrderError(fmt.Errorf("-2011 Unknown order sent.")) {
+		t.Fatal("expected Binance filled/cancelled race to be benign")
+	}
+	if isAlreadyTerminalOrderError(fmt.Errorf("-2010 Order would immediately match and take")) {
+		t.Fatal("immediate-match rejection must not be treated as a terminal cancel race")
+	}
+}
 
 func TestActiveOrderBook_pendingOrders(t *testing.T) {
 	now := time.Now()

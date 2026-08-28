@@ -93,113 +93,190 @@ type conditionalExecutionReturn struct {
 	BidAbsolute float64
 }
 
+// conditionalExecutionStateBuilder is the streaming form of
+// buildConditionalExecutionStates.  Horizon exposures are completed one
+// start point at a time as new BBO observations arrive.  Rebuilding the
+// entire lookback window for every newly completed start made the incremental
+// replay path O(number of observations * horizon length).  The deques and
+// return accumulators below carry the exact same state across observations,
+// so initialization is O(N) and steady state is amortized O(1) per point.
+type conditionalExecutionStateBuilder struct {
+	horizon      time.Duration
+	firstAt      time.Time
+	count        int
+	states       []conditionalExecutionState
+	lastPoint    MarketMakerHorizonPoint
+	hasLastPoint bool
+
+	maxAskH, minBidH, minAsk30, maxBid30  []int
+	returns                               []conditionalExecutionReturn
+	returnHead                            int
+	buyQV2, sellQV2                       float64
+	buyTotalVariation, sellTotalVariation float64
+	segmentStart                          int
+	leftH, left30                         int
+}
+
+func (b *conditionalExecutionStateBuilder) reset(horizon time.Duration, firstAt time.Time) {
+	*b = conditionalExecutionStateBuilder{
+		horizon: horizon, firstAt: firstAt,
+		segmentStart: 0, leftH: 0, left30: 0,
+	}
+}
+
+func (b *conditionalExecutionStateBuilder) ensure(points []MarketMakerHorizonPoint, horizon time.Duration) {
+	if horizon <= 0 || len(points) == 0 {
+		b.reset(horizon, time.Time{})
+		return
+	}
+	if b.horizon != horizon || b.count > len(points) ||
+		(b.count > 0 && !b.firstAt.Equal(points[0].At)) ||
+		(b.count == len(points) && b.hasLastPoint && b.lastPoint != points[len(points)-1]) {
+		b.reset(horizon, points[0].At)
+	}
+	if b.count == 0 {
+		b.reset(horizon, points[0].At)
+	}
+	if cap(b.states) < len(points) {
+		capacity := len(points) * 2
+		if capacity < len(points) {
+			capacity = len(points)
+		}
+		states := make([]conditionalExecutionState, len(points), capacity)
+		copy(states, b.states)
+		b.states = states
+	} else {
+		b.states = b.states[:len(points)]
+	}
+}
+
+func (b *conditionalExecutionStateBuilder) append(points []MarketMakerHorizonPoint, index int) {
+	point := points[index]
+	if index == 0 || point.GapBefore {
+		b.segmentStart = index
+		b.leftH, b.left30 = index, index
+		b.maxAskH, b.minBidH, b.minAsk30, b.maxBid30 = nil, nil, nil, nil
+		b.returns = b.returns[:0]
+		b.returnHead = 0
+		b.buyQV2, b.sellQV2 = 0, 0
+		b.buyTotalVariation, b.sellTotalVariation = 0, 0
+	} else {
+		previous := points[index-1]
+		if previousAsk, currentAsk := previous.askPrice(), point.askPrice(); previousAsk > 0 && currentAsk > 0 {
+			value := math.Log(currentAsk / previousAsk)
+			b.buyQV2 += value * value
+			b.buyTotalVariation += math.Abs(value)
+			previousBid, currentBid := previous.bidPrice(), point.bidPrice()
+			bidSquared, bidAbsolute := 0.0, 0.0
+			if previousBid > 0 && currentBid > 0 {
+				bidReturn := math.Log(currentBid / previousBid)
+				bidSquared = bidReturn * bidReturn
+				bidAbsolute = math.Abs(bidReturn)
+				b.sellQV2 += bidSquared
+				b.sellTotalVariation += bidAbsolute
+			}
+			b.returns = append(b.returns, conditionalExecutionReturn{
+				At: point.At, AskSquared: value * value, BidSquared: bidSquared,
+				AskAbsolute: math.Abs(value), BidAbsolute: bidAbsolute,
+			})
+		}
+	}
+
+	cutoffH := point.At.Add(-b.horizon)
+	for b.leftH < index && points[b.leftH].At.Before(cutoffH) {
+		b.leftH++
+	}
+	cutoff30 := point.At.Add(-30 * time.Second)
+	for b.left30 < index && points[b.left30].At.Before(cutoff30) {
+		b.left30++
+	}
+	for b.returnHead < len(b.returns) && b.returns[b.returnHead].At.Before(cutoffH) {
+		old := b.returns[b.returnHead]
+		b.buyQV2 -= old.AskSquared
+		b.sellQV2 -= old.BidSquared
+		b.buyTotalVariation -= old.AskAbsolute
+		b.sellTotalVariation -= old.BidAbsolute
+		b.returnHead++
+	}
+	if b.returnHead >= 1024 && b.returnHead*2 >= len(b.returns) {
+		copy(b.returns, b.returns[b.returnHead:])
+		b.returns = b.returns[:len(b.returns)-b.returnHead]
+		b.returnHead = 0
+	}
+	trimFront := func(values []int, minimum int) []int {
+		for len(values) > 0 && values[0] < minimum {
+			values = values[1:]
+		}
+		return values
+	}
+	b.maxAskH, b.minBidH = trimFront(b.maxAskH, b.leftH), trimFront(b.minBidH, b.leftH)
+	b.minAsk30, b.maxBid30 = trimFront(b.minAsk30, b.left30), trimFront(b.maxBid30, b.left30)
+	ask, bid := point.askPrice(), point.bidPrice()
+	for len(b.maxAskH) > 0 && points[b.maxAskH[len(b.maxAskH)-1]].askPrice() <= ask {
+		b.maxAskH = b.maxAskH[:len(b.maxAskH)-1]
+	}
+	b.maxAskH = append(b.maxAskH, index)
+	for len(b.minBidH) > 0 && points[b.minBidH[len(b.minBidH)-1]].bidPrice() >= bid {
+		b.minBidH = b.minBidH[:len(b.minBidH)-1]
+	}
+	b.minBidH = append(b.minBidH, index)
+	for len(b.minAsk30) > 0 && points[b.minAsk30[len(b.minAsk30)-1]].askPrice() >= ask {
+		b.minAsk30 = b.minAsk30[:len(b.minAsk30)-1]
+	}
+	b.minAsk30 = append(b.minAsk30, index)
+	for len(b.maxBid30) > 0 && points[b.maxBid30[len(b.maxBid30)-1]].bidPrice() <= bid {
+		b.maxBid30 = b.maxBid30[:len(b.maxBid30)-1]
+	}
+	b.maxBid30 = append(b.maxBid30, index)
+
+	if point.At.Sub(points[b.segmentStart].At) < b.horizon || ask <= 0 || bid <= 0 ||
+		len(b.maxAskH) == 0 || len(b.minBidH) == 0 || len(b.minAsk30) == 0 || len(b.maxBid30) == 0 {
+		b.states[index] = conditionalExecutionState{}
+		return
+	}
+	b.states[index] = conditionalExecutionState{
+		Valid:                 true,
+		BuyDrawdownBps:        math.Max(0, math.Log(points[b.maxAskH[0]].askPrice()/ask)*10_000),
+		BuyRebound30Bps:       math.Max(0, math.Log(ask/points[b.minAsk30[0]].askPrice())*10_000),
+		BuyQVBps:              math.Sqrt(math.Max(0, b.buyQV2)) * 10_000,
+		SellRunupBps:          math.Max(0, math.Log(bid/points[b.minBidH[0]].bidPrice())*10_000),
+		SellReversal30Bps:     math.Max(0, math.Log(points[b.maxBid30[0]].bidPrice()/bid)*10_000),
+		SellQVBps:             math.Sqrt(math.Max(0, b.sellQV2)) * 10_000,
+		SpreadBps:             math.Max(0, math.Log(ask/bid)*10_000),
+		SellNetReturnBps:      math.Log(bid/points[b.leftH].bidPrice()) * 10_000,
+		SellTotalVariationBps: math.Max(0, b.sellTotalVariation) * 10_000,
+		VolumeProfile:         point.volumeProfileState(b.horizon),
+	}
+}
+
+func (b *conditionalExecutionStateBuilder) build(points []MarketMakerHorizonPoint, horizon time.Duration) []conditionalExecutionState {
+	b.reset(horizon, time.Time{})
+	b.ensure(points, horizon)
+	for index := range points {
+		b.append(points, index)
+	}
+	b.count = len(points)
+	return b.states
+}
+
+func (b *conditionalExecutionStateBuilder) appendThrough(points []MarketMakerHorizonPoint, horizon time.Duration) []conditionalExecutionState {
+	b.ensure(points, horizon)
+	for index := b.count; index < len(points); index++ {
+		b.append(points, index)
+	}
+	b.count = len(points)
+	if len(points) > 0 {
+		b.lastPoint, b.hasLastPoint = points[len(points)-1], true
+	}
+	return b.states
+}
+
 // buildConditionalExecutionStates computes every causal start state in O(N).
 // Monotone deques provide rolling extrema and a bounded return queue provides
 // side-specific quadratic variation. Future prices never enter these fields.
 func buildConditionalExecutionStates(points []MarketMakerHorizonPoint, horizon time.Duration) []conditionalExecutionState {
-	states := make([]conditionalExecutionState, len(points))
-	if len(points) == 0 || horizon <= 0 {
-		return states
-	}
-	var maxAskH, minBidH, minAsk30, maxBid30 []int
-	var returns []conditionalExecutionReturn
-	returnHead := 0
-	buyQV2, sellQV2 := 0.0, 0.0
-	buyTotalVariation, sellTotalVariation := 0.0, 0.0
-	segmentStart := 0
-	leftH, left30 := 0, 0
-	for index, point := range points {
-		if index == 0 || point.GapBefore {
-			segmentStart = index
-			leftH, left30 = index, index
-			maxAskH, minBidH, minAsk30, maxBid30 = nil, nil, nil, nil
-			returns = returns[:0]
-			returnHead = 0
-			buyQV2, sellQV2 = 0, 0
-			buyTotalVariation, sellTotalVariation = 0, 0
-		} else {
-			previous := points[index-1]
-			if previousAsk, currentAsk := previous.askPrice(), point.askPrice(); previousAsk > 0 && currentAsk > 0 {
-				value := math.Log(currentAsk / previousAsk)
-				buyQV2 += value * value
-				buyTotalVariation += math.Abs(value)
-				previousBid, currentBid := previous.bidPrice(), point.bidPrice()
-				bidSquared := 0.0
-				bidAbsolute := 0.0
-				if previousBid > 0 && currentBid > 0 {
-					bidReturn := math.Log(currentBid / previousBid)
-					bidSquared = bidReturn * bidReturn
-					bidAbsolute = math.Abs(bidReturn)
-					sellQV2 += bidSquared
-					sellTotalVariation += bidAbsolute
-				}
-				returns = append(returns, conditionalExecutionReturn{
-					At: point.At, AskSquared: value * value, BidSquared: bidSquared,
-					AskAbsolute: math.Abs(value), BidAbsolute: bidAbsolute,
-				})
-			}
-		}
-
-		cutoffH := point.At.Add(-horizon)
-		for leftH < index && points[leftH].At.Before(cutoffH) {
-			leftH++
-		}
-		cutoff30 := point.At.Add(-30 * time.Second)
-		for left30 < index && points[left30].At.Before(cutoff30) {
-			left30++
-		}
-		for returnHead < len(returns) && returns[returnHead].At.Before(cutoffH) {
-			buyQV2 -= returns[returnHead].AskSquared
-			sellQV2 -= returns[returnHead].BidSquared
-			buyTotalVariation -= returns[returnHead].AskAbsolute
-			sellTotalVariation -= returns[returnHead].BidAbsolute
-			returnHead++
-		}
-		trimFront := func(values []int, minimum int) []int {
-			for len(values) > 0 && values[0] < minimum {
-				values = values[1:]
-			}
-			return values
-		}
-		maxAskH, minBidH = trimFront(maxAskH, leftH), trimFront(minBidH, leftH)
-		minAsk30, maxBid30 = trimFront(minAsk30, left30), trimFront(maxBid30, left30)
-		ask, bid := point.askPrice(), point.bidPrice()
-		for len(maxAskH) > 0 && points[maxAskH[len(maxAskH)-1]].askPrice() <= ask {
-			maxAskH = maxAskH[:len(maxAskH)-1]
-		}
-		maxAskH = append(maxAskH, index)
-		for len(minBidH) > 0 && points[minBidH[len(minBidH)-1]].bidPrice() >= bid {
-			minBidH = minBidH[:len(minBidH)-1]
-		}
-		minBidH = append(minBidH, index)
-		for len(minAsk30) > 0 && points[minAsk30[len(minAsk30)-1]].askPrice() >= ask {
-			minAsk30 = minAsk30[:len(minAsk30)-1]
-		}
-		minAsk30 = append(minAsk30, index)
-		for len(maxBid30) > 0 && points[maxBid30[len(maxBid30)-1]].bidPrice() <= bid {
-			maxBid30 = maxBid30[:len(maxBid30)-1]
-		}
-		maxBid30 = append(maxBid30, index)
-
-		if point.At.Sub(points[segmentStart].At) < horizon || ask <= 0 || bid <= 0 ||
-			len(maxAskH) == 0 || len(minBidH) == 0 || len(minAsk30) == 0 || len(maxBid30) == 0 {
-			continue
-		}
-		states[index] = conditionalExecutionState{
-			Valid:                 true,
-			BuyDrawdownBps:        math.Max(0, math.Log(points[maxAskH[0]].askPrice()/ask)*10_000),
-			BuyRebound30Bps:       math.Max(0, math.Log(ask/points[minAsk30[0]].askPrice())*10_000),
-			BuyQVBps:              math.Sqrt(math.Max(0, buyQV2)) * 10_000,
-			SellRunupBps:          math.Max(0, math.Log(bid/points[minBidH[0]].bidPrice())*10_000),
-			SellReversal30Bps:     math.Max(0, math.Log(points[maxBid30[0]].bidPrice()/bid)*10_000),
-			SellQVBps:             math.Sqrt(math.Max(0, sellQV2)) * 10_000,
-			SpreadBps:             math.Max(0, math.Log(ask/bid)*10_000),
-			SellNetReturnBps:      math.Log(bid/points[leftH].bidPrice()) * 10_000,
-			SellTotalVariationBps: math.Max(0, sellTotalVariation) * 10_000,
-			VolumeProfile:         point.volumeProfileState(horizon),
-		}
-	}
-	return states
+	var builder conditionalExecutionStateBuilder
+	return builder.build(points, horizon)
 }
 
 func conditionalExecutionStateAtIndex(points []MarketMakerHorizonPoint, index int, horizon time.Duration) conditionalExecutionState {
@@ -235,7 +312,42 @@ func (m *MarketMakerHorizonModel) conditionalExecutionState(horizon time.Duratio
 	if m == nil || len(m.points) == 0 {
 		return conditionalExecutionState{}
 	}
-	return conditionalExecutionStateAtIndex(m.points, len(m.points)-1, horizon)
+	if cached, ok := m.conditionalStates[horizon]; ok {
+		return cached
+	}
+	if len(m.points) > 0 {
+		if m.crossingExposureCaches == nil {
+			m.crossingExposureCaches = make(map[time.Duration]*marketMakerHorizonExposureCache)
+		}
+		cache := m.crossingExposureCaches[horizon]
+		if cache == nil {
+			cache = &marketMakerHorizonExposureCache{}
+			m.crossingExposureCaches[horizon] = cache
+		}
+		builder := &cache.ConditionalStateBuilder
+		latest := m.points[len(m.points)-1]
+		// A same-second BBO replacement is mutable until the next sampled
+		// second. Keep the old exact fallback for that rare case; ordinary new
+		// seconds use the carried rolling state and do not rescan the horizon.
+		if builder.count < len(m.points) ||
+			(builder.count == len(m.points) && builder.hasLastPoint && builder.lastPoint == latest) {
+			states := cache.conditionalStates(m.points, horizon)
+			if len(states) == len(m.points) {
+				state := states[len(states)-1]
+				if m.conditionalStates == nil {
+					m.conditionalStates = make(map[time.Duration]conditionalExecutionState)
+				}
+				m.conditionalStates[horizon] = state
+				return state
+			}
+		}
+	}
+	state := conditionalExecutionStateAtIndex(m.points, len(m.points)-1, horizon)
+	if m.conditionalStates == nil {
+		m.conditionalStates = make(map[time.Duration]conditionalExecutionState)
+	}
+	m.conditionalStates[horizon] = state
+	return state
 }
 
 // VolumeProfileState exposes only the latest causal profile snapshot for
@@ -245,7 +357,10 @@ func (m *MarketMakerHorizonModel) VolumeProfileState(horizon time.Duration) (Vol
 	if m == nil || horizon <= 0 || len(m.points) == 0 {
 		return VolumeProfileState{}, false
 	}
-	state := m.conditionalExecutionState(horizon).VolumeProfile
+	// Volume profile is already captured causally on every horizon point. Do
+	// not rebuild the O(horizon) conditional path merely to retrieve this O(1)
+	// snapshot; conditionalExecutionState consumes the identical point field.
+	state := m.points[len(m.points)-1].volumeProfileState(horizon)
 	return state, state.Valid
 }
 
@@ -375,8 +490,8 @@ func (m *MarketMakerHorizonModel) conditionalExecutionSideDecision(
 		if !lastExposure.IsZero() {
 			weight = math.Min(1, exposure.At.Sub(lastExposure).Seconds()/horizon.Seconds())
 		}
-		weight *= (priorPerPath + conditionalExecutionKernel(current, exposure.ConditionalState, buy, horizon)) /
-			(1 + priorPerPath)
+		kernel := conditionalExecutionKernel(current, exposure.ConditionalState, buy, horizon)
+		weight *= (priorPerPath + kernel) / (1 + priorPerPath)
 		if weight > 0 {
 			excursion := exposure.SellExcursionBps
 			if buy {

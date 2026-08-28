@@ -1,6 +1,7 @@
 package service
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,6 +10,9 @@ import (
 )
 
 func TestRedisPersistentService(t *testing.T) {
+	if os.Getenv("TEST_REDIS") != "1" {
+		t.Skip("requires a local Redis server; set TEST_REDIS=1 to run")
+	}
 	redisService := NewRedisPersistenceService(&RedisPersistenceConfig{
 		Host: "127.0.0.1",
 		Port: "6379",

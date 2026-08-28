@@ -334,8 +334,12 @@ type SyncConfig struct {
 		Trades bool `json:"trades,omitempty" yaml:"trades,omitempty"`
 		// Orders records the complete order lifecycle and upserts later status
 		// changes. FilledOrders is the legacy terminal-only mode.
-		Orders                      bool           `json:"orders,omitempty" yaml:"orders,omitempty"`
-		FilledOrders                bool           `json:"filledOrders,omitempty" yaml:"filledOrders,omitempty"`
+		Orders       bool `json:"orders,omitempty" yaml:"orders,omitempty"`
+		FilledOrders bool `json:"filledOrders,omitempty" yaml:"filledOrders,omitempty"`
+		// PrivateOrderFillLedger appends raw authenticated order and trade
+		// observations to the framework database. It is separate from the
+		// upserted orders/trades tables so lifecycle transitions are not lost.
+		PrivateOrderFillLedger      bool           `json:"privateOrderFillLedger,omitempty" yaml:"privateOrderFillLedger,omitempty"`
 		FuturesPosition             bool           `json:"futuresPosition,omitempty" yaml:"futuresPosition,omitempty"`
 		FuturesPositionSyncInterval types.Duration `json:"futuresPositionSyncInterval,omitempty" yaml:"futuresPositionSyncInterval,omitempty"`
 	} `json:"userDataStream,omitempty" yaml:"userDataStream,omitempty"`
@@ -371,6 +375,11 @@ type ProfilingConfig struct {
 }
 
 type EnvironmentConfig struct {
+	// ProductionVersion is an operator-supplied immutable label for the
+	// deployed strategy/configuration bundle. Framework audit records use it
+	// to prevent calibration from mixing incompatible production versions.
+	ProductionVersion string `json:"productionVersion,omitempty" yaml:"productionVersion,omitempty"`
+
 	DisableDefaultKLineSubscription bool `json:"disableDefaultKLineSubscription"`
 	DisableHistoryKLinePreload      bool `json:"disableHistoryKLinePreload"`
 

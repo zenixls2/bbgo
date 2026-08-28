@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"math"
 	"os"
 	"regexp"
@@ -11,12 +12,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/c9s/bbgo/pkg/strategy/gammacapture"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
 const (
-	minimumLifecycleFills     = 30
-	minimumLifecycleSideFills = 10
+	minimumLifecycleFills                = 30
+	minimumLifecycleSideFills            = 10
+	legacyBinanceBrokerClientOrderPrefix = "x-NSUYEBKM"
 )
 
 type journalMakerOrder struct {
@@ -195,16 +198,27 @@ func buildOrderLifecycleReport(path, symbol string, from, to time.Time, trades [
 }
 
 func readJournalMakerOrders(path, symbol string, from, to time.Time) ([]*journalMakerOrder, int) {
-	file, err := os.Open(path)
-	if err != nil {
-		fatalf("open journal lifecycle data: %v", err)
+	if path != "-" && isPrivateOrderFillLedgerFile(path) {
+		return readPrivateOrderFillLedgerMakerOrders(path, symbol, from, to)
 	}
-	defer file.Close()
+	var source io.Reader
+	var file *os.File
+	if path == "-" {
+		source = os.Stdin
+	} else {
+		var err error
+		file, err = os.Open(path)
+		if err != nil {
+			fatalf("open journal lifecycle data: %v", err)
+		}
+		defer file.Close()
+		source = file
+	}
 	var events []lifecycleJournalEvent
 	tradeFills := make(map[uint64]lifecycleJournalEvent)
 	activeBookFills := make(map[uint64]lifecycleJournalEvent)
 	excluded := 0
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(source)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		var row map[string]json.RawMessage
@@ -314,6 +328,163 @@ func readJournalMakerOrders(path, symbol string, from, to time.Time) ([]*journal
 	}
 	sort.Slice(orders, func(i, j int) bool { return orders[i].CreatedAt.Before(orders[j].CreatedAt) })
 	return orders, excluded
+}
+
+func isPrivateOrderFillLedgerFile(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) == "" {
+			continue
+		}
+		var probe struct {
+			EventType string `json:"eventType"`
+		}
+		return json.Unmarshal(scanner.Bytes(), &probe) == nil && probe.EventType != ""
+	}
+	return false
+}
+
+func readPrivateOrderFillLedgerMakerOrders(path, symbol string, from, to time.Time) ([]*journalMakerOrder, int) {
+	file, err := os.Open(path)
+	if err != nil {
+		fatalf("open private order/fill ledger: %v", err)
+	}
+	defer file.Close()
+
+	type ledgerOrderState struct {
+		order         *journalMakerOrder
+		lastExecuted  float64
+		pendingCancel string
+	}
+	states := make(map[uint64]*ledgerOrderState)
+	var events []gammacapture.PrivateOrderFillLedgerEvent
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) == "" {
+			continue
+		}
+		var event gammacapture.PrivateOrderFillLedgerEvent
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			continue
+		}
+		if event.Symbol != symbol || event.OrderID == 0 {
+			continue
+		}
+		events = append(events, event)
+	}
+	if err := scanner.Err(); err != nil {
+		fatalf("scan private order/fill ledger: %v", err)
+	}
+	sort.SliceStable(events, func(i, j int) bool {
+		return events[i].Sequence < events[j].Sequence
+	})
+
+	isMaker := func(event gammacapture.PrivateOrderFillLedgerEvent) bool {
+		if !strings.HasPrefix(event.ClientOrderID, "gcmm-") && !strings.HasPrefix(event.ClientOrderID, legacyBinanceBrokerClientOrderPrefix) {
+			return false
+		}
+		return event.OrderType == types.OrderTypeLimitMaker ||
+			(event.OrderType == types.OrderTypeLimit && event.TimeInForce == types.TimeInForceGTC)
+	}
+	orderAt := func(event gammacapture.PrivateOrderFillLedgerEvent) time.Time {
+		if !event.OrderCreatedAt.IsZero() {
+			return event.OrderCreatedAt
+		}
+		return event.ObservedAt
+	}
+	eventAt := func(event gammacapture.PrivateOrderFillLedgerEvent) time.Time {
+		if !event.ExchangeAt.IsZero() {
+			return event.ExchangeAt
+		}
+		return event.ObservedAt
+	}
+	statusReason := func(status types.OrderStatus) string {
+		switch status {
+		case types.OrderStatusFilled:
+			return "filled"
+		case types.OrderStatusCanceled:
+			return "canceled"
+		case types.OrderStatusRejected:
+			return "rejected"
+		case types.OrderStatusExpired:
+			return "expired"
+		case types.OrderStatusFinished:
+			return "finished"
+		default:
+			return "closed"
+		}
+	}
+	ensure := func(event gammacapture.PrivateOrderFillLedgerEvent) *ledgerOrderState {
+		state := states[event.OrderID]
+		if state != nil {
+			return state
+		}
+		createdAt := orderAt(event)
+		if createdAt.IsZero() || !createdAt.Before(to) || createdAt.Before(from) || !isMaker(event) {
+			return nil
+		}
+		state = &ledgerOrderState{order: &journalMakerOrder{
+			OrderID: event.OrderID, ClientOrderID: event.ClientOrderID,
+			Side: event.Side, Price: event.Price.Float64(), Quantity: event.Quantity.Float64(),
+			CreatedAt: createdAt,
+		}}
+		states[event.OrderID] = state
+		return state
+	}
+	for _, event := range events {
+		state := ensure(event)
+		if state == nil {
+			continue
+		}
+		if event.Price.Sign() > 0 {
+			state.order.Price = event.Price.Float64()
+		}
+		if event.Quantity.Sign() > 0 {
+			state.order.Quantity = event.Quantity.Float64()
+		}
+		if event.ExecutedQuantity.Float64() > state.lastExecuted {
+			state.lastExecuted = event.ExecutedQuantity.Float64()
+			state.order.Filled = true
+			state.order.FilledAt = eventAt(event)
+		}
+		switch event.EventType {
+		case gammacapture.PrivateLedgerEventFill:
+			state.order.Filled = true
+			state.order.FilledAt = eventAt(event)
+		case gammacapture.PrivateLedgerEventCancelRequest:
+			state.pendingCancel = event.CancelReason
+		case gammacapture.PrivateLedgerEventCancelResult:
+			if event.CancelAccepted && state.order.EndedAt.IsZero() {
+				state.order.EndedAt = eventAt(event)
+				state.order.EndReason = "cancel-request:" + event.CancelReason
+			}
+		case gammacapture.PrivateLedgerEventOrderUpdate:
+			if event.Status.Closed() && state.order.EndedAt.IsZero() {
+				state.order.EndedAt = eventAt(event)
+				if event.CancelReason != "" {
+					state.order.EndReason = "cancel-request:" + event.CancelReason
+				} else {
+					state.order.EndReason = statusReason(event.Status)
+				}
+			}
+		}
+	}
+	orders := make([]*journalMakerOrder, 0, len(states))
+	for _, state := range states {
+		if state.order.EndedAt.IsZero() {
+			state.order.EndedAt = to
+			state.order.EndReason = "end-of-observation"
+		}
+		orders = append(orders, state.order)
+	}
+	sort.Slice(orders, func(i, j int) bool { return orders[i].CreatedAt.Before(orders[j].CreatedAt) })
+	return orders, 0
 }
 
 func parseJournalCreation(message, symbol string) (*journalMakerOrder, bool, bool) {

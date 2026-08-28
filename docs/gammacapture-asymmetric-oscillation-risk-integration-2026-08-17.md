@@ -8,16 +8,43 @@ inventory-risk penalty supplied to the unified quote optimizer.
 
 ## Online path
 
-- `MarketMakerHorizonModel` derives causal bid-path net return, total
-  variation, and up/down EWMA variance for the selected Fast horizon.
+- `MarketMakerHorizonModel` derives causal bid-path net return and total
+  variation for the selected Fast horizon; the online Asymmetry model owns the
+  corresponding up/down terminal-variance posteriors.
 - `AsymmetricOscillationRiskModel` updates the matured terminal label before
   predicting the next multiplier; a data gap resets the pending label.
 - A live decision applies `MacroInventory.RiskAversion *= multiplier` only when
   `enabled` and `shadowOnly` is false.
-- The model state is included in the existing checkpoint (version 6), so a
+- The model state is included in the existing checkpoint (version 8), so a
   restart does not silently discard its prequential state.
 
-## Configuration used for ETHJPY
+## 2026-08-19 correctness correction
+
+The first online implementation kept one pending label and one EWMA for all
+selected windows. That pooled terminal variance from 10m, 15m, and 30m paths,
+so a horizon switch changed the meaning of the posterior. The model now keeps
+an independent state per normalized horizon:
+
+- each horizon has its own pending terminal executable-bid label;
+- each horizon has independent up/down EWMA variances and sample counts;
+- a matured label is applied only to the horizon that created it;
+- checkpoints serialize the horizon map and version 8 rejects the old
+  single-state format rather than restoring incompatible statistics;
+- startup replay warms every configured Fast window, not only the shortest one.
+
+The pure `EvaluateAsymmetricOscillationRisk` function remains available for
+mathematical diagnostics and can show a provisional path-direction score. The
+online model is the production boundary: until both up and down posteriors for
+the exact requested horizon reach `minSamples`, it returns
+`RiskMultiplier=1` with reason `asymmetry statistics not mature`. Therefore an
+unverified path cannot alter `fastRiskAversion`, quote distance, quantity, or
+fill-rate indirectly. ETHJPY production configuration currently keeps this
+alpha disabled while the corrected implementation is validated offline.
+
+## Historical replay configuration for ETHJPY
+
+The following was the configuration used by the historical comparison. It is
+not the live ETHJPY setting; production currently has `enabled: false`.
 
 ```yaml
 asymmetricOscillationRisk:

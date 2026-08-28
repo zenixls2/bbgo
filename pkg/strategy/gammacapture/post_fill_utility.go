@@ -220,7 +220,117 @@ func postFillInventoryRiskBenefitBps(side types.SideType, in PostFillUtilityInpu
 // BUY acquires base and SELL avoids carrying base, so both counterfactuals use
 // terminal bid. A terminal ask is valid only in a separately explicit future
 // repurchase cycle.
-func (m MarketMakerHorizonModel) postFillUtilityCandidates(now time.Time, lookback, horizon time.Duration, side types.SideType, distances []float64, entryCostBps, inventoryRiskBenefitBps, zScore float64) []PostFillUtilityCandidate {
+func (m *MarketMakerHorizonModel) postFillUtilityCandidates(now time.Time, lookback, horizon time.Duration, side types.SideType, distances []float64, entryCostBps, inventoryRiskBenefitBps, zScore float64) []PostFillUtilityCandidate {
+	out := make([]PostFillUtilityCandidate, len(distances))
+	for i, distance := range distances {
+		out[i].DistanceBps = distance
+	}
+	if m == nil || now.IsZero() || horizon <= 0 || len(distances) < 2 ||
+		(side != types.SideTypeBuy && side != types.SideTypeSell) {
+		return out
+	}
+	if lookback <= 0 {
+		lookback = 6 * time.Hour
+	}
+	exposures := m.crossingExposures(horizon)
+	if len(exposures) == 0 {
+		return out
+	}
+	cutoff := now.Add(-lookback)
+	startIndex := firstHorizonExposureAtOrAfter(exposures, cutoff)
+	var lastExposure time.Time
+	var sumWeight, sumWeightSquared float64
+	fillWeight := make([]float64, len(distances))
+	valueSum := make([]float64, len(distances))
+	valueSquareSum := make([]float64, len(distances))
+	diffSum := make([]float64, len(distances))
+	diffSquareSum := make([]float64, len(distances))
+	outcomes := make([]float64, len(distances))
+	for index := startIndex; index < len(exposures); {
+		exposure := exposures[index]
+		if exposure.EndAt.After(now) {
+			break
+		}
+		weight := 1.0
+		if !lastExposure.IsZero() {
+			weight = math.Min(1, exposure.At.Sub(lastExposure).Seconds()/horizon.Seconds())
+		}
+		if weight > 0 {
+			clear(outcomes)
+			for candidateIndex, distance := range distances {
+				if side == types.SideTypeBuy {
+					quote := exposure.StartAsk * math.Exp(-distance/10_000)
+					if exposure.MinimumAsk <= quote && exposure.TerminalBid > 0 {
+						fillWeight[candidateIndex] += weight
+						outcomes[candidateIndex] = makerFillTerminalWealthBps(
+							true, quote, exposure.TerminalBid, entryCostBps) + inventoryRiskBenefitBps
+					}
+				} else {
+					quote := exposure.StartBid * math.Exp(distance/10_000)
+					if exposure.MaximumBid >= quote && exposure.TerminalBid > 0 {
+						fillWeight[candidateIndex] += weight
+						outcomes[candidateIndex] = makerFillTerminalWealthBps(
+							false, quote, exposure.TerminalBid, entryCostBps) + inventoryRiskBenefitBps
+					}
+				}
+			}
+			base := outcomes[0]
+			for candidateIndex, outcome := range outcomes {
+				valueSum[candidateIndex] += weight * outcome
+				valueSquareSum[candidateIndex] += weight * outcome * outcome
+				difference := outcome - base
+				diffSum[candidateIndex] += weight * difference
+				diffSquareSum[candidateIndex] += weight * difference * difference
+			}
+			sumWeight += weight
+			sumWeightSquared += weight * weight
+			lastExposure = exposure.At
+		}
+		if exposure.NextMinute <= index {
+			break
+		}
+		index = exposure.NextMinute
+	}
+	return finalizePostFillUtilityCandidates(
+		out, fillWeight, valueSum, valueSquareSum, diffSum, diffSquareSum,
+		sumWeight, sumWeightSquared, zScore)
+}
+
+func finalizePostFillUtilityCandidates(
+	out []PostFillUtilityCandidate,
+	fillWeight, valueSum, valueSquareSum, diffSum, diffSquareSum []float64,
+	sumWeight, sumWeightSquared, zScore float64,
+) []PostFillUtilityCandidate {
+	if sumWeight <= 0 {
+		return out
+	}
+	effectiveN := sumWeight
+	if sumWeightSquared > 0 {
+		effectiveN = math.Min(sumWeight, sumWeight*sumWeight/sumWeightSquared)
+	}
+	for i := range out {
+		out[i].EffectiveSamples = effectiveN
+		out[i].FillProbability, _ = jeffreysBernoulliPosterior(fillWeight[i], sumWeight)
+		expectedMean := valueSum[i] / sumWeight
+		expectedVariance := math.Max(0, valueSquareSum[i]/sumWeight-expectedMean*expectedMean)
+		expectedSE := math.Sqrt(expectedVariance / math.Max(1, effectiveN))
+		out[i].ExpectedMeanBps = expectedMean
+		out[i].ExpectedStdErrorBps = expectedSE
+		out[i].ExpectedLowerBps = expectedMean - math.Max(0, zScore)*expectedSE
+		mean := diffSum[i] / sumWeight
+		variance := math.Max(0, diffSquareSum[i]/sumWeight-mean*mean)
+		se := math.Sqrt(variance / math.Max(1, effectiveN))
+		out[i].IncrementalMeanBps = mean
+		out[i].IncrementalStdErrorBps = se
+		out[i].IncrementalLowerBps = mean - math.Max(0, zScore)*se
+	}
+	return out
+}
+
+// postFillUtilityCandidatesReference retains the original raw-point scan for
+// exact equivalence tests. Production uses the cached exposure implementation
+// above so the same completed horizon paths are not rebuilt on every quote.
+func (m MarketMakerHorizonModel) postFillUtilityCandidatesReference(now time.Time, lookback, horizon time.Duration, side types.SideType, distances []float64, entryCostBps, inventoryRiskBenefitBps, zScore float64) []PostFillUtilityCandidate {
 	out := make([]PostFillUtilityCandidate, len(distances))
 	for i, distance := range distances {
 		out[i].DistanceBps = distance
@@ -328,28 +438,7 @@ func (m MarketMakerHorizonModel) postFillUtilityCandidates(now time.Time, lookba
 		sumWeightSquared += weight * weight
 		lastExposure = start.At
 	}
-	if sumWeight <= 0 {
-		return out
-	}
-	effectiveN := sumWeight
-	if sumWeightSquared > 0 {
-		effectiveN = math.Min(sumWeight, sumWeight*sumWeight/sumWeightSquared)
-	}
-	for i := range out {
-		out[i].EffectiveSamples = effectiveN
-		out[i].FillProbability, _ = jeffreysBernoulliPosterior(fillWeight[i], sumWeight)
-		expectedMean := valueSum[i] / sumWeight
-		expectedVariance := math.Max(0, valueSquareSum[i]/sumWeight-expectedMean*expectedMean)
-		expectedSE := math.Sqrt(expectedVariance / math.Max(1, effectiveN))
-		out[i].ExpectedMeanBps = expectedMean
-		out[i].ExpectedStdErrorBps = expectedSE
-		out[i].ExpectedLowerBps = expectedMean - math.Max(0, zScore)*expectedSE
-		mean := diffSum[i] / sumWeight
-		variance := math.Max(0, diffSquareSum[i]/sumWeight-mean*mean)
-		se := math.Sqrt(variance / math.Max(1, effectiveN))
-		out[i].IncrementalMeanBps = mean
-		out[i].IncrementalStdErrorBps = se
-		out[i].IncrementalLowerBps = mean - math.Max(0, zScore)*se
-	}
-	return out
+	return finalizePostFillUtilityCandidates(
+		out, fillWeight, valueSum, valueSquareSum, diffSum, diffSquareSum,
+		sumWeight, sumWeightSquared, zScore)
 }

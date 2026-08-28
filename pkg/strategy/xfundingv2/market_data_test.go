@@ -28,6 +28,9 @@ func Test_queryTopCapAssets(t *testing.T) {
 }
 
 func Test_queryPortfolioModeCollateralRates(t *testing.T) {
+	if os.Getenv("TEST_BINANCE") != "1" {
+		t.Skip("requires Binance public API; set TEST_BINANCE=1 to run")
+	}
 	ctx := context.Background()
 	symbols := []string{"BTC", "ETH", "BNB"}
 	collateralRates, err := queryPortfolioModeCollateralRates(ctx, symbols)

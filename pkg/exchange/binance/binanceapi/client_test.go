@@ -170,8 +170,8 @@ func TestClient_privateCall(t *testing.T) {
 }
 
 func TestClient_setTimeOffsetFromServer(t *testing.T) {
-	if b, _ := strconv.ParseBool(os.Getenv("CI")); b {
-		t.Skip("skip test for CI")
+	if os.Getenv("TEST_BINANCE") != "1" {
+		t.Skip("requires live Binance API; set TEST_BINANCE=1 to run")
 	}
 
 	client := NewClient("")

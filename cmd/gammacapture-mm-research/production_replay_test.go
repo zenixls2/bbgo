@@ -85,6 +85,21 @@ func TestProductionReplayWarmupIgnoresDisabledMacroHistory(t *testing.T) {
 	}
 }
 
+func TestBoundedProductionReplayDoesNotUseDefaultHistoricalCalibration(t *testing.T) {
+	from := time.Date(2026, 8, 17, 15, 0, 0, 0, time.UTC)
+	to := from.Add(12 * time.Hour)
+	configuredFrom := time.Date(2026, 7, 23, 7, 54, 0, 0, time.UTC)
+	configuredTo := configuredFrom.Add(2 * time.Hour)
+	gotFrom, gotTo := selectProductionCalibrationRange(from, to, configuredFrom, configuredTo, true, false, false)
+	if !gotFrom.Equal(from) || !gotTo.Equal(to) {
+		t.Fatalf("bounded replay widened to default calibration: got %s--%s", gotFrom, gotTo)
+	}
+	gotFrom, gotTo = selectProductionCalibrationRange(from, to, configuredFrom, configuredTo, true, true, false)
+	if !gotFrom.Equal(configuredFrom) || !gotTo.Equal(configuredTo) {
+		t.Fatalf("explicit calibration was not preserved: got %s--%s", gotFrom, gotTo)
+	}
+}
+
 func TestProductionReplayLoadRangeUsesEarlierCalibrationStart(t *testing.T) {
 	cfg := gammacapture.MarketMakerConfig{
 		HorizonLookback: types.Duration(6 * time.Hour),
@@ -183,6 +198,56 @@ func TestProductionConfigOverridesAreOptIn(t *testing.T) {
 		!got.JointDistanceQuantity.PathUtilityHorizonSelection ||
 		!got.JointDistanceQuantity.JointHorizonSelection {
 		t.Fatalf("explicit research overrides were not isolated correctly: %+v", got)
+	}
+}
+
+func TestTargetActionValueComparisonExplicitlyConstructsBothArms(t *testing.T) {
+	input := gammacapture.MarketMakerConfig{
+		DynamicInventoryAim: gammacapture.DynamicInventoryAimConfig{
+			Enabled:    false,
+			ShadowOnly: true,
+			RegimeConditionedTarget: gammacapture.RegimeConditionedTargetConfig{
+				Enabled: false,
+			},
+		},
+	}
+	baseline, candidate := targetActionValueComparisonArms(input)
+	if baseline.DynamicInventoryAim.Enabled || baseline.DynamicInventoryAim.ShadowOnly ||
+		baseline.DynamicInventoryAim.RegimeConditionedTarget.Enabled ||
+		!baseline.JointDistanceQuantity.LegacyStackedTargetContinuation {
+		t.Fatalf("target replay baseline was not the explicit retired arm: %+v", baseline)
+	}
+	if !candidate.DynamicInventoryAim.Enabled || candidate.DynamicInventoryAim.ShadowOnly ||
+		!candidate.DynamicInventoryAim.RegimeConditionedTarget.Enabled ||
+		candidate.JointDistanceQuantity.LegacyStackedTargetContinuation {
+		t.Fatalf("target replay candidate was not the explicit single-target arm: %+v", candidate)
+	}
+}
+
+func TestPivotRegimeTargetComparisonExplicitlyConstructsBothArms(t *testing.T) {
+	input := gammacapture.MarketMakerConfig{
+		PosteriorInventoryTarget: true,
+		DynamicInventoryAim: gammacapture.DynamicInventoryAimConfig{
+			Enabled:    false,
+			ShadowOnly: true,
+			RegimeConditionedTarget: gammacapture.RegimeConditionedTargetConfig{
+				Enabled: true,
+			},
+			PivotRegimeTarget: gammacapture.PivotRegimeTargetConfig{
+				Enabled: true,
+			},
+		},
+	}
+	baseline, candidate := pivotRegimeTargetComparisonArms(input)
+	if baseline.DynamicInventoryAim.Enabled || baseline.DynamicInventoryAim.ShadowOnly ||
+		baseline.DynamicInventoryAim.RegimeConditionedTarget.Enabled ||
+		baseline.DynamicInventoryAim.PivotRegimeTarget.Enabled {
+		t.Fatalf("pivot replay baseline was not the current target policy: %+v", baseline)
+	}
+	if !candidate.DynamicInventoryAim.Enabled || candidate.DynamicInventoryAim.ShadowOnly ||
+		candidate.DynamicInventoryAim.RegimeConditionedTarget.Enabled ||
+		!candidate.DynamicInventoryAim.PivotRegimeTarget.Enabled {
+		t.Fatalf("pivot replay candidate was not the explicit pivot arm: %+v", candidate)
 	}
 }
 

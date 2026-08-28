@@ -46,6 +46,40 @@ type FastCrossingInference struct {
 	RateSource          string
 }
 
+// ApplyMultiscaleDirectionFallback uses the one-minute regime posterior only
+// while the calibrated BOCPD45 direction is unavailable. This explicit
+// precedence is the duplicate-signal guard: the same change-point evidence is
+// never blended into direction twice, and the multiscale state does not own a
+// second quantity, price, or admission gate.
+func ApplyMultiscaleDirectionFallback(
+	fastDirection, fastConfidence float64,
+	bocpd BOCPD45Snapshot,
+	regime MultiscaleRegimeDecision,
+) (float64, bool) {
+	if bocpd.Ready || !regime.Healthy || regime.Samples <= 0 {
+		return fastDirection, false
+	}
+	transitionDirection := clampRatio(regime.UpProbability-regime.DownProbability, -1, 1)
+	if math.Abs(transitionDirection) <= 1e-12 {
+		return fastDirection, false
+	}
+	// ChangeProbability is the posterior mass on a new run. Its square-root
+	// converts a probability into the same confidence scale as the existing
+	// directional posterior without creating a second hard threshold.
+	transitionConfidence := math.Sqrt(clampRatio(regime.ChangeProbability, 0, 1)) *
+		math.Min(1, float64(regime.Samples)/30)
+	fastConfidence = clampRatio(fastConfidence, 0, 1)
+	if transitionConfidence <= 0 {
+		return fastDirection, false
+	}
+	weight := fastConfidence + transitionConfidence
+	if weight <= 0 {
+		return transitionDirection, true
+	}
+	return clampRatio((fastDirection*fastConfidence+
+		transitionDirection*transitionConfidence)/weight, -1, 1), true
+}
+
 type fastCrossingInference = FastCrossingInference
 
 // InferFastCrossing exposes the same pure inference used by the live strategy
@@ -123,6 +157,21 @@ func inferFastCrossing(window time.Duration, fast ModelSnapshot, evidence FastEv
 
 func (s *Strategy) initializeAdaptiveFastModels() {
 	windows := s.MarketMaker.FastModelWindows()
+	if s.MarketMaker.PrivateFillCalibration.Enabled {
+		s.makerPrivateFillCalibration = NewPrivateFillCalibrationModel(s.MarketMaker.PrivateFillCalibration)
+	} else {
+		s.makerPrivateFillCalibration = nil
+	}
+	if s.MarketMaker.RelativeHoldRisk.Enabled {
+		s.makerRelativeHoldRisk = NewRelativeHoldRiskModel(s.MarketMaker.RelativeHoldRisk)
+	} else {
+		s.makerRelativeHoldRisk = nil
+	}
+	s.makerRelativeHoldInitialAt = time.Time{}
+	s.makerRelativeHoldInitialBase = 0
+	s.makerRelativeHoldInitialQuote = 0
+	s.makerRelativeHoldAnchor = nil
+	s.makerLastRelativeHoldLogAt = time.Time{}
 	if s.MarketMaker.AsymmetricOscillationRisk.Enabled {
 		s.makerAsymmetricOscillationRisk = NewAsymmetricOscillationRiskModel(
 			s.MarketMaker.AsymmetricOscillationRisk)
@@ -133,6 +182,13 @@ func (s *Strategy) initializeAdaptiveFastModels() {
 		s.makerBOCPD45 = NewBOCPD45Model(s.MarketMaker.BOCPD45)
 	} else {
 		s.makerBOCPD45 = nil
+	}
+	if s.MarketMaker.MultiscaleRegime.Enabled {
+		s.makerMultiscaleRegime = NewBayesianMultiscaleRegime(s.MarketMaker.MultiscaleRegime)
+		s.makerMultiscaleDecision = MultiscaleRegimeDecision{Reason: "waiting for consecutive one-minute executable BBO closes"}
+	} else {
+		s.makerMultiscaleRegime = nil
+		s.makerMultiscaleDecision = MultiscaleRegimeDecision{Reason: "multiscale regime disabled"}
 	}
 	s.fastModels = make(map[time.Duration]*IntensityModel, len(windows))
 	s.fastEvidenceModels = make(map[time.Duration]*FastEvidenceModel, len(windows))
@@ -280,10 +336,12 @@ func (s *Strategy) observeFastEvidenceBBO(at time.Time, ticker types.BookTicker)
 		for _, model := range s.fastEvidenceModels {
 			model.ObserveBBO(at, ticker)
 		}
-		return
-	}
-	if s.fastEvidence != nil {
+	} else if s.fastEvidence != nil {
 		s.fastEvidence.ObserveBBO(at, ticker)
+	}
+	if s.makerMultiscaleRegime != nil {
+		s.makerMultiscaleDecision = s.makerMultiscaleRegime.ObserveMinute(
+			at, ticker.Buy.Float64(), ticker.Sell.Float64())
 	}
 }
 

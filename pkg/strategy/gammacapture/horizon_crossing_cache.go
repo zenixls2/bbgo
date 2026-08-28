@@ -21,6 +21,8 @@ type marketMakerHorizonExposure struct {
 	StartBookDepthReady    bool
 	TerminalBid            float64
 	TerminalAsk            float64
+	MinimumAsk             float64
+	MaximumBid             float64
 	BuyExcursionBps        float64
 	SellExcursionBps       float64
 	ConditionalState       conditionalExecutionState
@@ -28,15 +30,25 @@ type marketMakerHorizonExposure struct {
 }
 
 type marketMakerHorizonExposureCache struct {
-	Initialized    bool
-	BuiltThrough   time.Time
-	LastPointAt    time.Time
-	Exposures      []marketMakerHorizonExposure
-	BadPrefix      []int
-	MaxBidDeque    []int
-	MinAskDeque    []int
-	NextLinkCursor int
-	NextLinkSearch int
+	Initialized             bool
+	BuiltThrough            time.Time
+	LastPointAt             time.Time
+	Exposures               []marketMakerHorizonExposure
+	ConditionalStateBuilder conditionalExecutionStateBuilder
+	BadPrefix               []int
+	MaxBidDeque             []int
+	MinAskDeque             []int
+	NextLinkCursor          int
+	NextLinkSearch          int
+}
+
+func (c *marketMakerHorizonExposureCache) conditionalStates(
+	points []MarketMakerHorizonPoint, horizon time.Duration,
+) []conditionalExecutionState {
+	if c == nil {
+		return nil
+	}
+	return c.ConditionalStateBuilder.appendThrough(points, horizon)
 }
 
 // crossingExposures incrementally materializes the exact distance-independent
@@ -105,7 +117,7 @@ func (m *MarketMakerHorizonModel) crossingExposures(horizon time.Duration) []mar
 	cache.MaxBidDeque = cache.MaxBidDeque[:0]
 	cache.MinAskDeque = cache.MinAskDeque[:0]
 	cache.BuiltThrough = time.Time{}
-	conditionalStates := buildConditionalExecutionStates(m.points, horizon)
+	conditionalStates := cache.conditionalStates(m.points, horizon)
 	right := 1
 	pushWindow := func(index int) {
 		bid, ask := m.points[index].bidPrice(), m.points[index].askPrice()
@@ -175,6 +187,8 @@ func (m *MarketMakerHorizonModel) crossingExposures(horizon time.Duration) []mar
 			StartBookDepthReady:    start.BookDepthReady,
 			TerminalBid:            terminalBid,
 			TerminalAsk:            terminalAsk,
+			MinimumAsk:             minAsk,
+			MaximumBid:             maxBid,
 			BuyExcursionBps:        math.Log(startAsk/minAsk) * 10_000,
 			SellExcursionBps:       math.Log(maxBid/startBid) * 10_000,
 			ConditionalState:       conditionalStates[index],
@@ -207,22 +221,10 @@ func (m *MarketMakerHorizonModel) appendCompletedHorizonExposures(
 	}
 
 	// Build every newly matured start as one sliding-window batch. The prior
-	// implementation called horizonExposureAtIndex for each new second, scanning
-	// the complete H-second future path and rebuilding its H-second conditional
-	// state each time: O(newStarts*H). Monotone extrema, an integral prefix and
-	// one conditional-state pass make this exact batch O(newStarts+H).
-	stateLookback := horizon
-	if stateLookback < 30*time.Second {
-		stateLookback = 30 * time.Second
-	}
-	stateCutoff := m.points[first].At.Add(-stateLookback)
-	stateStart := sort.Search(len(m.points), func(index int) bool {
-		return !m.points[index].At.Before(stateCutoff)
-	})
-	if stateStart > 0 && !m.points[stateStart].GapBefore {
-		stateStart--
-	}
-	conditionalStates := buildConditionalExecutionStates(m.points[stateStart:end], horizon)
+	// implementation rebuilt the entire conditional lookback for every new
+	// start. Monotone extrema, an integral prefix, and the carried conditional
+	// state builder make this exact batch O(newStarts) after initialization.
+	conditionalStates := cache.conditionalStates(m.points, horizon)
 
 	localCount := len(m.points) - first
 	badPrefix := make([]int, localCount+1)
@@ -304,9 +306,11 @@ func (m *MarketMakerHorizonModel) appendCompletedHorizonExposures(
 			StartBookDepthReady:    start.BookDepthReady,
 			TerminalBid:            terminalBid,
 			TerminalAsk:            terminalAsk,
+			MinimumAsk:             m.points[minAskDeque[0]].askPrice(),
+			MaximumBid:             m.points[maxBidDeque[0]].bidPrice(),
 			BuyExcursionBps:        math.Log(startAsk/m.points[minAskDeque[0]].askPrice()) * 10_000,
 			SellExcursionBps:       math.Log(m.points[maxBidDeque[0]].bidPrice()/startBid) * 10_000,
-			ConditionalState:       conditionalStates[index-stateStart],
+			ConditionalState:       conditionalStates[index],
 		})
 	}
 }
@@ -359,6 +363,8 @@ func horizonExposureAtIndex(points []MarketMakerHorizonPoint, index int, horizon
 		StartBookDepthReady:    start.BookDepthReady,
 		TerminalBid:            terminalBid,
 		TerminalAsk:            terminalAsk,
+		MinimumAsk:             minAsk,
+		MaximumBid:             maxBid,
 		BuyExcursionBps:        math.Log(startAsk/minAsk) * 10_000,
 		SellExcursionBps:       math.Log(maxBid/startBid) * 10_000,
 		ConditionalState:       conditionalExecutionStateAtIndex(points, index, horizon),

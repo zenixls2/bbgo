@@ -1,0 +1,16 @@
+{
+  "name": "horizon-conditioned-continuation-utility-ethjpy-2026-08-26",
+  "status": "REJECT_NO_INCREMENTAL_VALUE",
+  "reason": "multiplicity-adjusted fee/risk-net lower bound is nonpositive",
+  "effectiveSamples": 32.0,
+  "adjustedAlpha": 0.016666666666666666,
+  "simultaneousOneSidedZ": 2.128045234184984,
+  "incrementalMeanBps": 0.5016656314687665,
+  "incrementalStandardErrorBps": 1.7074289379567553,
+  "incrementalCostBps": 0.0,
+  "riskPenaltyBps": 0.0,
+  "simultaneousNetLowerBps": -3.1318203826596354,
+  "positiveBlocks": 12,
+  "totalBlocks": 32,
+  "privateFillCalibration": "FAILED_NOT_AVAILABLE"
+}

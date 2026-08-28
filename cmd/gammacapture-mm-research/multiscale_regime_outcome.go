@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/c9s/bbgo/pkg/strategy/gammacapture"
+	"github.com/c9s/bbgo/pkg/types"
 )
 
 const multiscaleOutcomeFeatures = 4
@@ -91,7 +92,7 @@ func evaluateMultiscaleRegimeV2(closes []minuteRegimeClose, horizon, anchorStep 
 		return variant
 	}
 	model := gammacapture.NewBayesianMultiscaleRegime(gammacapture.MultiscaleRegimeConfig{
-		HazardMean: hazard, MaximumRunLength: int((2 * horizon) / time.Minute),
+		HazardMean: types.Duration(hazard), MaximumRunLength: int((2 * horizon) / time.Minute),
 		VolatilityWindow: 30, MinimumSamples: 30,
 	})
 	outcomeModel := newOnlineBayesianOutcome()

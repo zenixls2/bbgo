@@ -1,0 +1,23 @@
+{
+  "name": "terminal-wealth-target-relative-delta-ce",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 2.0,
+  "minimum_effective_samples": 24.0,
+  "incremental_mean_bps": 0.0149237061,
+  "incremental_standard_error_bps": 0.0015245961,
+  "incremental_cost_bps": 0.0,
+  "risk_penalty_bps": 0.0,
+  "candidate_tests": 2,
+  "alpha": 0.05,
+  "positive_blocks": 2,
+  "total_blocks": 2,
+  "minimum_positive_blocks": 2,
+  "data_cutoff": "2026-08-25T00:00:00Z",
+  "primary_horizon": "15m",
+  "secondary_horizon": "30m",
+  "eligible_definition": "mature terminal path, terminal profit-only rejection, positive next pivot-to-pivot executable outcome",
+  "inventory_grid": [0.0, 0.25, 0.5],
+  "quantity_grid": [0.5, 1.0, 2.0],
+  "note": "The delta CE is already fee/adverse-selection net and includes the configured certainty/risk penalty; no additional cost is deducted. The two-day holdout is intentionally insufficient for promotion."
+}

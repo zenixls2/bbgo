@@ -11,6 +11,20 @@ import (
 	"github.com/c9s/bbgo/pkg/types"
 )
 
+func TestMakerQuoteAdmissionFailsClosedWhenSuspendedOrHalted(t *testing.T) {
+	for _, runtime := range []RuntimeState{StateSuspended, StateHalted} {
+		if makerQuoteAdmissionAllowed(runtime, types.StrategyStatusRunning) {
+			t.Fatalf("runtime %s must not admit maker quotes", runtime)
+		}
+	}
+	if !makerQuoteAdmissionAllowed(StateWarmingUp, types.StrategyStatusRunning) {
+		t.Fatal("running strategy in warming-up state should be evaluated by the normal quote gates")
+	}
+	if makerQuoteAdmissionAllowed(StateWarmingUp, types.StrategyStatusStopped) {
+		t.Fatal("stopped strategy must not admit maker quotes")
+	}
+}
+
 func TestMarketMakerConfigUsesSessionFees(t *testing.T) {
 	cfg := MarketMakerConfig{MakerFeeBps: 10, TakerFeeBps: 10}
 	session := &bbgo.ExchangeSession{
@@ -475,6 +489,42 @@ func TestMakerEmptyBookRetryPendingPreservesEvidenceClockOnly(t *testing.T) {
 	}
 }
 
+func TestTargetRestoringQuoteRepriceRequired(t *testing.T) {
+	plan := MarketMakerQuotePlan{AllowBid: true, AllowAsk: true, BidPrice: 99, AskPrice: 101}
+	if !targetRestoringQuoteRepriceRequired(0.60, 0.50, plan, 99, 101.20, 10) {
+		t.Fatal("an overweight inventory with a materially closer SELL must reprice")
+	}
+	if targetRestoringQuoteRepriceRequired(0.60, 0.50, plan, 99, 101.05, 10) {
+		t.Fatal("a sub-threshold SELL improvement must retain the queue")
+	}
+	if !targetRestoringQuoteRepriceRequired(0.40, 0.50, plan, 98.80, 101, 10) {
+		t.Fatal("an underweight inventory with a materially closer BUY must reprice")
+	}
+	plan.AllowAsk = false
+	if targetRestoringQuoteRepriceRequired(0.60, 0.50, plan, 99, 101.20, 10) {
+		t.Fatal("a joint plan that clears SELL remains authoritative")
+	}
+}
+
+func TestMakerOrdersForDisallowedSidesClearsOnlyRequestedSide(t *testing.T) {
+	active := types.OrderSlice{
+		{SubmitOrder: types.SubmitOrder{Side: types.SideTypeBuy, Quantity: fixedpoint.NewFromFloat(0.01)}},
+		{SubmitOrder: types.SubmitOrder{Side: types.SideTypeSell, Quantity: fixedpoint.NewFromFloat(0.01)}},
+	}
+	cancel := makerOrdersForDisallowedSides(active, false, true)
+	if len(cancel) != 1 || cancel[0].Side != types.SideTypeBuy {
+		t.Fatalf("BUY-disabled plan must clear only BUY: %+v", cancel)
+	}
+	cancel = makerOrdersForDisallowedSides(active, true, false)
+	if len(cancel) != 1 || cancel[0].Side != types.SideTypeSell {
+		t.Fatalf("SELL-disabled plan must clear only SELL: %+v", cancel)
+	}
+	cancel = makerOrdersForDisallowedSides(active, false, false)
+	if len(cancel) != 2 {
+		t.Fatalf("both-disabled plan must clear both sides: %+v", cancel)
+	}
+}
+
 func TestMakerQuoteStatisticalRealignmentRequiresSignificantImprovement(t *testing.T) {
 	active := MarketMakerHorizonDecision{
 		EstimatorSource: "online-bbo", ScoreBpsPerHour: 5, ScoreStdErrorBpsHour: 1,
@@ -601,6 +651,23 @@ func TestMakerFillRebalanceFailureInvalidatesGeneration(t *testing.T) {
 	strategy.retryMakerFillRebalanceLocked(4)
 	if strategy.makerFillRefreshGeneration != 5 {
 		t.Fatal("a stale failure callback must not invalidate the next generation")
+	}
+}
+
+func TestMakerTerminalFillDeferralLogIsRateLimited(t *testing.T) {
+	strategy := &Strategy{Config: Config{Symbol: "ETHJPY"}}
+	first := time.Unix(1_700_000_000, 0)
+	strategy.logMakerTerminalFillDeferral(first, "pre-cancel")
+	if !strategy.makerLastTerminalFillDeferralLogAt.Equal(first) {
+		t.Fatal("first terminal-fill deferral must be logged")
+	}
+	strategy.logMakerTerminalFillDeferral(first.Add(9*time.Second), "post-cancel")
+	if !strategy.makerLastTerminalFillDeferralLogAt.Equal(first) {
+		t.Fatal("terminal-fill deferral log must be rate-limited")
+	}
+	strategy.logMakerTerminalFillDeferral(first.Add(10*time.Second), "post-cancel")
+	if !strategy.makerLastTerminalFillDeferralLogAt.Equal(first.Add(10 * time.Second)) {
+		t.Fatal("terminal-fill deferral log should resume after the interval")
 	}
 }
 

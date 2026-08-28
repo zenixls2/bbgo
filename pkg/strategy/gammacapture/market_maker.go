@@ -94,6 +94,16 @@ type PostFillUtilityConfig struct {
 	CandidateCount int `json:"candidateCount" yaml:"candidateCount"`
 }
 
+// PrivateOrderFillLedgerConfig controls the append-only private execution
+// ledger. It is observation-only: ledger errors are surfaced and logged, but
+// the writer never changes a quote, quantity, or gate decision.
+type PrivateOrderFillLedgerConfig struct {
+	Enabled           bool   `json:"enabled" yaml:"enabled"`
+	Path              string `json:"path" yaml:"path"`
+	SyncEachEvent     bool   `json:"syncEachEvent" yaml:"syncEachEvent"`
+	ProductionVersion string `json:"productionVersion,omitempty" yaml:"productionVersion,omitempty"`
+}
+
 // MarketMakerConfig contains only quote-policy parameters.  It is deliberately
 // independent of the exchange adapter so the policy can be trained and tested
 // against historical events without pretending that historical fills are known.
@@ -107,18 +117,26 @@ type MarketMakerConfig struct {
 	StartupCancelStaleOrders bool `json:"startupCancelStaleOrders" yaml:"startupCancelStaleOrders"`
 	// AccountSyncInterval periodically refreshes the authenticated account and
 	// reconciles external balance/position changes before quoting.
-	AccountSyncInterval    types.Duration `json:"accountSyncInterval" yaml:"accountSyncInterval"`
-	MakerFeeBps            float64        `json:"makerFeeBps" yaml:"makerFeeBps"`
-	TakerFeeBps            float64        `json:"takerFeeBps" yaml:"takerFeeBps"`
-	MinimumNetEdgeBps      float64        `json:"minimumNetEdgeBps" yaml:"minimumNetEdgeBps"`
-	AdverseSelectionBps    float64        `json:"adverseSelectionBps" yaml:"adverseSelectionBps"`
-	MinimumHalfSpreadBps   float64        `json:"minimumHalfSpreadBps" yaml:"minimumHalfSpreadBps"`
-	MaximumHalfSpreadBps   float64        `json:"maximumHalfSpreadBps" yaml:"maximumHalfSpreadBps"`
-	VolatilityMultiplier   float64        `json:"volatilityMultiplier" yaml:"volatilityMultiplier"`
-	InventoryTarget        float64        `json:"inventoryTarget" yaml:"inventoryTarget"`
-	InventoryLimit         float64        `json:"inventoryLimit" yaml:"inventoryLimit"`
-	AutoInventoryLimit     bool           `json:"autoInventoryLimit" yaml:"autoInventoryLimit"`
-	InventoryRiskBudgetJPY float64        `json:"inventoryRiskBudgetJPY" yaml:"inventoryRiskBudgetJPY"`
+	AccountSyncInterval types.Duration `json:"accountSyncInterval" yaml:"accountSyncInterval"`
+	// PrivateOrderFillLedger records private order updates and fills with the
+	// contemporaneous executable BBO. It is required for calibrated queue and
+	// adverse-selection studies; it does not participate in production policy.
+	PrivateOrderFillLedger PrivateOrderFillLedgerConfig `json:"privateOrderFillLedger" yaml:"privateOrderFillLedger"`
+	// PrivateFillCalibration consumes only private fills/order lifetimes from the
+	// ledger and live callbacks. It remains a non-blocking, warming estimator
+	// until its own causal labels reach the configured effective sample size.
+	PrivateFillCalibration PrivateFillCalibrationConfig `json:"privateFillCalibration" yaml:"privateFillCalibration"`
+	MakerFeeBps            float64                      `json:"makerFeeBps" yaml:"makerFeeBps"`
+	TakerFeeBps            float64                      `json:"takerFeeBps" yaml:"takerFeeBps"`
+	MinimumNetEdgeBps      float64                      `json:"minimumNetEdgeBps" yaml:"minimumNetEdgeBps"`
+	AdverseSelectionBps    float64                      `json:"adverseSelectionBps" yaml:"adverseSelectionBps"`
+	MinimumHalfSpreadBps   float64                      `json:"minimumHalfSpreadBps" yaml:"minimumHalfSpreadBps"`
+	MaximumHalfSpreadBps   float64                      `json:"maximumHalfSpreadBps" yaml:"maximumHalfSpreadBps"`
+	VolatilityMultiplier   float64                      `json:"volatilityMultiplier" yaml:"volatilityMultiplier"`
+	InventoryTarget        float64                      `json:"inventoryTarget" yaml:"inventoryTarget"`
+	InventoryLimit         float64                      `json:"inventoryLimit" yaml:"inventoryLimit"`
+	AutoInventoryLimit     bool                         `json:"autoInventoryLimit" yaml:"autoInventoryLimit"`
+	InventoryRiskBudgetJPY float64                      `json:"inventoryRiskBudgetJPY" yaml:"inventoryRiskBudgetJPY"`
 	// InventoryRiskBudgetRatio scales the adverse-move risk budget with the
 	// current quote-equivalent equity of the symbol. InventoryRiskBudgetJPY
 	// remains the absolute floor for small accounts or unavailable balances.
@@ -130,10 +148,17 @@ type MarketMakerConfig struct {
 	// Fast quote sizing, target switching, or IOC decisions.
 	FastRiskAversion         float64 `json:"fastRiskAversion" yaml:"fastRiskAversion"`
 	PosteriorInventoryTarget bool    `json:"posteriorInventoryTarget" yaml:"posteriorInventoryTarget"`
+	// CausalKlinePivot is a delayed-label 3-minute pivot learner. It may affect
+	// only the inventory target through a bounded overlay; it never gates,
+	// prices, sizes, cancels, or blocks orders. The production ETHJPY profile
+	// disables it while the causal pivot-regime CE owner is active.
+	CausalKlinePivot CausalKlinePivotConfig `json:"causalKlinePivot" yaml:"causalKlinePivot"`
 	// DynamicInventoryAim is retained for YAML/checkpoint compatibility and
-	// isolated research. Production quoting no longer evaluates this actuator;
-	// PosteriorInventoryTarget owns the live same-horizon target.
-	DynamicInventoryAim       DynamicInventoryAimConfig       `json:"dynamicInventoryAim" yaml:"dynamicInventoryAim"`
+	// isolated research. Its causal pivot-regime CE sub-owner is evaluated
+	// independently when explicitly enabled; the legacy actuator remains off.
+	DynamicInventoryAim DynamicInventoryAimConfig `json:"dynamicInventoryAim" yaml:"dynamicInventoryAim"`
+	// FastTargetExecution consumes evidence from the active inventory-target
+	// owner; it is not gated by PosteriorInventoryTarget.
 	FastTargetExecution       FastTargetExecutionConfig       `json:"fastTargetExecution" yaml:"fastTargetExecution"`
 	FastTargetSwitching       FastTargetSwitchingConfig       `json:"fastTargetSwitching" yaml:"fastTargetSwitching"`
 	FastDrift                 FastDriftConfig                 `json:"fastDrift" yaml:"fastDrift"`
@@ -400,6 +425,7 @@ func (c *MarketMakerConfig) setDefaults() {
 	if c.FastRiskAversion <= 0 {
 		c.FastRiskAversion = 1
 	}
+	c.CausalKlinePivot = c.CausalKlinePivot.withDefaults()
 	if c.JointDistanceQuantity.CandidateCount <= 0 {
 		c.JointDistanceQuantity.CandidateCount = 5
 	}
@@ -478,6 +504,7 @@ func (c *MarketMakerConfig) setDefaults() {
 		c.PostFillUtility.ConfidenceZScore = c.InventoryRiskZScore
 	}
 	c.HorizonTouchModel.setDefaults()
+	c.PrivateFillCalibration.setDefaults()
 	if c.FastWindow <= 0 {
 		c.FastWindow = types.Duration(60 * time.Second)
 	}
@@ -1253,7 +1280,7 @@ func (m *MarketMakerHorizonModel) ObserveBookWithSizesAndGap(
 	weightedPrice := bboDepthWeightedPrice(bid, bidSize, ask, askSize)
 	imbalance, depthReady := bboDepthImbalance(bidSize, askSize)
 	second := at.Truncate(time.Second)
-	volumeProfiles, volumeProfileN := m.volumeProfileSnapshots(weightedPrice)
+	volumeProfiles, volumeProfileN := m.volumeProfileSnapshots(weightedPrice, at)
 	if !m.lastSecond.IsZero() && second.Equal(m.lastSecond) {
 		if n := len(m.points); n > 0 {
 			m.points[n-1] = MarketMakerHorizonPoint{

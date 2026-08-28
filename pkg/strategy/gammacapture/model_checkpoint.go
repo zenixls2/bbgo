@@ -11,10 +11,12 @@ import (
 	"time"
 )
 
-const modelCheckpointVersion = 7
+const modelCheckpointVersion = 16
 
 // ModelCheckpoint is the bounded, causal state required to continue live
-// learning from a capture delta. It contains no orders, balances, or fills.
+// learning from a capture delta. It contains no orders or balances; private
+// fill calibration keeps only bounded sufficient statistics and pending label
+// metadata so live restart does not discard matured execution evidence.
 // Deterministic backtest/replay environments deliberately never restore it.
 type ModelCheckpoint struct {
 	Version                   int                                  `json:"version"`
@@ -23,12 +25,21 @@ type ModelCheckpoint struct {
 	SavedAt                   time.Time                            `json:"savedAt"`
 	ReplayAfter               time.Time                            `json:"replayAfter"`
 	TradeReplayAfter          time.Time                            `json:"tradeReplayAfter,omitempty"`
+	PrivateLedgerSize         int64                                `json:"privateLedgerSize,omitempty"`
 	Engine                    CrossingEngine                       `json:"engine"`
 	CaptureFiles              map[string]captureFileCheckpoint     `json:"captureFiles,omitempty"`
 	Slow                      intensityCheckpoint                  `json:"slow"`
 	Fast                      map[string]intensityCheckpoint       `json:"fast,omitempty"`
 	BOCPD45                   *bocpd45Checkpoint                   `json:"bocpd45,omitempty"`
+	MultiscaleRegime          *multiscaleRegimeCheckpoint          `json:"multiscaleRegime,omitempty"`
 	AsymmetricOscillationRisk *asymmetricOscillationRiskCheckpoint `json:"asymmetricOscillationRisk,omitempty"`
+	RelativeHoldRisk          *RelativeHoldRiskCheckpoint          `json:"relativeHoldRisk,omitempty"`
+	RelativeHoldBaseline      *relativeHoldRiskBaselineCheckpoint  `json:"relativeHoldBaseline,omitempty"`
+	RelativeHoldRiskSource    string                               `json:"relativeHoldRiskSource,omitempty"`
+	PrivateFillCalibration    *privateFillCalibrationCheckpoint    `json:"privateFillCalibration,omitempty"`
+	CausalKlinePivot          *CausalKlinePivotSnapshot            `json:"causalKlinePivot,omitempty"`
+	CausalKlineBuilder        *CausalKlineBuilderSnapshot          `json:"causalKlineBuilder,omitempty"`
+	PivotRegime               *PivotRegimeSnapshot                 `json:"pivotRegime,omitempty"`
 	Direction                 map[string]directionCheckpoint       `json:"direction,omitempty"`
 	Evidence                  map[string]fastEvidenceCheckpoint    `json:"evidence,omitempty"`
 	FastDrift                 map[string]fastDriftCheckpoint       `json:"fastDrift,omitempty"`
@@ -107,6 +118,26 @@ type horizonCheckpoint struct {
 	LastUpdate     time.Time                                 `json:"lastUpdate,omitempty"`
 	Decision       MarketMakerHorizonDecision                `json:"decision"`
 	VolumeProfiles map[string]rollingVolumeProfileCheckpoint `json:"volumeProfiles,omitempty"`
+	PathDecay      map[string]adaptivePathDecayCheckpoint    `json:"pathDecay,omitempty"`
+}
+
+type adaptivePathDecayCheckpoint struct {
+	LastMaturedAt   time.Time `json:"lastMaturedAt,omitempty"`
+	LastPairDecayAt time.Time `json:"lastPairDecayAt,omitempty"`
+	LastValue       float64   `json:"lastValue,omitempty"`
+	HaveValue       bool      `json:"haveValue,omitempty"`
+	PairCount       float64   `json:"pairCount,omitempty"`
+	MeanPrev        float64   `json:"meanPrev,omitempty"`
+	MeanCurr        float64   `json:"meanCurr,omitempty"`
+	M2Prev          float64   `json:"m2Prev,omitempty"`
+	M2Curr          float64   `json:"m2Curr,omitempty"`
+	CovLag1         float64   `json:"covLag1,omitempty"`
+	DeltaCount      float64   `json:"deltaCount,omitempty"`
+	MeanDelta       float64   `json:"meanDelta,omitempty"`
+	NeffMean        float64   `json:"neffMean,omitempty"`
+	NeffM2          float64   `json:"neffM2,omitempty"`
+	NeffCount       float64   `json:"neffCount,omitempty"`
+	LastNeff        time.Time `json:"lastNeff,omitempty"`
 }
 
 type volumeProfileSnapshotCheckpoint struct {
@@ -326,10 +357,12 @@ func (s *Strategy) prepareModelCheckpoint(now time.Time) error {
 		Version: modelCheckpointVersion, Symbol: s.Symbol, ModelHash: hash,
 		SavedAt: now.UTC(), ReplayAfter: s.State.LastReferenceTime.UTC(),
 		TradeReplayAfter:          s.makerLastPublicTradeAt.UTC(),
+		PrivateLedgerSize:         privateFillLedgerSize(s.MarketMaker.PrivateOrderFillLedger, s.Symbol),
 		Engine:                    *s.State.Engine,
 		CaptureFiles:              captureFiles,
 		Slow:                      checkpointIntensity(s.model),
 		BOCPD45:                   s.makerBOCPD45.checkpoint(),
+		MultiscaleRegime:          s.makerMultiscaleRegime.checkpoint(),
 		AsymmetricOscillationRisk: s.makerAsymmetricOscillationRisk.checkpoint(),
 		Fast:                      make(map[string]intensityCheckpoint, len(s.fastModels)),
 		Direction:                 make(map[string]directionCheckpoint, len(s.makerDirectionModels)),
@@ -341,6 +374,7 @@ func (s *Strategy) prepareModelCheckpoint(now time.Time) error {
 			LastUpdate:     s.makerHorizonModel.lastUpdate,
 			Decision:       s.makerHorizonModel.decision,
 			VolumeProfiles: make(map[string]rollingVolumeProfileCheckpoint, len(s.makerHorizonModel.volumeProfiles)),
+			PathDecay:      make(map[string]adaptivePathDecayCheckpoint, len(s.makerHorizonModel.pathDecay)),
 		},
 		Macro: macroInventoryCheckpoint{
 			CurrentStart:    s.makerMacroInventoryModel.currentStart,
@@ -351,11 +385,52 @@ func (s *Strategy) prepareModelCheckpoint(now time.Time) error {
 			LastObservation: s.makerMacroInventoryModel.lastObservation,
 		},
 	}
+	if s.MarketMaker.RelativeHoldRisk.Enabled && s.makerRelativeHoldRisk != nil {
+		relativeHoldCheckpoint := s.makerRelativeHoldRisk.Checkpoint()
+		checkpoint.RelativeHoldRisk = &relativeHoldCheckpoint
+		checkpoint.RelativeHoldBaseline = s.relativeHoldRiskBaselineCheckpoint()
+		checkpoint.RelativeHoldRiskSource = s.makerRelativeHoldPreloadSource
+		if checkpoint.RelativeHoldRiskSource == "" && relativeHoldCheckpoint.MaturedLabels > 0 {
+			// A live label stream that predates this source marker is retained
+			// only as an explicitly unknown legacy state. A subsequent startup
+			// will rebuild the bounded causal interval instead of treating an
+			// aggregated research checkpoint as live evidence.
+			checkpoint.RelativeHoldRiskSource = "legacy-live-unknown"
+		}
+	}
+	if s.MarketMaker.PrivateFillCalibration.Enabled && s.makerPrivateFillCalibration != nil {
+		checkpoint.PrivateFillCalibration = s.makerPrivateFillCalibration.checkpoint()
+	}
+	if s.MarketMaker.CausalKlinePivot.Enabled && s.makerCausalKlinePivot != nil && s.makerCausalKlineBuilder != nil {
+		pivotSnapshot := s.makerCausalKlinePivot.Snapshot()
+		builderSnapshot := s.makerCausalKlineBuilder.Snapshot()
+		checkpoint.CausalKlinePivot = &pivotSnapshot
+		checkpoint.CausalKlineBuilder = &builderSnapshot
+	}
+	pivotTarget := s.MarketMaker.DynamicInventoryAim.PivotRegimeTarget
+	if (pivotTarget.Enabled || pivotTarget.CausalCEEnabled) && s.makerPivotRegimeFilter != nil {
+		pivotSnapshot := s.makerPivotRegimeFilter.Snapshot()
+		checkpoint.PivotRegime = &pivotSnapshot
+	}
 	for _, point := range s.makerHorizonModel.points {
 		checkpoint.Horizon.Points = append(checkpoint.Horizon.Points, checkpointHorizonPoint(point))
 	}
 	for window, profile := range s.makerHorizonModel.volumeProfiles {
 		checkpoint.Horizon.VolumeProfiles[checkpointWindowKey(window)] = checkpointRollingVolumeProfile(profile)
+	}
+	for window, state := range s.makerHorizonModel.pathDecay {
+		if state == nil {
+			continue
+		}
+		checkpoint.Horizon.PathDecay[checkpointWindowKey(window)] = adaptivePathDecayCheckpoint{
+			LastMaturedAt: state.LastMaturedAt, LastPairDecayAt: state.LastPairDecayAt, LastValue: state.LastValue,
+			HaveValue: state.HaveValue, PairCount: state.PairCount,
+			MeanPrev: state.MeanPrev, MeanCurr: state.MeanCurr,
+			M2Prev: state.M2Prev, M2Curr: state.M2Curr, CovLag1: state.CovLag1,
+			DeltaCount: state.DeltaCount, MeanDelta: state.MeanDelta,
+			NeffMean: state.NeffMean, NeffM2: state.NeffM2,
+			NeffCount: state.NeffCount, LastNeff: state.LastNeff,
+		}
 	}
 	for window, model := range s.fastModels {
 		checkpoint.Fast[checkpointWindowKey(window)] = checkpointIntensity(model)
@@ -436,8 +511,25 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 	if s.MarketMaker.BOCPD45.Enabled && checkpoint.BOCPD45 == nil {
 		return time.Time{}, false, fmt.Errorf("model checkpoint is missing BOCPD45 calibration state")
 	}
+	if s.MarketMaker.MultiscaleRegime.Enabled && checkpoint.MultiscaleRegime == nil {
+		return time.Time{}, false, fmt.Errorf("model checkpoint is missing multiscale regime state")
+	}
 	if s.MarketMaker.AsymmetricOscillationRisk.Enabled && checkpoint.AsymmetricOscillationRisk == nil {
 		return time.Time{}, false, fmt.Errorf("model checkpoint is missing asymmetric oscillation risk state")
+	}
+	if s.MarketMaker.RelativeHoldRisk.Enabled && checkpoint.RelativeHoldRisk == nil {
+		return time.Time{}, false, fmt.Errorf("model checkpoint is missing relative-hold risk state")
+	}
+	if s.MarketMaker.RelativeHoldRisk.Enabled && checkpoint.RelativeHoldRiskSource != "" &&
+		checkpoint.RelativeHoldRiskSource != relativeHoldRiskLivePreloadSource {
+		return time.Time{}, false, fmt.Errorf("model checkpoint relative-hold source %q is not 1s causal-BBO/private-fill state", checkpoint.RelativeHoldRiskSource)
+	}
+	if s.MarketMaker.CausalKlinePivot.Enabled && (checkpoint.CausalKlinePivot == nil || checkpoint.CausalKlineBuilder == nil) {
+		return time.Time{}, false, fmt.Errorf("model checkpoint is missing causal Kline pivot state")
+	}
+	pivotTarget := s.MarketMaker.DynamicInventoryAim.PivotRegimeTarget
+	if (pivotTarget.Enabled || pivotTarget.CausalCEEnabled) && checkpoint.PivotRegime == nil {
+		return time.Time{}, false, fmt.Errorf("model checkpoint is missing pivot regime state")
 	}
 	if s.MarketMaker.VolumeProfile.Enabled {
 		for _, window := range s.MarketMaker.FastModelWindows() {
@@ -468,6 +560,7 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 	// replay must start from that cursor rather than the newer top-level value.
 	s.State.LastReferenceTime = checkpoint.ReplayAfter
 	s.makerLastPublicTradeAt = checkpoint.TradeReplayAfter
+	s.makerPrivateLedgerReplayOffset = checkpoint.PrivateLedgerSize
 	s.State.Engine = &checkpoint.Engine
 	s.makerCheckpointCaptureFiles = checkpoint.CaptureFiles
 	restoreIntensity(s.model, checkpoint.Slow)
@@ -494,9 +587,60 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 			return time.Time{}, false, err
 		}
 	}
+	if s.MarketMaker.MultiscaleRegime.Enabled {
+		if err := s.makerMultiscaleRegime.restore(checkpoint.MultiscaleRegime); err != nil {
+			return time.Time{}, false, err
+		}
+		s.makerMultiscaleDecision = s.makerMultiscaleRegime.lastDecision
+	}
 	if s.MarketMaker.AsymmetricOscillationRisk.Enabled {
 		if err := s.makerAsymmetricOscillationRisk.restore(checkpoint.AsymmetricOscillationRisk); err != nil {
 			return time.Time{}, false, err
+		}
+	}
+	if s.MarketMaker.RelativeHoldRisk.Enabled {
+		if s.makerRelativeHoldRisk == nil {
+			return time.Time{}, false, fmt.Errorf("relative-hold risk model is not initialized")
+		}
+		if err := s.makerRelativeHoldRisk.Restore(*checkpoint.RelativeHoldRisk); err != nil {
+			return time.Time{}, false, err
+		}
+		if err := s.restoreRelativeHoldRiskBaseline(checkpoint.RelativeHoldBaseline); err != nil {
+			return time.Time{}, false, err
+		}
+		s.makerRelativeHoldPreloadSource = checkpoint.RelativeHoldRiskSource
+	}
+	if s.MarketMaker.PrivateFillCalibration.Enabled {
+		if s.makerPrivateFillCalibration == nil {
+			return time.Time{}, false, fmt.Errorf("private-fill calibration model is not initialized")
+		}
+		if err := s.makerPrivateFillCalibration.restore(checkpoint.PrivateFillCalibration); err != nil {
+			return time.Time{}, false, err
+		}
+	}
+	if s.MarketMaker.CausalKlinePivot.Enabled {
+		if s.makerCausalKlinePivot == nil || s.makerCausalKlineBuilder == nil {
+			return time.Time{}, false, fmt.Errorf("causal Kline pivot learner is not initialized")
+		}
+		if !s.makerCausalKlineBuilder.Restore(*checkpoint.CausalKlineBuilder) {
+			return time.Time{}, false, fmt.Errorf("restore causal Kline builder state failed")
+		}
+		if !s.makerCausalKlinePivot.Restore(*checkpoint.CausalKlinePivot) {
+			return time.Time{}, false, fmt.Errorf("restore causal Kline pivot learner state failed")
+		}
+		s.makerCausalKlineDecision = checkpoint.CausalKlinePivot.LastDecision
+		if s.makerCausalKlineDecision.Reason == "" {
+			s.makerCausalKlineDecision = CausalKlinePivotDecision{Reason: "causal Kline pivot learner restored; awaiting next closed bar"}
+		}
+	}
+	if pivotTarget.Enabled || pivotTarget.CausalCEEnabled {
+		if s.makerPivotRegimeFilter == nil || checkpoint.PivotRegime == nil ||
+			!s.makerPivotRegimeFilter.Restore(*checkpoint.PivotRegime) {
+			return time.Time{}, false, fmt.Errorf("restore pivot regime state failed")
+		}
+		s.makerPivotRegimeDecision = checkpoint.PivotRegime.LastDecision
+		if s.makerPivotRegimeDecision.Reason == "" {
+			s.makerPivotRegimeDecision = PivotRegimeDecision{Reason: "pivot regime restored; awaiting next BBO"}
 		}
 	}
 	for window, model := range s.fastEvidenceModels {
@@ -529,6 +673,22 @@ func (s *Strategy) restoreModelCheckpoint(now time.Time) (time.Time, bool, error
 	// the first live BBO to recompute distance under the current quote algorithm.
 	s.makerHorizonModel.lastUpdate = time.Time{}
 	s.makerHorizonModel.decision = checkpoint.Horizon.Decision
+	s.makerHorizonModel.pathDecay = make(map[time.Duration]*adaptivePathDecayState, len(checkpoint.Horizon.PathDecay))
+	for _, window := range s.MarketMaker.FastModelWindows() {
+		entry, ok := checkpoint.Horizon.PathDecay[checkpointWindowKey(window)]
+		if !ok {
+			continue
+		}
+		s.makerHorizonModel.pathDecay[window] = &adaptivePathDecayState{
+			LastMaturedAt: entry.LastMaturedAt, LastPairDecayAt: entry.LastPairDecayAt, LastValue: entry.LastValue,
+			HaveValue: entry.HaveValue, PairCount: entry.PairCount,
+			MeanPrev: entry.MeanPrev, MeanCurr: entry.MeanCurr,
+			M2Prev: entry.M2Prev, M2Curr: entry.M2Curr, CovLag1: entry.CovLag1,
+			DeltaCount: entry.DeltaCount, MeanDelta: entry.MeanDelta,
+			NeffMean: entry.NeffMean, NeffM2: entry.NeffM2,
+			NeffCount: entry.NeffCount, LastNeff: entry.LastNeff,
+		}
+	}
 	if s.MarketMaker.VolumeProfile.Enabled {
 		s.makerHorizonModel.configureVolumeProfiles(s.MarketMaker)
 		for _, window := range s.MarketMaker.FastModelWindows() {

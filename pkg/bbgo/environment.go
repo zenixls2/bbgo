@@ -97,20 +97,21 @@ const (
 // Environment presents the real exchange data layer
 type Environment struct {
 	// built-in service
-	DatabaseService   *service.DatabaseService
-	OrderService      *service.OrderService
-	TradeService      *service.TradeService
-	ProfitService     *service.ProfitService
-	PositionService   *service.PositionService
-	BacktestService   service.BackTestable
-	RewardService     *service.RewardService
-	MarginService     *service.MarginService
-	SyncService       *service.SyncService
-	AccountService    *service.AccountService
-	WithdrawService   *service.WithdrawService
-	DepositService    *service.DepositService
-	PersistentService *service.PersistenceServiceFacade
-	ProfilingService  *pyroscope.Profiler
+	DatabaseService               *service.DatabaseService
+	OrderService                  *service.OrderService
+	TradeService                  *service.TradeService
+	PrivateOrderFillLedgerService *service.PrivateOrderFillLedgerService
+	ProfitService                 *service.ProfitService
+	PositionService               *service.PositionService
+	BacktestService               service.BackTestable
+	RewardService                 *service.RewardService
+	MarginService                 *service.MarginService
+	SyncService                   *service.SyncService
+	AccountService                *service.AccountService
+	WithdrawService               *service.WithdrawService
+	DepositService                *service.DepositService
+	PersistentService             *service.PersistenceServiceFacade
+	ProfilingService              *pyroscope.Profiler
 
 	// external services
 	GoogleSpreadSheetService *googleservice.SpreadSheetService
@@ -181,6 +182,10 @@ func (environ *Environment) SelectSessions(names ...string) map[string]*Exchange
 }
 
 func (environ *Environment) ConfigureDatabase(ctx context.Context, config *Config) error {
+	if config != nil && config.Environment != nil {
+		environ.environmentConfig = config.Environment
+	}
+
 	// configureDB configures the database service based on the environment variable
 	var dbDriver string
 	var dbDSN string
@@ -233,6 +238,7 @@ func (environ *Environment) ConfigureDatabaseDriver(
 	db := environ.DatabaseService.DB
 	environ.OrderService = &service.OrderService{DB: db}
 	environ.TradeService = &service.TradeService{DB: db}
+	environ.PrivateOrderFillLedgerService = service.NewPrivateOrderFillLedgerService(db, environ.ProductionVersion())
 	environ.RewardService = &service.RewardService{DB: db}
 	environ.AccountService = &service.AccountService{DB: db}
 	environ.ProfitService = &service.ProfitService{DB: db}
@@ -363,6 +369,16 @@ func (environ *Environment) SetStartTime(t time.Time) *Environment {
 	return environ
 }
 
+// ProductionVersion returns the configured deployment label used by
+// framework-level audit records. An empty value is valid for legacy configs,
+// but production calibration should always set it explicitly.
+func (environ *Environment) ProductionVersion() string {
+	if environ.environmentConfig == nil {
+		return ""
+	}
+	return environ.environmentConfig.ProductionVersion
+}
+
 func (environ *Environment) StartTime() time.Time {
 	return environ.startTime
 }
@@ -389,6 +405,10 @@ func (environ *Environment) BindSync(config *SyncConfig) {
 	}
 
 	environ.syncConfig = config
+	privateLedgerEnabled := config.UserDataStream.PrivateOrderFillLedger && environ.PrivateOrderFillLedgerService != nil
+	if config.UserDataStream.PrivateOrderFillLedger && environ.PrivateOrderFillLedgerService == nil {
+		log.Warn("private order/fill ledger is enabled but no database is configured; events will not be persisted")
+	}
 
 	tradeWriterCreator := func(session *ExchangeSession) func(trade types.Trade) {
 		return func(trade types.Trade) {
@@ -463,15 +483,32 @@ func (environ *Environment) BindSync(config *SyncConfig) {
 	for _, session := range environ.sessions {
 		// avoid using the iterator variable.
 		s2 := session
+		if privateLedgerEnabled {
+			s2.SetPrivateOrderFillLedger(environ.PrivateOrderFillLedgerService)
+		}
 		// if trade sync is on, we will write all received trades
 		if config.UserDataStream.Trades {
 			tradeWriter := tradeWriterCreator(s2)
 			session.UserDataStream.OnTradeUpdate(tradeWriter)
 		}
+		if privateLedgerEnabled {
+			session.UserDataStream.OnTradeUpdate(func(trade types.Trade) {
+				if err := environ.PrivateOrderFillLedgerService.RecordFill(s2.Name, "", "", trade, nil); err != nil {
+					log.WithError(err).WithFields(log.Fields{"session": s2.Name, "symbol": trade.Symbol}).Error("private order/fill ledger trade insert failed")
+				}
+			})
+		}
 
 		if config.UserDataStream.Orders || config.UserDataStream.FilledOrders {
 			orderWriter := orderWriterCreator(s2, config.UserDataStream.Orders)
 			session.UserDataStream.OnOrderUpdate(orderWriter)
+		}
+		if privateLedgerEnabled {
+			session.UserDataStream.OnOrderUpdate(func(order types.Order) {
+				if err := environ.PrivateOrderFillLedgerService.RecordOrderUpdate(s2.Name, "", "", order); err != nil {
+					log.WithError(err).WithFields(log.Fields{"session": s2.Name, "symbol": order.Symbol, "orderID": order.OrderID}).Error("private order/fill ledger order insert failed")
+				}
+			})
 		}
 
 		// setup sync for futures position risk

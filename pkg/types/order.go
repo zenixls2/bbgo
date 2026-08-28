@@ -162,7 +162,9 @@ type SubmitOrder struct {
 	Price    fixedpoint.Value `json:"price" db:"price"`
 	Quantity fixedpoint.Value `json:"quantity" db:"quantity"`
 
-	// AveragePrice is only used in back-test currently
+	// AveragePrice is the volume-weighted average execution price when the
+	// exchange reports cumulative quote value. It remains zero for unfilled
+	// orders and for exchanges that do not expose that field.
 	AveragePrice fixedpoint.Value `json:"averagePrice,omitempty"`
 
 	StopPrice fixedpoint.Value `json:"stopPrice,omitempty" db:"stop_price"`
@@ -396,6 +398,9 @@ func (o *Order) Update(update Order) {
 	if update.Price.Sign() > 0 {
 		o.Price = update.Price
 	}
+	if update.AveragePrice.Sign() > 0 {
+		o.AveragePrice = update.AveragePrice
+	}
 	o.IsWorking = update.IsWorking
 }
 
@@ -530,9 +535,13 @@ func (o Order) String() string {
 		desc += " stop@ " + o.StopPrice.String() + " ->"
 	}
 
+	price := o.Price.String()
+	if o.ExecutedQuantity.Sign() > 0 && o.AveragePrice.Sign() > 0 &&
+		o.AveragePrice.Compare(o.Price) != 0 {
+		price = fmt.Sprintf("%s (avg-fill %s)", price, o.AveragePrice.String())
+	}
 	desc += fmt.Sprintf(" %s/%s @ %s", o.ExecutedQuantity.String(),
-		o.Quantity.String(),
-		o.Price.String())
+		o.Quantity.String(), price)
 
 	desc += " | " + string(o.Status) + " | "
 

@@ -1,0 +1,23 @@
+{
+  "name": "causal-kline-pivot-3m5m-2026-08-25",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 28.0,
+  "minimum_effective_samples": 24.0,
+  "incremental_mean_bps": 18.695153588552422,
+  "incremental_standard_error_bps": 1.9591131461254188,
+  "incremental_cost_bps": 0.0,
+  "risk_penalty_bps": 0.0,
+  "candidate_tests": 2,
+  "alpha": 0.05,
+  "positive_blocks": 28,
+  "total_blocks": 28,
+  "minimum_positive_blocks": 3,
+  "primary_interval": "5m",
+  "primary_horizon": "15m",
+  "primary_cost_bps": 26.0,
+  "primary_action_mean_bps": -6.754322346502208,
+  "primary_action_lower_bps": -8.131972799961373,
+  "promotion_gate": "REJECT_NO_FEE_NET_VALUE",
+  "promotion_reason": "Relative improvement over the existing directional-change baseline is positive, but the Kline tag's own executable fee-net action lower bound remains negative on holdout."
+}

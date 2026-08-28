@@ -59,10 +59,10 @@ func (s *productionReplayState) recordEquity(at time.Time, mid, targetRatio floa
 		Inventory:     s.inventory, RiskyWeight: riskyWeight, TargetRatio: targetRatio,
 		ReversalDirection: direction, EarlyReversal: early, ReversalApplied: applied,
 	}
-	if point.EquityJPY > s.equityPeak {
+	if (s.scoreStarted || s.scoreFrom.IsZero()) && point.EquityJPY > s.equityPeak {
 		s.equityPeak = point.EquityJPY
 	}
-	if s.equityPeak > 0 {
+	if (s.scoreStarted || s.scoreFrom.IsZero()) && s.equityPeak > 0 {
 		drawdownPct := 100 * (s.equityPeak - point.EquityJPY) / s.equityPeak
 		if drawdownPct > s.maximumDrawdownPct {
 			s.maximumDrawdownPct = drawdownPct

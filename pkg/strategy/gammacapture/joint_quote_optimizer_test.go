@@ -37,19 +37,70 @@ func TestChooseSideSafeFallbackNeverReturnsBothSides(t *testing.T) {
 	}
 }
 
+func TestTargetCEAuthoritativeRejectionRequiresMatureEvidence(t *testing.T) {
+	if targetCEAuthoritativeRejection(JointDistanceQuantityDecision{
+		AuthoritativeRejection: true,
+		PathMaturityReady:      false,
+	}) {
+		t.Fatal("immature target-relative CE must preserve the bootstrap quote")
+	}
+	if !targetCEAuthoritativeRejection(JointDistanceQuantityDecision{
+		AuthoritativeRejection: true,
+		PathMaturityReady:      true,
+	}) {
+		t.Fatal("mature target-relative CE must retain its explicit rejection")
+	}
+}
+
+func TestTargetRestoringPlanAfterJointRejectionIsSideAware(t *testing.T) {
+	base := MarketMakerQuotePlan{
+		AllowBid: true, AllowAsk: true,
+		BidQuoteNotional: 100, AskQuoteNotional: 200,
+	}
+
+	overweight := targetRestoringPlanAfterJointRejection(base, 0.60, 0.50, false, true)
+	if overweight.AllowBid || !overweight.AllowAsk || overweight.BidQuoteNotional != 0 || overweight.AskQuoteNotional != 200 {
+		t.Fatalf("overweight rejection must retain only corrective SELL: %+v", overweight)
+	}
+	clearedSell := targetRestoringPlanAfterJointRejection(base, 0.60, 0.50, false, false)
+	if clearedSell.AllowBid || clearedSell.AllowAsk || clearedSell.BidQuoteNotional != 0 || clearedSell.AskQuoteNotional != 0 {
+		t.Fatalf("joint side-level SELL rejection must clear SELL: %+v", clearedSell)
+	}
+
+	underweight := targetRestoringPlanAfterJointRejection(base, 0.40, 0.50, true, false)
+	if !underweight.AllowBid || underweight.AllowAsk || underweight.BidQuoteNotional != 100 || underweight.AskQuoteNotional != 0 {
+		t.Fatalf("underweight rejection must retain only corrective BUY: %+v", underweight)
+	}
+
+	balanced := targetRestoringPlanAfterJointRejection(base, 0.50, 0.50, false, false)
+	if balanced.AllowBid || balanced.AllowAsk || balanced.BidQuoteNotional != 0 || balanced.AskQuoteNotional != 0 {
+		t.Fatalf("balanced rejection must clear both sides: %+v", balanced)
+	}
+}
+
 func TestSideSafeFallbackAdmissionRequiresRobustRiskReduction(t *testing.T) {
 	ordinary := JointPathPayoffDecision{CertaintyEquivalent: -0.01, RiskReducing: false}
-	if _, admitted, _ := sideSafeFallbackAdmission(-0.01, ordinary, 0); admitted {
+	if _, admitted, _ := sideSafeFallbackAdmission(-0.01, ordinary); admitted {
 		t.Fatal("fee-negative non-risk-reducing side must remain rejected")
 	}
 	riskReducing := JointPathPayoffDecision{CertaintyEquivalent: 0.02, RiskReducing: true}
-	score, admitted, hedge := sideSafeFallbackAdmission(-0.01, riskReducing, 0)
+	score, admitted, hedge := sideSafeFallbackAdmission(-0.01, riskReducing)
 	if !admitted || !hedge || math.Abs(score-0.02) > 1e-12 {
 		t.Fatalf("positive robust CE should admit only the risk-reducing side: score=%.12f admitted=%t hedge=%t", score, admitted, hedge)
 	}
 	negativeRobust := JointPathPayoffDecision{CertaintyEquivalent: -0.02, RiskReducing: true}
-	if _, admitted, _ := sideSafeFallbackAdmission(-0.01, negativeRobust, 0); admitted {
+	if _, admitted, _ := sideSafeFallbackAdmission(-0.01, negativeRobust); admitted {
 		t.Fatal("risk reduction without positive robust CE must remain rejected")
+	}
+}
+
+func TestSideSafeFallbackDoesNotStackTargetContinuation(t *testing.T) {
+	robust := JointPathPayoffDecision{
+		CertaintyEquivalent: -0.01,
+		RiskReducing:        true,
+	}
+	if _, admitted, _ := sideSafeFallbackAdmission(-0.02, robust); admitted {
+		t.Fatal("mature target-relative CE must not be rescued by a second target-progress value")
 	}
 }
 
@@ -174,6 +225,21 @@ func TestFastFeeNetRegretValue(t *testing.T) {
 	if math.Abs(mean-0.4) > 1e-12 || downside != 0 || math.Abs(net-0.4) > 1e-12 {
 		t.Fatalf("risk-reduction credit was not included exactly once: mean=%v downside=%v net=%v",
 			mean, downside, net)
+	}
+}
+
+func TestTargetRelativeCEAdmissionUsesPairedConfidenceBound(t *testing.T) {
+	raw := JointPathPayoffDecision{ExpectedPnLJPY: 1, KellyPenaltyJPY: 0.2}
+	confidence := JointPathPayoffDecision{CertaintyEquivalent: 0.35}
+	mean, downside, net := targetRelativeCEAdmissionValue(raw, confidence)
+	if math.Abs(mean-0.8) > 1e-12 || math.Abs(downside-0.45) > 1e-12 || math.Abs(net-0.35) > 1e-12 {
+		t.Fatalf("paired CE admission mismatch: mean=%v downside=%v net=%v", mean, downside, net)
+	}
+	// A positive incremental mean must not bypass a non-positive paired CE.
+	confidence.CertaintyEquivalent = -0.05
+	_, _, net = targetRelativeCEAdmissionValue(raw, confidence)
+	if net >= 0 {
+		t.Fatalf("non-positive corrected CE must remain rejected: %v", net)
 	}
 }
 
@@ -350,6 +416,49 @@ func TestRiskReducingContinuationNetValueRequiresTargetProgressAfterCost(t *test
 		12)
 	if buy >= 0 {
 		t.Fatalf("BUY away from target must not be admitted by missing-path prior: %v", buy)
+	}
+}
+
+func TestMatureTargetRestoringValueCountsInventoryTargetOnce(t *testing.T) {
+	moments := jointPathPayoffMoments{
+		SellMeanBps:      100,
+		SellVarBps2:      1,
+		InventoryVarBps2: 1,
+	}
+	stats := JointPathPayoffStats{
+		EffectiveSamples: 100,
+		BuyDominant:      moments,
+		SellDominant:     moments,
+	}
+	robust := stats.EvaluateTargetRelativePosition(
+		100, 900, 0, 100, 1_000, 0.1, 1.645)
+	want := robust.CertaintyEquivalent
+	got := targetRestoringOrderNetValue(
+		stats, 100, 900, 1_000,
+		0, 100, 0, 1, 0, 0.1, 12, 1.645, false)
+	if math.Abs(got-want) > 1e-12 {
+		t.Fatalf("mature value stacked a separate target continuation: got=%v want=%v", got, want)
+	}
+	if got <= 0 {
+		t.Fatalf("fee-positive mature SELL must remain admissible below a bullish target: %v", got)
+	}
+	if stacked := got + TargetProgressContinuationValue(
+		100, 900, 1_000, 0, 100, 0, 1, 0); stacked >= 0 {
+		t.Fatalf("fixture must expose the old duplicate-target veto: stacked=%v", stacked)
+	}
+	legacy := targetRestoringOrderNetValue(
+		stats, 100, 900, 1_000,
+		0, 100, 0, 1, 0, 0.1, 12, 1.645, true)
+	if legacy >= 0 {
+		t.Fatalf("research control did not reproduce the retired stacked veto: %v", legacy)
+	}
+	// Mature path utility comes from the empirical terminal distribution; the
+	// Bellman fill-probability prior is irrelevant once that label exists.
+	gotWithDifferentPrior := targetRestoringOrderNetValue(
+		stats, 100, 900, 1_000,
+		0, 100, 0.9, 0.1, 0.1, 0.1, 99, 1.645, false)
+	if math.Abs(gotWithDifferentPrior-got) > 1e-12 {
+		t.Fatalf("mature action value still depends on fallback prior: got=%v changed=%v", got, gotWithDifferentPrior)
 	}
 }
 
@@ -730,10 +839,9 @@ func TestOptimizeJointDistanceQuantityMakesSupportedTrendRejectionAuthoritative(
 		t.Fatalf("non-positive fee-net Fast value must remain rejected: %+v", unified)
 	}
 
-	// The identical adverse terminal posterior must not turn a full-base account
-	// into an absorbing state. With no quote balance, a target-restoring passive
-	// SELL moves toward target and unlocks the next BUY; the complete sequential
-	// spread still has to pay both fees and the configured residual edge.
+	// Re-evaluate the identical mature adverse posterior at a full-base account
+	// boundary. Capacity changes feasibility, but it must not add a second target
+	// reward to the already target-relative terminal action value.
 	boundaryPlan := base
 	boundaryPlan.BidPrice = bestAsk * math.Exp(-15.0/10_000)
 	boundaryPlan.AskPrice = bestBid * math.Exp(15.0/10_000)
@@ -755,86 +863,12 @@ func TestOptimizeJointDistanceQuantityMakesSupportedTrendRejectionAuthoritative(
 		AvailableBuyCapitalJPY: 0, AvailableSellInventoryNotionalJPY: 6_000,
 		Projection: boundaryProjection,
 	}, boundaryProjection)
-	wantBoundarySell := TargetRestoringContinuationNotional(
-		6_000, 3_500, 7_000, config.MakerFeeBps+config.AdverseSelectionBps)
-	if !boundary.Enabled || !boundary.Applied || !boundary.SideSafeFallback ||
-		boundary.Plan.AllowBid || !boundary.Plan.AllowAsk ||
-		math.Abs(boundary.Projection.SellNotionalJPY-wantBoundarySell) > 1e-9 ||
-		!boundary.RiskReducing ||
-		boundary.Reason != "target-restoring account-boundary continuation control" {
-		t.Fatalf("target-restoring balance boundary was not kept viable: %+v", boundary)
-	}
-
-	// minimumNetEdge is the reservation profit of a completed oscillation, not
-	// a cost of reducing inventory risk.  Raising that cycle hurdle above the
-	// entire quoted spread must not suppress a one-sided target-restoring SELL
-	// whose Bellman continuation value pays its own maker/adverse cost.
-	rebalanceConfig := config
-	rebalanceConfig.MinimumNetEdgeBps = 1_000
-	rebalance := OptimizeUnifiedFastQuantity(&model, rebalanceConfig, JointDistanceQuantityInput{
-		Now: start.Add(time.Hour), Horizon: 10 * time.Minute,
-		BestBid: bestBid, BestAsk: bestAsk, MidPrice: mid, BasePlan: boundaryPlan,
-		ConfidenceZScore: 1.282, PairEquityJPY: 7_000, RiskAversion: 1,
-		AvailableBuyCapitalJPY: 0, AvailableSellInventoryNotionalJPY: 6_000,
-		Projection: boundaryProjection,
-	}, boundaryProjection)
-	if !rebalance.Enabled || !rebalance.Applied || rebalance.Plan.AllowBid ||
-		!rebalance.Plan.AllowAsk || !rebalance.RiskReducing ||
-		rebalance.Projection.SellNotionalJPY <= 100 {
-		t.Fatalf("cycle profit hurdle leaked into target-restoring SELL: %+v", rebalance)
-	}
-
-	// A policy-disabled BUY is not a balance boundary when both sides retain
-	// exchange capacity. The terminal optimizer already rejected promotion, so
-	// this path may preserve one cell but must not turn the policy decision into
-	// a target-gap-sized SELL.
-	policyProjection := boundaryProjection
-	policyProjection.MinBuyNotionalJPY = 100
-	policyProjection.MaxBuyNotionalJPY = 1_000
-	policy := OptimizeUnifiedFastQuantity(&model, config, JointDistanceQuantityInput{
-		Now: start.Add(time.Hour), Horizon: 10 * time.Minute,
-		BestBid: bestBid, BestAsk: bestAsk, MidPrice: mid, BasePlan: boundaryPlan,
-		ConfidenceZScore: 1.282, PairEquityJPY: 7_000, RiskAversion: 1,
-		AvailableBuyCapitalJPY: 1_000, AvailableSellInventoryNotionalJPY: 6_000,
-		Projection: policyProjection,
-	}, policyProjection)
-	if !policy.Applied || math.Abs(policy.Projection.SellNotionalJPY-100) > 1e-9 ||
-		policy.Reason != "target-restoring one-sided policy continuation floor" {
-		t.Fatalf("policy-only one-sided continuation must remain one cell: %+v", policy)
-	}
-
-	// After a partial boundary fill both balances become executable.  A large
-	// remaining target error must not turn that interior account state into an
-	// absorbing no-order state.  The same scale-free proximal control supplies
-	// one target-restoring side, while its endogenous exchange-minimum threshold
-	// leaves the small-error authoritative rejection above unchanged.
-	interiorPlan := base
-	interiorProjection := projection
-	interiorProjection.CurrentInventoryNotionalJPY = 5_200
-	interiorProjection.TargetInventoryNotionalJPY = 4_000
-	interiorProjection.LowerInventoryNotionalJPY = 0
-	interiorProjection.UpperInventoryNotionalJPY = 7_000
-	interiorProjection.FastBuyNotionalJPY = 1_000
-	interiorProjection.FastSellNotionalJPY = 1_000
-	interiorProjection.MinBuyNotionalJPY = 100
-	interiorProjection.MinSellNotionalJPY = 100
-	interiorProjection.MaxBuyNotionalJPY = 1_800
-	interiorProjection.MaxSellNotionalJPY = 5_200
-	interior := OptimizeUnifiedFastQuantity(&model, config, JointDistanceQuantityInput{
-		Now: start.Add(time.Hour), Horizon: 10 * time.Minute,
-		BestBid: bestBid, BestAsk: bestAsk, MidPrice: mid, BasePlan: interiorPlan,
-		ConfidenceZScore: 1.282, PairEquityJPY: 7_000, RiskAversion: 1,
-		AvailableBuyCapitalJPY: 1_800, AvailableSellInventoryNotionalJPY: 5_200,
-		Projection: interiorProjection,
-	}, interiorProjection)
-	wantInteriorSell := TargetRestoringContinuationNotional(
-		5_200, 4_000, 7_000, config.MakerFeeBps+config.AdverseSelectionBps)
-	if !interior.Enabled || !interior.Applied || !interior.SideSafeFallback ||
-		interior.Plan.AllowBid || !interior.Plan.AllowAsk ||
-		math.Abs(interior.Projection.SellNotionalJPY-wantInteriorSell) > 1e-9 ||
-		!interior.RiskReducing ||
-		interior.Reason != "target-restoring interior proximal continuation control" {
-		t.Fatalf("interior target-restoring continuation was not kept viable: %+v", interior)
+	// This path posterior is mature and says that selling into the rising path
+	// destroys terminal wealth.  A large target gap or account boundary must not
+	// resurrect it through a second Bellman target reward.  Missing-path Bellman
+	// behavior is covered separately by the continuation-prior unit tests.
+	if boundary.Enabled || boundary.Applied || !boundary.AuthoritativeRejection {
+		t.Fatalf("mature adverse SELL was resurrected by target stacking: %+v", boundary)
 	}
 }
 

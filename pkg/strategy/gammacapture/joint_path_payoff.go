@@ -21,22 +21,118 @@ type jointPathPayoffMoments struct {
 }
 
 type JointPathPayoffStats struct {
-	EffectiveSamples                float64
-	BuyDominant                     jointPathPayoffMoments
-	SellDominant                    jointPathPayoffMoments
-	InventoryTarget                 jointPathPayoffMoments
-	InventoryTargetEffectiveSamples float64
-	TwoStageContinuation            bool
-	ContinuationHorizon             time.Duration
-	BuyThenSellSamples              float64
-	BuyThenSellCompletions          float64
-	SellThenBuySamples              float64
-	SellThenBuyCompletions          float64
+	EffectiveSamples float64
+	// EffectiveSamplesBaseline is an online EWMA of previously observed
+	// effective path mass. It is a stability reference only; the current
+	// EffectiveSamples remains the authoritative causal count.
+	EffectiveSamplesBaseline         float64
+	EffectiveSamplesBaselineStd      float64
+	PathDecayHalfLifeSeconds         float64
+	PathDecayAutocorrelation         float64
+	PathDecayPersistenceObservations float64
+	BuyDominant                      jointPathPayoffMoments
+	SellDominant                     jointPathPayoffMoments
+	InventoryTarget                  jointPathPayoffMoments
+	InventoryTargetEffectiveSamples  float64
+	TwoStageContinuation             bool
+	ContinuationHorizon              time.Duration
+	BuyThenSellSamples               float64
+	BuyThenSellCompletions           float64
+	SellThenBuySamples               float64
+	SellThenBuyCompletions           float64
+}
+
+// JointPathMaturityDecision separates statistical incompleteness from an
+// economically negative terminal-wealth estimate. EffectiveSamples is the
+// weighted information mass of completed overlapping paths, not their raw
+// row count.
+type JointPathMaturityDecision struct {
+	Matured                bool
+	Reason                 string
+	EffectiveSamples       float64
+	ConfidenceHalfWidthBps float64
+	ReferenceScaleBps      float64
+	RelativeHalfWidth      float64
+}
+
+// AssessJointPathMaturity applies one causal precision rule to every joint
+// distance candidate. It uses only completed path moments already available at
+// quote time. Crossing health and the later terminal-wealth sign/CE test remain
+// separate owners; a mature path can therefore still be rejected as negative.
+func AssessJointPathMaturity(stats JointPathPayoffStats, config MarketMakerConfig, zScore float64) JointPathMaturityDecision {
+	if zScore <= 0 || math.IsNaN(zScore) || math.IsInf(zScore, 0) {
+		zScore = 1.645
+	}
+	decision := JointPathMaturityDecision{
+		EffectiveSamples: stats.EffectiveSamples,
+		Reason:           "terminal-path effective samples are not non-degenerate",
+	}
+	effective := stats.EffectiveSamples
+	if stats.InventoryTargetEffectiveSamples > 0 {
+		effective = math.Min(effective, stats.InventoryTargetEffectiveSamples)
+	}
+	decision.EffectiveSamples = effective
+	if effective <= 1 || math.IsNaN(effective) || math.IsInf(effective, 0) {
+		return decision
+	}
+	buy, sell, target := stats.BuyDominant, stats.SellDominant, stats.InventoryTarget
+	variance := math.Max(buy.BuyVarBps2, buy.SellVarBps2)
+	variance = math.Max(variance, math.Max(sell.BuyVarBps2, sell.SellVarBps2))
+	variance = math.Max(variance, target.InventoryVarBps2)
+	if variance < 0 || math.IsNaN(variance) || math.IsInf(variance, 0) {
+		decision.Reason = "terminal-path variance is invalid"
+		return decision
+	}
+	decision.ConfidenceHalfWidthBps = zScore * math.Sqrt(variance/effective)
+	// When the current path mass falls below its own causal trailing baseline,
+	// add only the variance uncertainty implied by that information loss. This
+	// is a continuous surcharge, not another sample-count gate. If the current
+	// mass is above baseline, no penalty is applied.
+	if stats.EffectiveSamplesBaseline > effective && stats.EffectiveSamplesBaseline > 1 {
+		baselineTerm := 1/math.Sqrt(effective) - 1/math.Sqrt(stats.EffectiveSamplesBaseline)
+		if baselineTerm > 0 {
+			decision.ConfidenceHalfWidthBps += zScore * math.Sqrt(variance) * baselineTerm
+		}
+	}
+	meanScale := math.Max(math.Abs(buy.BuyMeanBps), math.Abs(buy.SellMeanBps))
+	meanScale = math.Max(meanScale, math.Max(math.Abs(sell.BuyMeanBps), math.Abs(sell.SellMeanBps)))
+	meanScale = math.Max(meanScale, math.Abs(target.InventoryMeanBps))
+	costScale := config.MakerFeeBps + config.AdverseSelectionBps + config.MinimumNetEdgeBps
+	if costScale < 1 {
+		costScale = 1
+	}
+	decision.ReferenceScaleBps = math.Max(costScale, meanScale)
+	if math.IsNaN(decision.ReferenceScaleBps) || math.IsInf(decision.ReferenceScaleBps, 0) || decision.ReferenceScaleBps <= 0 {
+		decision.Reason = "terminal-path economic scale is invalid"
+		return decision
+	}
+	decision.RelativeHalfWidth = decision.ConfidenceHalfWidthBps / decision.ReferenceScaleBps
+	maxRelative := config.JointDistanceQuantity.PathMaturityMaxRelativeHalfWidth
+	if maxRelative <= 0 || math.IsNaN(maxRelative) || math.IsInf(maxRelative, 0) {
+		maxRelative = 1
+	}
+	if math.IsNaN(decision.RelativeHalfWidth) || math.IsInf(decision.RelativeHalfWidth, 0) {
+		decision.Reason = "terminal-path confidence width is invalid"
+		return decision
+	}
+	if decision.RelativeHalfWidth > maxRelative {
+		decision.Reason = "terminal-path confidence width exceeds maturity scale"
+		return decision
+	}
+	decision.Matured = true
+	decision.Reason = "terminal-path posterior is mature"
+	return decision
 }
 
 type JointPathPayoffDecision struct {
-	ExpectedPnLJPY                  float64
+	ExpectedPnLJPY float64
+	// StdErrorJPY is the incremental order-payoff SE retained for path
+	// diagnostics and legacy callers. LowerPnLJPY uses the target-relative
+	// whole-vs-baseline SE difference below.
 	StdErrorJPY                     float64
+	BaselineStdErrorJPY             float64
+	WholePositionStdErrorJPY        float64
+	IncrementalStdErrorJPY          float64
 	LowerPnLJPY                     float64
 	ExistingInventoryExpectedPnLJPY float64
 	TargetInventoryNotionalJPY      float64
@@ -248,6 +344,59 @@ func (m *MarketMakerHorizonModel) conditionalJointPathPayoffStatistics(
 		now, config, horizon, buyDistanceBps, sellDistanceBps, &current)
 }
 
+// adaptivePathDecaySnapshot updates only with completed, distance-independent
+// paths.  It is intentionally separate from quote-distance scoring: every
+// candidate observes the same decay state and therefore cannot select a decay
+// factor after seeing its own payoff.
+func (m *MarketMakerHorizonModel) adaptivePathDecaySnapshot(
+	now time.Time,
+	config MarketMakerConfig,
+	horizon time.Duration,
+	exposures []marketMakerHorizonExposure,
+) adaptivePathDecaySnapshot {
+	if m == nil || now.IsZero() || horizon <= 0 || !config.JointDistanceQuantity.AdaptivePathDecay {
+		return adaptivePathDecaySnapshot{}
+	}
+	if m.pathDecay == nil {
+		m.pathDecay = make(map[time.Duration]*adaptivePathDecayState)
+	}
+	state := m.pathDecay[horizon]
+	if state == nil {
+		state = &adaptivePathDecayState{}
+		m.pathDecay[horizon] = state
+	}
+	completionHorizon := jointContinuationHorizon(config, horizon)
+	for _, exposure := range exposures {
+		maturity := exposure.EndAt
+		if config.JointDistanceQuantity.TwoStageContinuation {
+			maturity = exposure.At.Add(horizon + completionHorizon)
+		}
+		if maturity.After(now) {
+			break
+		}
+		if !state.LastMaturedAt.IsZero() && !exposure.At.After(state.LastMaturedAt) {
+			continue
+		}
+		if exposure.StartBid <= 0 || exposure.StartAsk <= 0 ||
+			exposure.TerminalBid <= 0 || exposure.TerminalAsk <= 0 {
+			continue
+		}
+		// Use the two executable sides separately: BUY volatility observes ask
+		// and SELL volatility observes bid.  The larger absolute terminal side
+		// return is a conservative volatility-persistence label; no midpoint or
+		// signed directional information is consumed. Cap only pathological feed
+		// values so one bad tick cannot make a six-hour half-life permanent.
+		buyValue := math.Abs(math.Log(exposure.TerminalAsk/exposure.StartAsk) * 10_000)
+		sellValue := math.Abs(math.Log(exposure.TerminalBid/exposure.StartBid) * 10_000)
+		value := math.Max(buyValue, sellValue)
+		if value > 10_000 {
+			value = 10_000
+		}
+		state.observePath(exposure.At, value, horizon, time.Duration(config.HorizonLookback))
+	}
+	return state.snapshot(horizon, time.Duration(config.HorizonLookback))
+}
+
 func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
 	now time.Time,
 	config MarketMakerConfig,
@@ -262,18 +411,21 @@ func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
 	config.setDefaults()
 	completionHorizon := jointContinuationHorizon(config, horizon)
 	exposures := m.crossingExposures(horizon)
+	decaySnapshot := m.adaptivePathDecaySnapshot(now, config, horizon, exposures)
 	var bboIndex *marketMakerBBORangeIndex
 	if config.JointDistanceQuantity.TwoStageContinuation {
 		bboIndex = m.executableBBORangeIndex()
 	}
 	lookback := time.Duration(config.HorizonLookback)
 	cutoff := now.Add(-lookback)
-	// Sparse-market path payoffs are non-stationary. Use the geometric mean of
-	// the execution horizon and the available lookback as a scale-free
-	// exponential half-life: it reacts much faster than the full lookback while
-	// retaining several non-overlapping holding windows. No fitted decay
-	// coefficient or symbol-specific constant is introduced.
-	decayHalfLifeSeconds := math.Sqrt(horizon.Seconds() * lookback.Seconds())
+	// Sparse-market path payoffs are non-stationary. The half-life is estimated
+	// from the causal lag-one persistence of matured executable-BBO path
+	// volatility; the old sqrt(H*L) scale is used only before the estimator has
+	// eight lagged pairs.
+	decayHalfLifeSeconds := decaySnapshot.HalfLifeSeconds
+	if decayHalfLifeSeconds <= 0 {
+		decayHalfLifeSeconds = math.Sqrt(horizon.Seconds() * lookback.Seconds())
+	}
 	var buyDominant, sellDominant, inventoryTarget weightedJointMoments
 	var buyDominantBuyOnly, buyDominantSellOnly sideImbalanceSufficientStats
 	var sellDominantBuyOnly, sellDominantSellOnly sideImbalanceSufficientStats
@@ -479,17 +631,36 @@ func (m *MarketMakerHorizonModel) jointPathPayoffStatistics(
 			sellDominantSellOnly, -imbalance)
 	}
 	stats := JointPathPayoffStats{
-		EffectiveSamples:                math.Min(buyN, sellN),
-		BuyDominant:                     buyMoments,
-		SellDominant:                    sellMoments,
-		InventoryTarget:                 targetMoments,
-		InventoryTargetEffectiveSamples: targetN,
-		TwoStageContinuation:            config.JointDistanceQuantity.TwoStageContinuation,
-		ContinuationHorizon:             completionHorizon,
-		BuyThenSellSamples:              buyThenSellSamples,
-		BuyThenSellCompletions:          buyThenSellCompletions,
-		SellThenBuySamples:              sellThenBuySamples,
-		SellThenBuyCompletions:          sellThenBuyCompletions,
+		EffectiveSamples:                 math.Min(buyN, sellN),
+		PathDecayHalfLifeSeconds:         decayHalfLifeSeconds,
+		PathDecayAutocorrelation:         decaySnapshot.Autocorrelation,
+		PathDecayPersistenceObservations: decaySnapshot.PersistenceObservations,
+		BuyDominant:                      buyMoments,
+		SellDominant:                     sellMoments,
+		InventoryTarget:                  targetMoments,
+		InventoryTargetEffectiveSamples:  targetN,
+		TwoStageContinuation:             config.JointDistanceQuantity.TwoStageContinuation,
+		ContinuationHorizon:              completionHorizon,
+		BuyThenSellSamples:               buyThenSellSamples,
+		BuyThenSellCompletions:           buyThenSellCompletions,
+		SellThenBuySamples:               sellThenBuySamples,
+		SellThenBuyCompletions:           sellThenBuyCompletions,
+	}
+	// Update the Neff reference only after the current path estimate has been
+	// formed. Repeated distance queries at the same timestamp are idempotent.
+	if config.JointDistanceQuantity.AdaptivePathDecay {
+		if m.pathDecay == nil {
+			m.pathDecay = make(map[time.Duration]*adaptivePathDecayState)
+		}
+		state := m.pathDecay[horizon]
+		if state == nil {
+			state = &adaptivePathDecayState{}
+			m.pathDecay[horizon] = state
+		}
+		state.observeNeff(now, stats.EffectiveSamples, horizon, time.Duration(config.HorizonLookback))
+		neffSnapshot := state.snapshot(horizon, time.Duration(config.HorizonLookback))
+		stats.EffectiveSamplesBaseline = neffSnapshot.EffectiveSamplesBaseline
+		stats.EffectiveSamplesBaselineStd = neffSnapshot.EffectiveSamplesStd
 	}
 	if config.VolumeProfile.Enabled && config.VolumeProfile.AsymmetricPOCRisk &&
 		current != nil {
@@ -591,9 +762,13 @@ func (m *MarketMakerHorizonModel) jointBalancedPathPayoffDifference(
 	config.setDefaults()
 	completionHorizon := jointContinuationHorizon(config, horizon)
 	exposures := m.crossingExposures(horizon)
+	decaySnapshot := m.adaptivePathDecaySnapshot(now, config, horizon, exposures)
 	lookback := time.Duration(config.HorizonLookback)
 	cutoff := now.Add(-lookback)
-	decayHalfLifeSeconds := math.Sqrt(horizon.Seconds() * lookback.Seconds())
+	decayHalfLifeSeconds := decaySnapshot.HalfLifeSeconds
+	if decayHalfLifeSeconds <= 0 {
+		decayHalfLifeSeconds = math.Sqrt(horizon.Seconds() * lookback.Seconds())
+	}
 	entryCostBps := config.MakerFeeBps + config.AdverseSelectionBps
 	cycleCostBps := 2*entryCostBps + config.MinimumNetEdgeBps
 	var bboIndex *marketMakerBBORangeIndex
@@ -792,12 +967,24 @@ func (s JointPathPayoffStats) EvaluateTargetRelativePosition(
 	wholeVarianceJPY2 := math.Max(0, baselineVarianceJPY2+incrementalVarianceJPY2+
 		2*inventoryOrderCovarianceJPY2)
 	marginalVarianceJPY2 := wholeVarianceJPY2 - baselineVarianceJPY2
-	standardErrorJPY := math.Sqrt(incrementalVarianceJPY2 / math.Max(1, s.EffectiveSamples))
-	lower := meanJPY - math.Max(0, zScore)*standardErrorJPY
+	effectiveSamples := math.Max(1, s.EffectiveSamples)
+	baselineStdErrorJPY := math.Sqrt(math.Max(0, baselineVarianceJPY2) / effectiveSamples)
+	wholePositionStdErrorJPY := math.Sqrt(wholeVarianceJPY2 / effectiveSamples)
+	incrementalStdErrorJPY := math.Sqrt(incrementalVarianceJPY2 / effectiveSamples)
+	// The lower bound is a paired comparison against submitting no new order.
+	// Using the incremental order-payoff SE here double-counts uncertainty when
+	// the existing inventory is already risky, and fails to credit uncertainty
+	// reduced by a target-restoring action. The consistent bound is the
+	// difference between the candidate and baseline whole-position bounds.
+	lower := meanJPY - math.Max(0, zScore)*
+		(wholePositionStdErrorJPY-baselineStdErrorJPY)
 	kellyPenalty := math.Max(0, riskAversion) * marginalVarianceJPY2 / (2 * pairEquityJPY)
 	return JointPathPayoffDecision{
 		ExpectedPnLJPY:                  meanJPY,
-		StdErrorJPY:                     standardErrorJPY,
+		StdErrorJPY:                     incrementalStdErrorJPY,
+		BaselineStdErrorJPY:             baselineStdErrorJPY,
+		WholePositionStdErrorJPY:        wholePositionStdErrorJPY,
+		IncrementalStdErrorJPY:          incrementalStdErrorJPY,
 		LowerPnLJPY:                     lower,
 		ExistingInventoryExpectedPnLJPY: currentInventoryNotionalJPY * moments.InventoryMeanBps / 10_000,
 		TargetInventoryNotionalJPY:      targetInventoryNotionalJPY,

@@ -1,0 +1,84 @@
+{
+  "name": "terminal-wealth-delta-ce-baseline-confidence-audit",
+  "date": "2026-08-26",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "production_changed": false,
+  "source_changed": true,
+  "production_rolled_back": false,
+  "current_runtime_formula": "source: target-relative whole-minus-baseline lower-bound SE; live service unchanged",
+  "objective": "Compare the current incremental-order lower-bound CE with the candidate-minus-no-order lower-bound CE.",
+  "current_formula": "meanDelta - z*sqrt(incrementalVariance/N) - gamma*marginalVariance/(2*pairEquity)",
+  "corrected_formula": "meanDelta - z*(sqrt(wholeVariance/N)-sqrt(baselineVariance/N)) - gamma*marginalVariance/(2*pairEquity)",
+  "correction_formula": "z*(sqrt(incrementalVariance/N)-sqrt(wholeVariance/N)+sqrt(baselineVariance/N))",
+  "full_5s_holdout": {
+    "replay_from": "2026-07-24T00:00:00Z",
+    "replay_to": "2026-08-25T00:00:00Z",
+    "bbo_retention_interval": "5s",
+    "15m": {
+      "eligible": 500,
+      "original_mean_relief_bps": 0.0201829536,
+      "corrected_mean_relief_bps": 11.2591004498,
+      "mean_missing_correction_bps": 11.2389174962,
+      "corrected_default_cell_accepted": 64,
+      "corrected_rescued_anywhere_in_grid": 65,
+      "effective_blocks": 32,
+      "positive_blocks": 32
+    },
+    "30m": {
+      "eligible": 290,
+      "original_mean_relief_bps": 0.0404265412,
+      "corrected_mean_relief_bps": 19.7758368251,
+      "mean_missing_correction_bps": 19.7354102839,
+      "corrected_default_cell_accepted": 93,
+      "corrected_rescued_anywhere_in_grid": 93,
+      "effective_blocks": 29,
+      "positive_blocks": 29
+    }
+  },
+  "two_day_1s_sensitivity": {
+    "replay_from": "2026-08-23T00:00:00Z",
+    "replay_to": "2026-08-25T00:00:00Z",
+    "bbo_retention_interval": "1s",
+    "15m": {
+      "eligible": 26,
+      "original_mean_relief_bps": 0.0149237061,
+      "corrected_mean_relief_bps": 11.7744624189,
+      "mean_missing_correction_bps": 11.7595387128,
+      "corrected_default_cell_accepted": 3,
+      "corrected_rescued_anywhere_in_grid": 3
+    },
+    "30m": {
+      "eligible": 12,
+      "original_mean_relief_bps": 0.0291296227,
+      "corrected_mean_relief_bps": 24.3125894158,
+      "mean_missing_correction_bps": 24.2834597931,
+      "corrected_default_cell_accepted": 8,
+      "corrected_rescued_anywhere_in_grid": 8
+    }
+  },
+  "integrated_48h_replay": {
+    "replay_from": "2026-08-22T00:00:00Z",
+    "replay_to": "2026-08-24T00:00:00Z",
+    "bbo_retention_interval": "10s",
+    "queue_multiplier": 0.0,
+    "private_fill_calibration_passed": false,
+    "current_ce_legacy_policy": {
+      "full_fills": 172,
+      "net_pnl_jpy": -136.7526272498,
+      "hold_pnl_jpy": -99.0277059672,
+      "maximum_drawdown_pct": 4.0936697266,
+      "quote_refreshes": 371
+    },
+    "configured_horizon_touch_arm": {
+      "full_fills": 150,
+      "net_pnl_jpy": -149.7280289982,
+      "hold_pnl_jpy": -94.5557201923,
+      "maximum_drawdown_pct": 4.2245470265,
+      "quote_refreshes": 363
+    },
+    "note": "Engineering replay only; calibration failure forbids using synthetic fill comparison for live promotion."
+  },
+  "decision": "FORMULA_BUG_CONFIRMED_FIXED_IN_SOURCE_NOT_DEPLOYED",
+  "next_gate": "Live promotion requires private-fill calibration and a clean before/after policy comparison."
+}

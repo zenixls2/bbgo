@@ -3,6 +3,7 @@ package gammacapture
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"time"
 )
 
@@ -176,7 +177,12 @@ type asymmetricOscillationRiskPending struct {
 	Regime    float64
 }
 
-type asymmetricOscillationRiskCheckpoint struct {
+type asymmetricOscillationRiskHorizonState struct {
+	Stats   AsymmetricOscillationRiskStats
+	Pending *asymmetricOscillationRiskPending
+}
+
+type asymmetricOscillationRiskHorizonCheckpoint struct {
 	Stats            AsymmetricOscillationRiskStats `json:"stats"`
 	PendingMaturesAt time.Time                      `json:"pendingMaturesAt,omitempty"`
 	PendingHorizon   time.Duration                  `json:"pendingHorizon,omitempty"`
@@ -184,19 +190,67 @@ type asymmetricOscillationRiskCheckpoint struct {
 	PendingRegime    float64                        `json:"pendingRegime,omitempty"`
 }
 
+type asymmetricOscillationRiskCheckpoint struct {
+	// Horizon-specific state prevents terminal variance labels from 10m, 15m,
+	// and 30m paths being pooled into one EWMA. ModelCheckpoint's version bump
+	// rejects the former single-state representation instead of restoring it
+	// with incompatible statistics.
+	Horizons map[string]asymmetricOscillationRiskHorizonCheckpoint `json:"horizons,omitempty"`
+}
+
 // AsymmetricOscillationRiskModel is an online prequential wrapper around the
-// pure evaluator. It permits one non-overlapping pending label per horizon.
-// The caller must call UpdateLabel only when the future executable bid is
-// observed at or after the horizon; no future value is used by Predict.
+// pure evaluator. It keeps one non-overlapping pending label and one matured
+// variance state per horizon. The caller must call UpdateLabel only when the
+// future executable bid is observed at or after the horizon; no future value
+// is used by Predict.
 type AsymmetricOscillationRiskModel struct {
-	Config  AsymmetricOscillationRiskConfig
-	Stats   AsymmetricOscillationRiskStats
-	Pending *asymmetricOscillationRiskPending
+	Config   AsymmetricOscillationRiskConfig
+	horizons map[time.Duration]*asymmetricOscillationRiskHorizonState
 }
 
 func NewAsymmetricOscillationRiskModel(cfg AsymmetricOscillationRiskConfig) *AsymmetricOscillationRiskModel {
 	cfg = cfg.normalized()
-	return &AsymmetricOscillationRiskModel{Config: cfg}
+	return &AsymmetricOscillationRiskModel{Config: cfg, horizons: make(map[time.Duration]*asymmetricOscillationRiskHorizonState)}
+}
+
+func normalizeAsymmetricRiskHorizon(horizon time.Duration) time.Duration {
+	if horizon <= 0 {
+		return 0
+	}
+	return horizon.Round(time.Second)
+}
+
+func (m *AsymmetricOscillationRiskModel) horizonState(horizon time.Duration) *asymmetricOscillationRiskHorizonState {
+	if m == nil {
+		return nil
+	}
+	if m.horizons == nil {
+		m.horizons = make(map[time.Duration]*asymmetricOscillationRiskHorizonState)
+	}
+	horizon = normalizeAsymmetricRiskHorizon(horizon)
+	if horizon <= 0 {
+		return nil
+	}
+	state := m.horizons[horizon]
+	if state == nil {
+		state = &asymmetricOscillationRiskHorizonState{}
+		m.horizons[horizon] = state
+	}
+	return state
+}
+
+// StatsForHorizon returns only the matured state for the requested horizon.
+// It is intentionally read-only so diagnostics cannot mutate the learner or
+// accidentally pool windows.
+func (m *AsymmetricOscillationRiskModel) StatsForHorizon(horizon time.Duration) (AsymmetricOscillationRiskStats, bool) {
+	if m == nil {
+		return AsymmetricOscillationRiskStats{}, false
+	}
+	state := m.horizons[normalizeAsymmetricRiskHorizon(horizon)]
+	if state == nil {
+		return AsymmetricOscillationRiskStats{}, false
+	}
+	return state.Stats, true
 }
 
 func (m *AsymmetricOscillationRiskModel) Predict(
@@ -206,15 +260,28 @@ func (m *AsymmetricOscillationRiskModel) Predict(
 	if m == nil {
 		return AsymmetricOscillationRiskDecision{Reason: "model unavailable"}
 	}
-	d := EvaluateAsymmetricOscillationRisk(m.Config, features, m.Stats)
+	horizon = normalizeAsymmetricRiskHorizon(horizon)
+	state := m.horizonState(horizon)
+	if state == nil {
+		return AsymmetricOscillationRiskDecision{Reason: "asymmetric oscillation risk horizon unavailable"}
+	}
+	d := EvaluateAsymmetricOscillationRisk(m.Config, features, state.Stats)
+	// The pure evaluator remains useful for mathematical diagnostics before
+	// maturity. The online model must not let that provisional path-direction
+	// score alter Fast risk aversion until both directional variance posteriors
+	// for this exact horizon have matured.
+	if !d.AsymmetryReady && math.Abs(d.OscillationScore) > 1e-12 {
+		d.RiskMultiplier = 1
+		d.Reason = "asymmetry statistics not mature"
+	}
 	if now.IsZero() || bestBid <= 0 || horizon <= 0 || !finiteAsymmetricRisk(bestBid) ||
 		!finiteAsymmetricRisk(d.OscillationScore) {
 		return d
 	}
 	// Do not overlap labels. A caller can mature the existing prediction and
 	// start a new one on the next eligible decision timestamp.
-	if m.Pending == nil && math.Abs(d.OscillationScore) > 1e-12 {
-		m.Pending = &asymmetricOscillationRiskPending{
+	if state.Pending == nil && math.Abs(d.OscillationScore) > 1e-12 {
+		state.Pending = &asymmetricOscillationRiskPending{
 			MaturesAt: now.Add(horizon), Horizon: horizon,
 			StartBid: bestBid, Regime: d.OscillationScore,
 		}
@@ -225,44 +292,53 @@ func (m *AsymmetricOscillationRiskModel) Predict(
 // UpdateLabel updates the EWMA only after maturity. A delayed observation past
 // the bounded event lag is discarded; existing statistics remain valid.
 func (m *AsymmetricOscillationRiskModel) UpdateLabel(now time.Time, bestBid float64) bool {
-	if m == nil || m.Pending == nil || now.IsZero() || bestBid <= 0 ||
-		!finiteAsymmetricRisk(bestBid) || now.Before(m.Pending.MaturesAt) {
+	if m == nil || now.IsZero() || bestBid <= 0 || !finiteAsymmetricRisk(bestBid) {
 		return false
 	}
-	pending := m.Pending
-	m.Pending = nil
-	maxLag := pending.Horizon / 10
-	if maxLag > 2*time.Minute {
-		maxLag = 2 * time.Minute
-	}
-	if maxLag < time.Second {
-		maxLag = time.Second
-	}
-	if now.Sub(pending.MaturesAt) > maxLag {
-		return false
-	}
-	returnBps := math.Log(bestBid/pending.StartBid) * 10_000
-	if !finiteAsymmetricRisk(returnBps) {
-		return false
-	}
+	updated := false
 	alpha := m.Config.normalized().EWMAAlpha
-	if pending.Regime > 0 {
-		m.Stats.UpVarianceBps2 = (1-alpha)*m.Stats.UpVarianceBps2 + alpha*returnBps*returnBps
-		m.Stats.UpSamples++
-	} else if pending.Regime < 0 {
-		m.Stats.DownVarianceBps2 = (1-alpha)*m.Stats.DownVarianceBps2 + alpha*returnBps*returnBps
-		m.Stats.DownSamples++
-	} else {
-		return false
+	for _, state := range m.horizons {
+		if state == nil || state.Pending == nil || now.Before(state.Pending.MaturesAt) {
+			continue
+		}
+		pending := state.Pending
+		state.Pending = nil
+		maxLag := pending.Horizon / 10
+		if maxLag > 2*time.Minute {
+			maxLag = 2 * time.Minute
+		}
+		if maxLag < time.Second {
+			maxLag = time.Second
+		}
+		if now.Sub(pending.MaturesAt) > maxLag {
+			continue
+		}
+		returnBps := math.Log(bestBid/pending.StartBid) * 10_000
+		if !finiteAsymmetricRisk(returnBps) {
+			continue
+		}
+		if pending.Regime > 0 {
+			state.Stats.UpVarianceBps2 = (1-alpha)*state.Stats.UpVarianceBps2 + alpha*returnBps*returnBps
+			state.Stats.UpSamples++
+			updated = true
+		} else if pending.Regime < 0 {
+			state.Stats.DownVarianceBps2 = (1-alpha)*state.Stats.DownVarianceBps2 + alpha*returnBps*returnBps
+			state.Stats.DownSamples++
+			updated = true
+		}
 	}
-	return true
+	return updated
 }
 
 // ResetPending invalidates only the unlabelled forecast after a market-data
 // gap or restart; matured EWMA risk statistics are retained.
 func (m *AsymmetricOscillationRiskModel) ResetPending() {
 	if m != nil {
-		m.Pending = nil
+		for _, state := range m.horizons {
+			if state != nil {
+				state.Pending = nil
+			}
+		}
 	}
 }
 
@@ -270,27 +346,64 @@ func (m *AsymmetricOscillationRiskModel) checkpoint() *asymmetricOscillationRisk
 	if m == nil {
 		return nil
 	}
-	state := &asymmetricOscillationRiskCheckpoint{Stats: m.Stats}
-	if m.Pending != nil {
-		state.PendingMaturesAt = m.Pending.MaturesAt
-		state.PendingHorizon = m.Pending.Horizon
-		state.PendingStartBid = m.Pending.StartBid
-		state.PendingRegime = m.Pending.Regime
+	checkpoint := &asymmetricOscillationRiskCheckpoint{
+		Horizons: make(map[string]asymmetricOscillationRiskHorizonCheckpoint, len(m.horizons)),
 	}
-	return state
+	for horizon, state := range m.horizons {
+		if state == nil {
+			continue
+		}
+		entry := asymmetricOscillationRiskHorizonCheckpoint{Stats: state.Stats}
+		if state.Pending != nil {
+			entry.PendingMaturesAt = state.Pending.MaturesAt
+			entry.PendingHorizon = state.Pending.Horizon
+			entry.PendingStartBid = state.Pending.StartBid
+			entry.PendingRegime = state.Pending.Regime
+		}
+		checkpoint.Horizons[checkpointWindowKey(horizon)] = entry
+	}
+	return checkpoint
 }
 
-func (m *AsymmetricOscillationRiskModel) restore(state *asymmetricOscillationRiskCheckpoint) error {
-	if m == nil || state == nil {
+func (m *AsymmetricOscillationRiskModel) restore(checkpoint *asymmetricOscillationRiskCheckpoint) error {
+	if m == nil || checkpoint == nil {
 		return fmt.Errorf("asymmetric oscillation risk checkpoint is missing")
 	}
-	m.Stats = state.Stats
-	m.Pending = nil
-	if !state.PendingMaturesAt.IsZero() && state.PendingHorizon > 0 && state.PendingStartBid > 0 {
-		m.Pending = &asymmetricOscillationRiskPending{
-			MaturesAt: state.PendingMaturesAt, Horizon: state.PendingHorizon,
-			StartBid: state.PendingStartBid, Regime: state.PendingRegime,
+	m.horizons = make(map[time.Duration]*asymmetricOscillationRiskHorizonState, len(checkpoint.Horizons))
+	for key, entry := range checkpoint.Horizons {
+		seconds, err := strconv.ParseInt(key, 10, 64)
+		if err != nil || seconds <= 0 {
+			return fmt.Errorf("asymmetric oscillation risk checkpoint horizon %q is invalid", key)
 		}
+		horizon := time.Duration(seconds) * time.Second
+		if horizon <= 0 || int64(horizon/time.Second) != seconds {
+			return fmt.Errorf("asymmetric oscillation risk checkpoint horizon %q overflows duration", key)
+		}
+		if !finiteAsymmetricRisk(entry.Stats.UpVarianceBps2) ||
+			!finiteAsymmetricRisk(entry.Stats.DownVarianceBps2) ||
+			entry.Stats.UpVarianceBps2 < 0 || entry.Stats.DownVarianceBps2 < 0 ||
+			entry.Stats.UpSamples < 0 || entry.Stats.DownSamples < 0 {
+			return fmt.Errorf("asymmetric oscillation risk checkpoint horizon %q has invalid statistics", key)
+		}
+		state := &asymmetricOscillationRiskHorizonState{Stats: entry.Stats}
+		pendingPresent := !entry.PendingMaturesAt.IsZero() || entry.PendingHorizon != 0 ||
+			entry.PendingStartBid != 0 || entry.PendingRegime != 0
+		if pendingPresent {
+			if entry.PendingMaturesAt.IsZero() || entry.PendingHorizon <= 0 ||
+				!finiteAsymmetricRisk(entry.PendingStartBid) || entry.PendingStartBid <= 0 ||
+				!finiteAsymmetricRisk(entry.PendingRegime) || math.Abs(entry.PendingRegime) <= 1e-12 {
+				return fmt.Errorf("asymmetric oscillation risk checkpoint horizon %q has invalid pending label", key)
+			}
+			pendingHorizon := normalizeAsymmetricRiskHorizon(entry.PendingHorizon)
+			if pendingHorizon != horizon {
+				return fmt.Errorf("asymmetric oscillation risk checkpoint horizon mismatch: key=%s pending=%s", key, pendingHorizon)
+			}
+			state.Pending = &asymmetricOscillationRiskPending{
+				MaturesAt: entry.PendingMaturesAt, Horizon: pendingHorizon,
+				StartBid: entry.PendingStartBid, Regime: entry.PendingRegime,
+			}
+		}
+		m.horizons[horizon] = state
 	}
 	return nil
 }

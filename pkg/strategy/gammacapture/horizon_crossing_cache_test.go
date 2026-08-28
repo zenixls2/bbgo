@@ -180,6 +180,32 @@ func TestCrossingExposureCacheDefersSameSecondReplacement(t *testing.T) {
 	}
 }
 
+func TestCrossingDecisionQueryCacheInvalidatesOnObservation(t *testing.T) {
+	config := MarketMakerConfig{HorizonLookback: types.Duration(10 * time.Minute)}
+	model := MarketMakerHorizonModel{}
+	start := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	for second := 0; second <= 10*60; second++ {
+		mid := 100 * math.Exp(0.00001*float64(second))
+		model.ObserveBookWithGap(start.Add(time.Duration(second)*time.Second), mid, mid+0.01, config, false)
+	}
+	now := start.Add(10*time.Minute + 500*time.Millisecond)
+	first := model.CrossingDecisionAtSideDistances(now, config, time.Minute, 5, 5, 10)
+	if len(model.crossingDecisionCache) != 1 {
+		t.Fatalf("expected one cached crossing query, got %d", len(model.crossingDecisionCache))
+	}
+	second := model.CrossingDecisionAtSideDistances(now, config, time.Minute, 5, 5, 10)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("cached crossing query changed result\nfirst: %+v\nsecond: %+v", first, second)
+	}
+	if len(model.crossingDecisionCache) != 1 {
+		t.Fatalf("repeated query should reuse cache, got %d entries", len(model.crossingDecisionCache))
+	}
+	model.ObserveBookWithGap(now.Add(time.Second), 101, 101.01, config, false)
+	if len(model.crossingDecisionCache) != 0 {
+		t.Fatalf("new observation must invalidate query cache, got %d entries", len(model.crossingDecisionCache))
+	}
+}
+
 func TestIncrementalExposureBatchMatchesFreshExactBuild(t *testing.T) {
 	rng := rand.New(rand.NewSource(15082026))
 	start := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)

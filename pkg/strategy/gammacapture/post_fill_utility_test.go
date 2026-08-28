@@ -122,3 +122,43 @@ func TestPostFillInventoryRiskBenefitUsesMarginalExecutableFill(t *testing.T) {
 		t.Fatalf("oversized whole-budget hypothetical should expose the old sign reversal, got %f", got)
 	}
 }
+
+func TestPostFillExposureCacheMatchesReferencePointScan(t *testing.T) {
+	distances := []float64{45, 39, 33, 27, 21, 15}
+	for _, upward := range []bool{false, true} {
+		model, end, _, _ := postFillUtilityTrendModel(upward)
+		for _, side := range []types.SideType{types.SideTypeBuy, types.SideTypeSell} {
+			for _, offset := range []time.Duration{0, -37 * time.Second, -4 * time.Minute} {
+				now := end.Add(offset)
+				got := model.postFillUtilityCandidates(
+					now, 6*time.Hour, 10*time.Minute, side, distances, 12, 1.25, 1.645)
+				want := model.postFillUtilityCandidatesReference(
+					now, 6*time.Hour, 10*time.Minute, side, distances, 12, 1.25, 1.645)
+				if len(got) != len(want) {
+					t.Fatalf("candidate count differs: got=%d want=%d", len(got), len(want))
+				}
+				for index := range want {
+					actual := []float64{
+						got[index].DistanceBps, got[index].IncrementalMeanBps,
+						got[index].IncrementalStdErrorBps, got[index].IncrementalLowerBps,
+						got[index].ExpectedMeanBps, got[index].ExpectedStdErrorBps,
+						got[index].ExpectedLowerBps, got[index].FillProbability,
+						got[index].EffectiveSamples,
+					}
+					expected := []float64{
+						want[index].DistanceBps, want[index].IncrementalMeanBps,
+						want[index].IncrementalStdErrorBps, want[index].IncrementalLowerBps,
+						want[index].ExpectedMeanBps, want[index].ExpectedStdErrorBps,
+						want[index].ExpectedLowerBps, want[index].FillProbability,
+						want[index].EffectiveSamples,
+					}
+					for field := range expected {
+						if math.Abs(actual[field]-expected[field]) > 1e-10 {
+							t.Fatalf("cached/reference mismatch up=%t side=%s offset=%s candidate=%d field=%d got=%.12f want=%.12f", upward, side, offset, index, field, actual[field], expected[field])
+						}
+					}
+				}
+			}
+		}
+	}
+}

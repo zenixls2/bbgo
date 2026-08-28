@@ -21,6 +21,9 @@ func Test_newClientOrderID(t *testing.T) {
 }
 
 func Test_new(t *testing.T) {
+	if os.Getenv("TEST_BINANCE") != "1" {
+		t.Skip("requires live Binance API; set TEST_BINANCE=1 to run")
+	}
 	ex := New("", "")
 	assert.NotEmpty(t, ex)
 	ctx := context.Background()
@@ -73,6 +76,9 @@ func Test_QueryPositionRisk(t *testing.T) {
 }
 
 func Test_QueryFuturesMarkPriceKLines(t *testing.T) {
+	if os.Getenv("TEST_BINANCE") != "1" {
+		t.Skip("requires live Binance API; set TEST_BINANCE=1 to run")
+	}
 	ex := New("", "")
 	ex.UseFutures()
 	assert.NotEmpty(t, ex)
@@ -100,6 +106,9 @@ func Test_QueryFuturesMarkPriceKLines(t *testing.T) {
 }
 
 func Test_QueryFuturesIndexPriceKLines(t *testing.T) {
+	if os.Getenv("TEST_BINANCE") != "1" {
+		t.Skip("requires live Binance API; set TEST_BINANCE=1 to run")
+	}
 	ex := New("", "")
 	ex.UseFutures()
 	assert.NotEmpty(t, ex)

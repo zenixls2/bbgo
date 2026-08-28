@@ -184,6 +184,110 @@ func SymmetricInventoryProjectionBounds(target, hardLower, hardUpper float64) (l
 	return center - halfWidth, center + halfWidth
 }
 
+// TargetAwareFallbackQuoteInput describes the quantity fallback used when the
+// second-moment inventory projection is unavailable. All values share the same
+// mid-marked quote-currency notional. The fallback is deliberately target
+// monotone: it may reduce the current target error, but it may never create a
+// quote that increases that error.
+type TargetAwareFallbackQuoteInput struct {
+	CurrentInventoryNotionalJPY   float64
+	TargetInventoryNotionalJPY    float64
+	HardLowerInventoryNotionalJPY float64
+	HardUpperInventoryNotionalJPY float64
+	BuyNotionalCapJPY             float64
+	SellNotionalCapJPY            float64
+	MinBuyNotionalJPY             float64
+	MinSellNotionalJPY            float64
+}
+
+type TargetAwareFallbackQuoteDecision struct {
+	Enabled             bool
+	Reason              string
+	CorrectiveDirection int
+	BuyNotionalJPY      float64
+	SellNotionalJPY     float64
+}
+
+// TargetAwareFallbackQuoteNotionals preserves the Macro/causal target when the
+// probability projection cannot solve (notably when a target at a hard 0% or
+// 100% boundary collapses its symmetric interval). A material target error is
+// corrected on one side only. When inventory is already aligned with a
+// strictly interior target, one minimum executable cell per side is retained
+// for private-fill learning; hard-boundary targets do not add exposure merely
+// to manufacture observations.
+func TargetAwareFallbackQuoteNotionals(in TargetAwareFallbackQuoteInput) TargetAwareFallbackQuoteDecision {
+	d := TargetAwareFallbackQuoteDecision{Reason: "invalid target-aware fallback input"}
+	values := []float64{
+		in.CurrentInventoryNotionalJPY, in.TargetInventoryNotionalJPY,
+		in.HardLowerInventoryNotionalJPY, in.HardUpperInventoryNotionalJPY,
+		in.BuyNotionalCapJPY, in.SellNotionalCapJPY,
+		in.MinBuyNotionalJPY, in.MinSellNotionalJPY,
+	}
+	for _, value := range values {
+		if !inventoryProjectionFinite(value) {
+			return d
+		}
+	}
+	if in.HardUpperInventoryNotionalJPY <= in.HardLowerInventoryNotionalJPY ||
+		in.BuyNotionalCapJPY < 0 || in.SellNotionalCapJPY < 0 ||
+		in.MinBuyNotionalJPY < 0 || in.MinSellNotionalJPY < 0 {
+		return d
+	}
+
+	lower := in.HardLowerInventoryNotionalJPY
+	upper := in.HardUpperInventoryNotionalJPY
+	current := math.Max(lower, math.Min(upper, in.CurrentInventoryNotionalJPY))
+	target := math.Max(lower, math.Min(upper, in.TargetInventoryNotionalJPY))
+	buyCap := math.Max(0, math.Min(in.BuyNotionalCapJPY, upper-current))
+	sellCap := math.Max(0, math.Min(in.SellNotionalCapJPY, current-lower))
+	gap := target - current
+	tolerance := 1e-9 * math.Max(1, math.Max(math.Abs(lower), math.Abs(upper)))
+
+	if gap > tolerance {
+		d.CorrectiveDirection = 1
+		d.BuyNotionalJPY = math.Min(gap, buyCap)
+		if d.BuyNotionalJPY+1e-9 < in.MinBuyNotionalJPY {
+			d.BuyNotionalJPY = 0
+		}
+		d.Enabled = d.BuyNotionalJPY > 0
+		d.Reason = "buy-only target correction"
+		if !d.Enabled {
+			d.Reason = "buy target gap is not executable"
+		}
+		return d
+	}
+	if gap < -tolerance {
+		d.CorrectiveDirection = -1
+		d.SellNotionalJPY = math.Min(-gap, sellCap)
+		if d.SellNotionalJPY+1e-9 < in.MinSellNotionalJPY {
+			d.SellNotionalJPY = 0
+		}
+		d.Enabled = d.SellNotionalJPY > 0
+		d.Reason = "sell-only target correction"
+		if !d.Enabled {
+			d.Reason = "sell target gap is not executable"
+		}
+		return d
+	}
+
+	if target <= lower+tolerance || target >= upper-tolerance {
+		d.Reason = "aligned hard-boundary target"
+		return d
+	}
+	if buyCap+1e-9 >= in.MinBuyNotionalJPY && in.MinBuyNotionalJPY > 0 {
+		d.BuyNotionalJPY = in.MinBuyNotionalJPY
+	}
+	if sellCap+1e-9 >= in.MinSellNotionalJPY && in.MinSellNotionalJPY > 0 {
+		d.SellNotionalJPY = in.MinSellNotionalJPY
+	}
+	d.Enabled = d.BuyNotionalJPY > 0 || d.SellNotionalJPY > 0
+	d.Reason = "interior target minimum learning cells"
+	if !d.Enabled {
+		d.Reason = "interior target has no executable learning cell"
+	}
+	return d
+}
+
 // InventoryActuationInput describes the reachable-set problem between a Macro
 // inventory target and the passive maker-fill process. MomentumSignal is the
 // signed posterior mean in [-1,1], so (1+s*m)/2 is the posterior probability

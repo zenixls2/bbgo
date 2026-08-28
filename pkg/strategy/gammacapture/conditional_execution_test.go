@@ -35,6 +35,29 @@ func TestConditionalExecutionStateIsCausalAndSideSpecific(t *testing.T) {
 	}
 }
 
+func TestConditionalExecutionStateCacheInvalidatesOnAcceptedBBO(t *testing.T) {
+	start := time.Unix(4_000, 0)
+	cfg := MarketMakerConfig{
+		HorizonLookback:  types.Duration(time.Minute),
+		MaxTradingWindow: types.Duration(10 * time.Second),
+	}
+	var model MarketMakerHorizonModel
+	for second := 0; second <= 12; second++ {
+		model.ObserveBookWithGap(start.Add(time.Duration(second)*time.Second), 100, 100.1, cfg, false)
+	}
+	horizon := 10 * time.Second
+	first := model.conditionalExecutionState(horizon)
+	held := model.conditionalExecutionState(horizon)
+	if first != held || len(model.conditionalStates) != 1 {
+		t.Fatalf("repeated query did not reuse exact state: first=%+v held=%+v", first, held)
+	}
+	model.ObserveBookWithGap(start.Add(13*time.Second), 99.5, 99.6, cfg, false)
+	next := model.conditionalExecutionState(horizon)
+	if !next.Valid || next == first || len(model.conditionalStates) != 1 {
+		t.Fatalf("accepted BBO did not invalidate/rebuild state: first=%+v next=%+v", first, next)
+	}
+}
+
 func TestConditionalExecutionKernelUsesVolumeProfileOnlyWhenBothStatesAreReady(t *testing.T) {
 	base := conditionalExecutionState{Valid: true, BuyQVBps: 5, SellQVBps: 5, SpreadBps: 4}
 	if got := conditionalExecutionKernel(base, base, true, time.Minute); got != 1 {
@@ -77,6 +100,10 @@ func TestMarketMakerHorizonModelCarriesCausalVolumeProfileSnapshots(t *testing.T
 	if !state.Valid || !state.VolumeProfile.Valid || state.VolumeProfile.EffectiveTrades < 4 {
 		t.Fatalf("causal profile snapshot not carried into horizon state: %+v", state)
 	}
+	direct, ready := model.VolumeProfileState(10 * time.Second)
+	if !ready || direct != state.VolumeProfile {
+		t.Fatalf("O(1) latest profile differs from conditional path snapshot: direct=%+v state=%+v", direct, state.VolumeProfile)
+	}
 }
 
 func TestConditionalExposureCacheStartupMatchesIncremental(t *testing.T) {
@@ -116,6 +143,40 @@ func TestConditionalExposureCacheStartupMatchesIncremental(t *testing.T) {
 			!close(gotState.SpreadBps, wantState.SpreadBps) {
 			t.Fatalf("conditional state mismatch at %d: got=%+v want=%+v",
 				index, gotState, wantState)
+		}
+	}
+}
+
+func TestConditionalExecutionStreamingBuilderMatchesBatch(t *testing.T) {
+	start := time.Unix(7_000, 0)
+	points := make([]MarketMakerHorizonPoint, 0, 240)
+	for index := 0; index < 240; index++ {
+		if index == 80 || index == 170 {
+			points = append(points, MarketMakerHorizonPoint{
+				At:  start.Add(time.Duration(index) * time.Second),
+				Bid: 100, Ask: 100.05, GapBefore: true,
+			})
+			continue
+		}
+		mid := 100 + 0.15*math.Sin(float64(index)/7)
+		points = append(points, MarketMakerHorizonPoint{
+			At:  start.Add(time.Duration(index) * time.Second),
+			Bid: mid - 0.02, Ask: mid + 0.03,
+		})
+	}
+	horizon := 45 * time.Second
+	want := buildConditionalExecutionStates(points, horizon)
+	var builder conditionalExecutionStateBuilder
+	var got []conditionalExecutionState
+	for end := 1; end <= len(points); end++ {
+		got = builder.appendThrough(points[:end], horizon)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("streaming state count mismatch: got=%d want=%d", len(got), len(want))
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("streaming state mismatch at %d: got=%+v want=%+v", index, got[index], want[index])
 		}
 	}
 }

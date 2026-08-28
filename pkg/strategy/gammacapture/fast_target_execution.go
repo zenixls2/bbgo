@@ -36,10 +36,14 @@ type FastTargetExecutionInput struct {
 	// PassiveAvailable distinguishes a valid resting-maker alternative from an
 	// authoritative maker rejection.  In the latter case the counterfactual is
 	// to keep the inventory until H, not to pretend that a rejected quote fills.
-	PassiveAvailable              bool
-	TouchProbability              float64
-	TouchStdError                 float64
-	InventoryReturnMeanBps        float64
+	PassiveAvailable       bool
+	TouchProbability       float64
+	TouchStdError          float64
+	InventoryReturnMeanBps float64
+	// InventoryReturnSEBps is the causal standard error of the executable
+	// directional return forecast. It is used only for the one-sided CE lower
+	// bound; it is not folded into the inventory target itself.
+	InventoryReturnSEBps          float64
 	InventoryPredictiveSDBps      float64
 	DirectionConfidence           float64
 	PersistentDownsideActive      bool
@@ -60,9 +64,19 @@ type FastTargetExecutionInput struct {
 // FastTargetExecutionDecision is an auditable, depth-capped marketable IOC
 // limit. Remaining target inventory is left to the ordinary Fast maker quote.
 type FastTargetExecutionDecision struct {
-	Trigger                           bool
-	Reason                            string
-	Direction                         int
+	Trigger   bool
+	Reason    string
+	Direction int
+	// ReferenceHorizonReady describes the anti-overlap maturity check for the
+	// previous IOC decision. It is intentionally separate from evidence
+	// readiness: a valid forecast can exist while a prior same-side decision is
+	// still being observed.
+	ReferenceHorizonReady bool
+	ReferenceMaturityAt   time.Time
+	// DecisionEvaluated is true only after the reference-horizon gate has
+	// passed. False means the remaining CE/quantity fields were not evaluated;
+	// their zero values must not be interpreted as measured zeros.
+	DecisionEvaluated                 bool
 	Quantity                          float64
 	TargetGapBase                     float64
 	ResidualMakerGapBase              float64
@@ -78,18 +92,21 @@ type FastTargetExecutionDecision struct {
 	ExecutionCostBps                  float64
 	// FeeIncrementBps is retained as an audit field for older logs.  The
 	// decision uses ExpectedExecutionFeeBps, which also handles no-maker/hold.
-	FeeIncrementBps               float64
-	PersistentDownsideActive      bool
-	PersistentDownsideEValue      float64
-	PersistentDownsideForecastBps float64
-	PersistentUpsideActive        bool
-	PersistentUpsideEValue        float64
-	PersistentUpsideForecastBps   float64
-	InventoryVariancePenaltyBps   float64
-	ActiveCertaintyEquivalentBps  float64
-	MaximumImpactBps              float64
-	UrgentFraction                float64
-	WorstPrice                    float64
+	FeeIncrementBps                  float64
+	PersistentDownsideActive         bool
+	PersistentDownsideEValue         float64
+	PersistentDownsideForecastBps    float64
+	PersistentUpsideActive           bool
+	PersistentUpsideEValue           float64
+	PersistentUpsideForecastBps      float64
+	InventoryVariancePenaltyBps      float64
+	ActiveCertaintyEquivalentMeanBps float64
+	// ActiveCertaintyEquivalentBps is the conservative lower bound after the
+	// confidence haircut, not an unbounded risk gradient.
+	ActiveCertaintyEquivalentBps float64
+	MaximumImpactBps             float64
+	UrgentFraction               float64
+	WorstPrice                   float64
 }
 
 // EvaluateFastTargetExecution compares a conservative lower bound on the
@@ -102,7 +119,11 @@ type FastTargetExecutionDecision struct {
 // the same-horizon predictive return: BUY loses when price rises before filling
 // and SELL loses when price falls before filling.
 func EvaluateFastTargetExecution(c FastTargetExecutionConfig, in FastTargetExecutionInput) FastTargetExecutionDecision {
-	d := FastTargetExecutionDecision{Reason: "disabled", Direction: in.Direction}
+	d := FastTargetExecutionDecision{
+		Reason:                "disabled",
+		Direction:             in.Direction,
+		ReferenceHorizonReady: true,
+	}
 	if !c.Enabled {
 		return d
 	}
@@ -115,6 +136,15 @@ func EvaluateFastTargetExecution(c FastTargetExecutionConfig, in FastTargetExecu
 		d.Reason = "invalid Fast execution prices or horizon"
 		return d
 	}
+	// Populate the directional gap before the maturity gate. This keeps the
+	// diagnostic useful when an otherwise valid decision is waiting for a
+	// prior reference horizon.
+	switch {
+	case in.Direction > 0:
+		d.TargetGapBase = in.TargetInventoryBase - in.CurrentInventoryBase
+	case in.Direction < 0:
+		d.TargetGapBase = in.CurrentInventoryBase - in.TargetInventoryBase
+	}
 	if !in.LastExecutionModelAt.IsZero() {
 		maturity := in.LastExecutionModelAt.Add(in.Horizon)
 		if in.Direction != 0 && in.Direction == in.LastExecutionDirection {
@@ -124,11 +154,14 @@ func EvaluateFastTargetExecution(c FastTargetExecutionConfig, in FastTargetExecu
 			// opposite-side risk exit retains the original one-H maturity rule.
 			maturity = maturity.Add(in.Horizon)
 		}
+		d.ReferenceMaturityAt = maturity
 		if in.ModelUpdatedAt.Before(maturity) {
+			d.ReferenceHorizonReady = false
 			d.Reason = "prior Fast IOC reference horizon is unresolved"
 			return d
 		}
 	}
+	d.DecisionEvaluated = true
 	if in.TouchProbability < 0 || in.TouchProbability > 1 || in.TouchStdError < 0 ||
 		math.IsNaN(in.TouchProbability) || math.IsNaN(in.TouchStdError) {
 		d.Reason = "invalid empirical touch posterior"
@@ -194,6 +227,10 @@ func EvaluateFastTargetExecution(c FastTargetExecutionConfig, in FastTargetExecu
 		d.Reason = "invalid Fast predictive dispersion"
 		return d
 	}
+	if in.InventoryReturnSEBps < 0 || math.IsNaN(in.InventoryReturnSEBps) || math.IsInf(in.InventoryReturnSEBps, 0) {
+		d.Reason = "invalid Fast return standard error"
+		return d
+	}
 	if in.InventoryPredictiveSDBps > 0 {
 		zReturn := directionalMean / in.InventoryPredictiveSDBps
 		phi := math.Exp(-0.5*zReturn*zReturn) / math.Sqrt(2*math.Pi)
@@ -244,30 +281,35 @@ func EvaluateFastTargetExecution(c FastTargetExecutionConfig, in FastTargetExecu
 		// duplicate hard gate that can strand an extreme inventory position.
 		d.UrgentFraction = 1
 	}
-	urgentQuantity := d.TargetGapBase * d.UrgentFraction
 	d.DepthCapBase = visibleDepth
-	if in.Direction > 0 {
-		allowedImpactBps := math.Max(0, d.MaximumImpactBps)
-		d.WorstPrice = touchPrice * math.Exp(allowedImpactBps/10_000)
-		balanceCap := in.AvailableQuote / d.WorstPrice
-		d.Quantity = math.Min(urgentQuantity, math.Min(visibleDepth, balanceCap))
-	} else {
-		allowedImpactBps := math.Max(0, d.MaximumImpactBps)
-		d.WorstPrice = touchPrice * math.Exp(-allowedImpactBps/10_000)
-		d.Quantity = math.Min(urgentQuantity, math.Min(visibleDepth, in.AvailableBase))
-	}
-	d.ResidualMakerGapBase = math.Max(0, d.TargetGapBase-d.Quantity)
-	if d.Quantity <= 0 || d.Quantity < in.MinimumQuantityBase ||
-		d.Quantity*touchPrice < in.MinimumNotionalJPY {
-		d.Reason = "Fast active quantity is below exchange minimum"
+	// Estimate the marginal portfolio CE for every impulse, including when a
+	// passive quote exists. Previously passive actions bypassed this calculation,
+	// so a risk-gradient value could trigger an IOC with no positive execution
+	// value. The signed variance term is intentional: reducing inventory risk is
+	// a benefit (negative penalty), while adding risk is a cost.
+	if in.PairEquityJPY <= 0 || math.IsNaN(in.PairEquityJPY) || math.IsInf(in.PairEquityJPY, 0) {
+		d.Reason = "Fast active certainty equivalent lacks pair equity"
 		return d
 	}
-	if !in.PassiveAvailable {
-		if in.PairEquityJPY <= 0 || math.IsNaN(in.PairEquityJPY) || math.IsInf(in.PairEquityJPY, 0) {
-			d.Reason = "Fast active certainty equivalent lacks pair equity"
-			return d
+	setQuantity := func(impactBps float64) {
+		impactBps = math.Max(0, impactBps)
+		if in.Direction > 0 {
+			d.WorstPrice = touchPrice * math.Exp(impactBps/10_000)
+			urgentQuantity := d.TargetGapBase * d.UrgentFraction
+			balanceCap := in.AvailableQuote / d.WorstPrice
+			d.Quantity = math.Min(urgentQuantity, math.Min(visibleDepth, balanceCap))
+		} else {
+			d.WorstPrice = touchPrice * math.Exp(-impactBps/10_000)
+			urgentQuantity := d.TargetGapBase * d.UrgentFraction
+			d.Quantity = math.Min(urgentQuantity, math.Min(visibleDepth, in.AvailableBase))
 		}
+		d.ResidualMakerGapBase = math.Max(0, d.TargetGapBase-d.Quantity)
+	}
+	computeCE := func() float64 {
 		notionalJPY := d.Quantity * touchPrice
+		if notionalJPY <= 0 || math.IsNaN(notionalJPY) || math.IsInf(notionalJPY, 0) {
+			return math.Inf(-1)
+		}
 		inventoryDeviationJPY := (in.CurrentInventoryBase - in.TargetInventoryBase) * touchPrice
 		inventoryDeltaJPY := float64(in.Direction) * notionalJPY
 		marginalVarianceJPY2 :=
@@ -276,28 +318,58 @@ func EvaluateFastTargetExecution(c FastTargetExecutionConfig, in FastTargetExecu
 				in.InventoryPredictiveSDBps * in.InventoryPredictiveSDBps / 100_000_000
 		d.InventoryVariancePenaltyBps = math.Max(0, in.RiskAversion) *
 			marginalVarianceJPY2 / (2 * in.PairEquityJPY) / notionalJPY * 10_000
-		d.ActiveCertaintyEquivalentBps = directionalMean - in.TakerFeeBps - d.InventoryVariancePenaltyBps
-		if d.ActiveCertaintyEquivalentBps <= 0 {
-			d.Reason = "Fast active certainty equivalent is nonpositive"
-			return d
+		d.ActiveCertaintyEquivalentMeanBps = directionalMean - in.TakerFeeBps - d.InventoryVariancePenaltyBps
+		return d.ActiveCertaintyEquivalentMeanBps - math.Max(0, in.ConfidenceZScore)*in.InventoryReturnSEBps
+	}
+	setQuantity(d.MaximumImpactBps)
+	if d.Quantity <= 0 || d.Quantity < in.MinimumQuantityBase ||
+		d.Quantity*touchPrice < in.MinimumNotionalJPY {
+		d.Reason = "Fast active quantity is below exchange minimum"
+		return d
+	}
+	ceLower := computeCE()
+	d.ActiveCertaintyEquivalentBps = ceLower
+	if ceLower <= 0 || math.IsNaN(ceLower) || math.IsInf(ceLower, 0) {
+		d.Reason = "Fast active certainty equivalent is nonpositive"
+		return d
+	}
+	if in.PassiveAvailable {
+		// A passive quote can justify a smaller crossing budget, but it cannot
+		// bypass the same terminal-wealth lower bound. Recompute quantity after
+		// capping impact and then recompute CE at that final quantity.
+		d.MaximumImpactBps = math.Min(math.Max(0, d.MaximumImpactBps), ceLower)
+		if d.WaitLossBps > 0 {
+			d.UrgentFraction = d.PassiveMissProbabilityLower *
+				math.Min(1, d.MaximumImpactBps/d.WaitLossBps)
 		}
-		// The positive portfolio CE is also the maximum adverse execution impact
-		// the impulse can pay relative to holding.  Re-price the marketable limit
-		// from that unified value instead of the earlier maker-wait comparison,
-		// which is undefined after an authoritative maker rejection.
-		d.MaximumImpactBps = d.ActiveCertaintyEquivalentBps
-		if in.Direction > 0 {
-			d.WorstPrice = touchPrice * math.Exp(d.MaximumImpactBps/10_000)
-			d.Quantity = math.Min(d.Quantity, in.AvailableQuote/d.WorstPrice)
-		} else {
-			d.WorstPrice = touchPrice * math.Exp(-d.MaximumImpactBps/10_000)
-		}
+		setQuantity(d.MaximumImpactBps)
 		if d.Quantity <= 0 || d.Quantity < in.MinimumQuantityBase ||
 			d.Quantity*touchPrice < in.MinimumNotionalJPY {
 			d.Reason = "Fast active quantity is below exchange minimum"
 			return d
 		}
-		d.ResidualMakerGapBase = math.Max(0, d.TargetGapBase-d.Quantity)
+		ceLower = computeCE()
+		d.ActiveCertaintyEquivalentBps = ceLower
+		if ceLower <= 0 || math.IsNaN(ceLower) || math.IsInf(ceLower, 0) {
+			d.Reason = "Fast active certainty equivalent is nonpositive"
+			return d
+		}
+	} else {
+		// With no admissible maker quote, the CE lower bound is the maximum
+		// adverse execution impact the impulse can pay relative to holding.
+		d.MaximumImpactBps = ceLower
+		setQuantity(d.MaximumImpactBps)
+		if d.Quantity <= 0 || d.Quantity < in.MinimumQuantityBase ||
+			d.Quantity*touchPrice < in.MinimumNotionalJPY {
+			d.Reason = "Fast active quantity is below exchange minimum"
+			return d
+		}
+		ceLower = computeCE()
+		d.ActiveCertaintyEquivalentBps = ceLower
+		if ceLower <= 0 || math.IsNaN(ceLower) || math.IsInf(ceLower, 0) {
+			d.Reason = "Fast active certainty equivalent is nonpositive"
+			return d
+		}
 	}
 	d.Trigger = true
 	if in.PassiveAvailable {

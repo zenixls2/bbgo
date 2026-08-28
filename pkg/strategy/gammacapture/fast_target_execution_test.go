@@ -124,6 +124,36 @@ func TestFastTargetExecutionRejectedBuyUsesTargetRelativeRiskAndBlocksNegativeCE
 	}
 }
 
+func TestFastTargetExecutionPassivePathRequiresPositiveCE(t *testing.T) {
+	in := fastTargetExecutionInput(1)
+	in.InventoryReturnMeanBps = 20
+	in.InventoryReturnSEBps = 20
+	in.InventoryPredictiveSDBps = 0
+	in.TakerFeeBps = 10
+	in.MakerFeeBps = 0
+	d := EvaluateFastTargetExecution(FastTargetExecutionConfig{Enabled: true}, in)
+	if d.Trigger || d.Reason != "Fast active certainty equivalent is nonpositive" {
+		t.Fatalf("passive path must not bypass terminal CE: %+v", d)
+	}
+}
+
+func TestFastTargetExecutionUsesSignedRiskBenefit(t *testing.T) {
+	in := fastTargetExecutionInput(-1)
+	in.TargetInventoryBase = 0.4
+	in.PassiveAvailable = false
+	in.PassiveQuotePrice = 0
+	in.TouchProbability = 0
+	in.TouchStdError = 0
+	in.InventoryReturnMeanBps = 0
+	in.InventoryPredictiveSDBps = 400
+	in.RiskAversion = 5
+	in.PairEquityJPY = 200
+	d := EvaluateFastTargetExecution(FastTargetExecutionConfig{Enabled: true}, in)
+	if !d.Trigger || d.InventoryVariancePenaltyBps >= 0 {
+		t.Fatalf("risk-reducing IOC should receive a signed variance benefit: %+v", d)
+	}
+}
+
 func TestFastTargetExecutionUsesPersistentBidDownsideOnlyForSell(t *testing.T) {
 	sell := fastTargetExecutionInput(-1)
 	sell.TargetInventoryBase = .4
@@ -235,7 +265,8 @@ func TestFastTargetExecutionAtMostOncePerModelUpdate(t *testing.T) {
 	in := fastTargetExecutionInput(1)
 	in.LastExecutionModelAt = in.ModelUpdatedAt
 	d := EvaluateFastTargetExecution(FastTargetExecutionConfig{Enabled: true}, in)
-	if d.Trigger || d.Reason != "prior Fast IOC reference horizon is unresolved" {
+	if d.Trigger || d.Reason != "prior Fast IOC reference horizon is unresolved" ||
+		d.ReferenceHorizonReady || d.DecisionEvaluated || d.TargetGapBase != 0.5 {
 		t.Fatalf("expected duplicate model update rejection, got %+v", d)
 	}
 }
@@ -244,7 +275,9 @@ func TestFastTargetExecutionWaitsForPriorReferenceHorizon(t *testing.T) {
 	in := fastTargetExecutionInput(1)
 	in.LastExecutionModelAt = in.ModelUpdatedAt.Add(-10 * time.Minute)
 	d := EvaluateFastTargetExecution(FastTargetExecutionConfig{Enabled: true}, in)
-	if d.Trigger || d.Reason != "prior Fast IOC reference horizon is unresolved" {
+	if d.Trigger || d.Reason != "prior Fast IOC reference horizon is unresolved" ||
+		d.ReferenceHorizonReady || d.DecisionEvaluated ||
+		d.ReferenceMaturityAt != in.LastExecutionModelAt.Add(in.Horizon) {
 		t.Fatalf("overlapping posterior windows must not create repeated IOC evidence: %+v", d)
 	}
 	in.LastExecutionModelAt = in.ModelUpdatedAt.Add(-in.Horizon)

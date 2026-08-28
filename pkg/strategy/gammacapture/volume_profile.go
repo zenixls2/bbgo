@@ -66,6 +66,7 @@ type volumeProfileBin struct {
 // volume node and +1 at the nearest upper node.
 type VolumeProfileState struct {
 	Valid               bool
+	Stale               bool
 	POCDistanceBps      float64
 	LocalDensityRatio   float64
 	LocalFlowImbalance  float64
@@ -75,6 +76,8 @@ type VolumeProfileState struct {
 	EffectiveTrades     float64
 	Bins                int
 	KernelWeight        float64
+	LastObservationAt   time.Time
+	Age                 time.Duration
 }
 
 // SideTerminalRiskMoments returns the mean and variance of a bounded adverse
@@ -99,7 +102,7 @@ func (s VolumeProfileState) SideTerminalRiskMoments(buy bool) (meanBps, variance
 // the profile's one-sigma bound; the production risk model can use its
 // already-calibrated confidence level without introducing a new coefficient.
 func (s VolumeProfileState) SideTerminalRiskMomentsWithZScore(buy bool, zScore float64) (meanBps, varianceBps2 float64) {
-	if !s.Valid || s.ProfileScaleBps <= 0 || !finiteVolumeProfileValue(s.POCDistanceBps) ||
+	if !s.Valid || s.Stale || s.ProfileScaleBps <= 0 || !finiteVolumeProfileValue(s.POCDistanceBps) ||
 		!finiteVolumeProfileValue(s.LocalDensityRatio) || !finiteVolumeProfileValue(s.LocalFlowImbalance) {
 		return 0, 0
 	}
@@ -234,7 +237,7 @@ func (m *MarketMakerHorizonModel) ObservePublicTrade(at time.Time, price, quanti
 	}
 }
 
-func (m *MarketMakerHorizonModel) volumeProfileSnapshots(price float64) ([maxVolumeProfileSnapshots]volumeProfileSnapshot, uint8) {
+func (m *MarketMakerHorizonModel) volumeProfileSnapshots(price float64, at time.Time) ([maxVolumeProfileSnapshots]volumeProfileSnapshot, uint8) {
 	var snapshots [maxVolumeProfileSnapshots]volumeProfileSnapshot
 	if m == nil || price <= 0 || len(m.volumeProfileWindows) == 0 {
 		return snapshots, 0
@@ -248,7 +251,7 @@ func (m *MarketMakerHorizonModel) volumeProfileSnapshots(price float64) ([maxVol
 		if profile == nil {
 			continue
 		}
-		snapshots[count] = volumeProfileSnapshot{Horizon: window, State: profile.Snapshot(price)}
+		snapshots[count] = volumeProfileSnapshot{Horizon: window, State: profile.SnapshotAt(price, at)}
 		count++
 	}
 	return snapshots, count
@@ -337,13 +340,37 @@ func (p *RollingVolumeProfile) smoothedMass(index int64) float64 {
 	return 0.5*(center.buy+center.sell) + 0.25*(left.buy+left.sell+right.buy+right.sell)
 }
 
-// Snapshot is O(B) and is intended for the statistical model clock (one
-// minute), not every BBO event. It does not allocate and never mutates bins.
-func (p *RollingVolumeProfile) Snapshot(price float64) VolumeProfileState {
+// SnapshotAt advances only the global decay scale and then computes the
+// O(B) profile statistics. The decay itself is O(1); the rare O(B)
+// renormalization is triggered only after the scale has underflowed. Keeping
+// this timestamped path separate from the compatibility Snapshot prevents a
+// wall-clock gap in public trades from preserving stale profile mass.
+func (p *RollingVolumeProfile) SnapshotAt(price float64, at time.Time) VolumeProfileState {
 	if p == nil {
 		return VolumeProfileState{}
 	}
-	state := VolumeProfileState{Bins: len(p.bins), KernelWeight: p.config.KernelWeight}
+	if at.IsZero() {
+		at = p.lastAt
+	}
+	state := VolumeProfileState{
+		Bins: len(p.bins), KernelWeight: p.config.KernelWeight,
+		LastObservationAt: p.lastAt,
+	}
+	if !p.lastAt.IsZero() && at.After(p.lastAt) {
+		p.decayTo(at)
+		state.LastObservationAt = p.lastAt
+	}
+	if !state.LastObservationAt.IsZero() && at.After(state.LastObservationAt) {
+		state.Age = at.Sub(state.LastObservationAt)
+	}
+	if state.Age > 2*time.Duration(p.config.HalfLife) {
+		// A large historical mass can remain above MinEffectiveTrades after
+		// several half-lives. Explicit staleness prevents that residual mass
+		// from being mistaken for current flow even when the count threshold is
+		// still numerically met.
+		state.Stale = true
+		return state
+	}
 	if price <= 0 || len(p.bins) == 0 || p.countRaw*p.scale < p.config.MinEffectiveTrades || p.totalRaw <= 0 {
 		return state
 	}
@@ -413,6 +440,16 @@ func (p *RollingVolumeProfile) Snapshot(price float64) VolumeProfileState {
 	state.CorridorPosition = math.Max(-1, math.Min(1, corridor))
 	state.EffectiveTrades = p.countRaw * p.scale
 	return state
+}
+
+// Snapshot preserves the historical API for deterministic tests and callers
+// that do not own a statistical clock. Production and replay quote paths use
+// SnapshotAt so elapsed wall-clock time is always represented.
+func (p *RollingVolumeProfile) Snapshot(price float64) VolumeProfileState {
+	if p == nil {
+		return VolumeProfileState{}
+	}
+	return p.SnapshotAt(price, p.lastAt)
 }
 
 func (p *RollingVolumeProfile) BinCount() int {

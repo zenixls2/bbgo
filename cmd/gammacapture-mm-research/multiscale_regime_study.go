@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/c9s/bbgo/pkg/strategy/gammacapture"
+	"github.com/c9s/bbgo/pkg/types"
 )
 
 type multiscaleRegimeStudyInput struct {
@@ -144,7 +145,7 @@ func evaluateMultiscaleRegime(closes []minuteRegimeClose, horizon, anchorStep ti
 		return variant
 	}
 	model := gammacapture.NewBayesianMultiscaleRegime(gammacapture.MultiscaleRegimeConfig{
-		HazardMean: hazard, MaximumRunLength: int((2 * horizon) / time.Minute),
+		HazardMean: types.Duration(hazard), MaximumRunLength: int((2 * horizon) / time.Minute),
 		VolatilityWindow: 30, MinimumSamples: 30,
 	})
 	horizonSteps := int(horizon / time.Minute)

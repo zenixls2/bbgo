@@ -1,0 +1,29 @@
+{
+  "name": "horizon-conditioned-continuation-utility-ethjpy-2026-08-26",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 32.0,
+  "minimum_effective_samples": 24.0,
+  "incremental_mean_bps": 0.5016656314687665,
+  "incremental_standard_error_bps": 1.7074289379567553,
+  "incremental_cost_bps": 0.0,
+  "risk_penalty_bps": 0.0,
+  "candidate_tests": 3,
+  "alpha": 0.05,
+  "positive_blocks": 12,
+  "total_blocks": 32,
+  "minimum_positive_blocks": 5,
+  "primary_horizon": "15m short execution + next confirmed pivot, max 6h label window",
+  "neighboring_variants": [
+    "fixed 60m continuation",
+    "next confirmed pivot pooled side estimator",
+    "next confirmed pivot phase-conditioned estimator"
+  ],
+  "entry_cost_bps_already_in_realized_mean": 12.0,
+  "private_fill_calibration_passed": false,
+  "private_fills": 0,
+  "public_touch_labels": 0,
+  "private_fill_reason": "No historical private order/queue ledger was available; public BBO touches are not private-fill evidence.",
+  "decision": "REJECT_NO_INCREMENTAL_VALUE_AND_PRIVATE_FILL_NOT_AVAILABLE",
+  "decision_reason": "The point estimate is positive but the multiplicity-adjusted block-level fee-net lower bound is negative; no private-fill calibration exists for production authorization."
+}

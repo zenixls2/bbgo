@@ -395,6 +395,48 @@ func TestRestingOrdersCannotCrossDynamicInventoryBand(t *testing.T) {
 	}
 }
 
+func TestInventoryBandCancellationKeepsCorrectiveSide(t *testing.T) {
+	band := InventoryBand{MinInventory: 0.15, Target: 0.30, MaxInventory: 0.45}
+	orders := types.OrderSlice{
+		{SubmitOrder: types.SubmitOrder{Side: types.SideTypeBuy, Quantity: fixedpoint.NewFromFloat(0.02)}},
+		{SubmitOrder: types.SubmitOrder{Side: types.SideTypeSell, Quantity: fixedpoint.NewFromFloat(0.10)}},
+	}
+	buyViolation, sellViolation := makerOrderInventoryBandViolations(orders, 0.50, band)
+	if !buyViolation || sellViolation {
+		t.Fatalf("overweight inventory must flag only the inventory-increasing BUY: buy=%v sell=%v", buyViolation, sellViolation)
+	}
+	cancel := makerOrdersForInventoryBandViolations(orders, 0.50, band)
+	if len(cancel) != 1 || cancel[0].Side != types.SideTypeBuy {
+		t.Fatalf("overweight inventory must cancel only BUY: %+v", cancel)
+	}
+
+	buyViolation, sellViolation = makerOrderInventoryBandViolations(orders, 0.10, band)
+	if buyViolation || !sellViolation {
+		t.Fatalf("underweight inventory must flag only the inventory-increasing SELL: buy=%v sell=%v", buyViolation, sellViolation)
+	}
+	cancel = makerOrdersForInventoryBandViolations(orders, 0.10, band)
+	if len(cancel) != 1 || cancel[0].Side != types.SideTypeSell {
+		t.Fatalf("underweight inventory must cancel only SELL: %+v", cancel)
+	}
+}
+
+func TestRestingOrdersIgnoreSubStepDynamicBandNoise(t *testing.T) {
+	// This reproduces the live ETHJPY failure: the resting bid plus current
+	// inventory exceeds the recalculated cap by 4.47e-8 base, well below the
+	// venue's 1e-5 quantity step. Such numerical drift must not trigger a
+	// cancellation-only transition.
+	band := InventoryBand{MinInventory: 0, MaxInventory: 0.019805945308849715}
+	orders := types.OrderSlice{{
+		SubmitOrder: types.SubmitOrder{
+			Side:     types.SideTypeBuy,
+			Quantity: fixedpoint.MustNewFromString("0.0171"),
+		},
+	}}
+	if makerOrdersExceedInventoryBand(orders, 0.00270599, band) {
+		t.Fatalf("sub-step cap drift must not cancel a valid resting bid")
+	}
+}
+
 func TestInventoryOutsideBandWithoutOrdersAllowsCorrectiveQuote(t *testing.T) {
 	band := InventoryBand{MinInventory: 0.15, Target: 0.30, MaxInventory: 0.45}
 	if makerOrdersExceedInventoryBand(nil, 0.50, band) {
@@ -540,5 +582,27 @@ func TestDynamicInventoryBandAllowsTargetAtMacroCap(t *testing.T) {
 	}
 	if got := inventorySellHeadroomQuantity(band, band.Target); got <= 0 {
 		t.Fatalf("sell headroom must remain positive at the carrying cap, got %.8f", got)
+	}
+}
+
+func TestMakerMinimumExecutableQuantityHandlesFloatStepBoundary(t *testing.T) {
+	market := types.Market{
+		Symbol:      "ETHJPY",
+		MinNotional: fixedpoint.MustNewFromString("100"),
+		MinQuantity: fixedpoint.MustNewFromString("0.00001"),
+		StepSize:    fixedpoint.MustNewFromString("0.00001"),
+		TickSize:    fixedpoint.MustNewFromString("1"),
+	}
+
+	price := fixedpoint.MustNewFromString("391970")
+	quantity, ok := makerMinimumExecutableQuantity(market, price)
+	if !ok || quantity.Sign() <= 0 {
+		t.Fatalf("minimum quantity should survive the exchange validator: quantity=%s ok=%v", quantity, ok)
+	}
+	if quantity.Mul(price).Compare(market.MinNotional) < 0 {
+		t.Fatalf("minimum quantity must satisfy min-notional: quantity=%s notional=%s", quantity, quantity.Mul(price))
+	}
+	if quantity.String() != "0.00027" {
+		t.Fatalf("expected one-lot float-boundary safety margin, got %s", quantity)
 	}
 }

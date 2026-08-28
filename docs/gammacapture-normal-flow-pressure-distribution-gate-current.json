@@ -1,0 +1,16 @@
+{
+  "name": "normal-flow-pressure-current",
+  "causal": true,
+  "leakage_checks_passed": true,
+  "effective_samples": 111,
+  "minimum_effective_samples": 100,
+  "incremental_mean_bps": 2.3570675448200658,
+  "incremental_standard_error_bps": 3.6853127188699615,
+  "incremental_cost_bps": 0,
+  "risk_penalty_bps": 0,
+  "candidate_tests": 4,
+  "alpha": 0.05,
+  "positive_blocks": 2,
+  "total_blocks": 2,
+  "minimum_positive_blocks": 2
+}

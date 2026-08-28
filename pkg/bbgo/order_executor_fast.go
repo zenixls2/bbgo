@@ -32,8 +32,10 @@ func (e *FastOrderExecutor) SubmitOrders(ctx context.Context, submitOrders ...ty
 	if err != nil {
 		return nil, err
 	}
+	e.recordSubmitIntent(ctx, formattedOrders)
 
 	createdOrders, errIdx, err := BatchPlaceOrder(ctx, e.session.Exchange, nil, formattedOrders...)
+	e.recordSubmitResult(ctx, formattedOrders, createdOrders, errIdx, err)
 	if len(errIdx) > 0 {
 		return nil, err
 	}
@@ -59,7 +61,14 @@ func (e *FastOrderExecutor) Cancel(ctx context.Context, orders ...types.Order) e
 		return nil
 	}
 
-	if err := e.activeMakerOrders.FastCancel(ctx, e.session.Exchange, orders...); err != nil {
+	trackedOrders := orders
+	if len(trackedOrders) == 0 {
+		trackedOrders = e.activeMakerOrders.Orders()
+	}
+	e.recordCancelRequest(ctx, "fast_cancel", trackedOrders)
+	err := e.activeMakerOrders.FastCancel(ctx, e.session.Exchange, orders...)
+	e.recordCancelResult(ctx, "fast_cancel", trackedOrders, err)
+	if err != nil {
 		return errors.Wrap(err, "fast cancel order error")
 	}
 

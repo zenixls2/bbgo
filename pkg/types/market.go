@@ -61,6 +61,15 @@ type Market struct {
 	MinPrice fixedpoint.Value `json:"minPrice,omitempty"`
 	MaxPrice fixedpoint.Value `json:"maxPrice,omitempty"`
 
+	// PERCENT_PRICE_BY_SIDE is evaluated by Binance against its weighted
+	// average price. Keeping the multipliers on the normalized market lets
+	// marketable IOC helpers enforce the same exchange bound before submission.
+	PercentPriceBidMultiplierUp   fixedpoint.Value `json:"percentPriceBidMultiplierUp,omitempty"`
+	PercentPriceBidMultiplierDown fixedpoint.Value `json:"percentPriceBidMultiplierDown,omitempty"`
+	PercentPriceAskMultiplierUp   fixedpoint.Value `json:"percentPriceAskMultiplierUp,omitempty"`
+	PercentPriceAskMultiplierDown fixedpoint.Value `json:"percentPriceAskMultiplierDown,omitempty"`
+	PercentPriceAveragePriceMins  int              `json:"percentPriceAveragePriceMins,omitempty"`
+
 	ContractValue fixedpoint.Value `json:"contractValue,omitempty"`
 }
 

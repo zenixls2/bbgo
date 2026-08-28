@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 
@@ -17,9 +16,7 @@ import (
 )
 
 func TestBacktestService_FindMissingTimeRanges_EmptyData(t *testing.T) {
-	if b, _ := strconv.ParseBool(os.Getenv("CI")); b {
-		t.Skip("skip test for CI")
-	}
+	skipWithoutBinanceIntegration(t)
 
 	db, err := prepareDB(t)
 	if err != nil {
@@ -46,9 +43,7 @@ func TestBacktestService_FindMissingTimeRanges_EmptyData(t *testing.T) {
 }
 
 func TestBacktestService_QueryExistingDataRange(t *testing.T) {
-	if b, _ := strconv.ParseBool(os.Getenv("CI")); b {
-		t.Skip("skip test for CI")
-	}
+	skipWithoutBinanceIntegration(t)
 
 	db, err := prepareDB(t)
 	if err != nil {
@@ -77,9 +72,7 @@ func TestBacktestService_QueryExistingDataRange(t *testing.T) {
 }
 
 func TestBacktestService_SyncPartial(t *testing.T) {
-	if b, _ := strconv.ParseBool(os.Getenv("CI")); b {
-		t.Skip("skip test for CI")
-	}
+	skipWithoutBinanceIntegration(t)
 
 	db, err := prepareDB(t)
 	if err != nil {
@@ -127,9 +120,7 @@ func TestBacktestService_SyncPartial(t *testing.T) {
 }
 
 func TestBacktestService_FindMissingTimeRanges(t *testing.T) {
-	if b, _ := strconv.ParseBool(os.Getenv("CI")); b {
-		t.Skip("skip test for CI")
-	}
+	skipWithoutBinanceIntegration(t)
 
 	db, err := prepareDB(t)
 	if err != nil {
@@ -183,5 +174,12 @@ func TestBacktestService_FindMissingTimeRanges(t *testing.T) {
 		timeRanges, err = service.FindMissingTimeRanges(ctx, ex, symbol, types.Interval1h, startTime1, endTime2)
 		assert.NoError(t, err)
 		assert.Empty(t, timeRanges, "after partial sync, missing time ranges should be back-filled")
+	}
+}
+
+func skipWithoutBinanceIntegration(t *testing.T) {
+	t.Helper()
+	if os.Getenv("TEST_BINANCE") != "1" {
+		t.Skip("requires Binance public API; set TEST_BINANCE=1 to run")
 	}
 }

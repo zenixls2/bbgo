@@ -6,14 +6,14 @@ import (
 	"os"
 	"time"
 
-	maxapi "github.com/c9s/bbgo/pkg/exchange/max/maxapi"
+	maxapi "github.com/c9s/bbgo/pkg/exchange/max/maxapi/v3"
 	flag "github.com/spf13/pflag"
 )
 
-func waitWithdrawalsComplete(ctx context.Context, client *maxapi.RestClient, currency string, limit int) error {
+func waitWithdrawalsComplete(ctx context.Context, client *maxapi.Client, currency string, limit int) error {
 	var lastState maxapi.WithdrawState
 	for {
-		withdrawals, err := client.WithdrawalService.NewGetWithdrawalHistoryRequest().
+		withdrawals, err := client.NewGetWithdrawalHistoryRequest().
 			Currency(currency).
 			Limit(limit).
 			Do(ctx)
@@ -33,17 +33,17 @@ func waitWithdrawalsComplete(ctx context.Context, client *maxapi.RestClient, cur
 			lastState = withdrawal.State
 
 			switch withdrawal.State {
-			case "submitting", "submitted", "pending", "processing", "approved":
+			case maxapi.WithdrawStateProcessing:
 				pending = true
 
 				log.Printf("there is a pending withdrawal request, waiting...")
 				break
 
-			case "sent", "confirmed":
+			case maxapi.WithdrawStateDone:
 				continue
 
-			case "rejected":
-
+			case maxapi.WithdrawStateFailed, maxapi.WithdrawStateCanceled:
+				log.Printf("withdrawal reached terminal failure state: %s", withdrawal.State)
 			}
 
 		}
@@ -86,7 +86,7 @@ func main() {
 
 	ctx := context.Background()
 
-	maxRest := maxapi.NewRestClient(maxapi.ProductionAPIURL)
+	maxRest := maxapi.NewClient()
 	maxRest.Auth(key, secret)
 
 	if err := waitWithdrawalsComplete(ctx, maxRest, currency, 1); err != nil {
@@ -94,7 +94,7 @@ func main() {
 	}
 	log.Printf("all withdrawals are sent, sending new withdrawal request...")
 
-	addresses, err := maxRest.WithdrawalService.NewGetWithdrawalAddressesRequest().
+	addresses, err := maxRest.NewGetWithdrawalAddressesRequest().
 		Currency(currency).Do(ctx)
 	if err != nil {
 		log.Fatal(err)
@@ -104,7 +104,7 @@ func main() {
 		if address.Address == targetAddress {
 			log.Printf("found address: %+v", address)
 			if do {
-				response, err := maxRest.WithdrawalService.NewWithdrawalRequest().
+				response, err := maxRest.NewWithdrawalRequest().
 					Currency(currency).
 					Amount(amount).
 					AddressUUID(address.UUID).

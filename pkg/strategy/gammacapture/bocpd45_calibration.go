@@ -3,6 +3,7 @@ package gammacapture
 import (
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/c9s/bbgo/pkg/types"
@@ -75,8 +76,9 @@ type bocpd45Side struct {
 }
 
 type bocpd45CalibrationSample struct {
-	Probability float64 `json:"probability"`
-	Label       float64 `json:"label"`
+	At          time.Time `json:"at,omitempty"`
+	Probability float64   `json:"probability"`
+	Label       float64   `json:"label"`
 }
 
 type bocpd45PendingLabel struct {
@@ -87,15 +89,17 @@ type bocpd45PendingLabel struct {
 }
 
 type bocpd45Checkpoint struct {
-	LastBid    float64                    `json:"lastBid,omitempty"`
-	LastAsk    float64                    `json:"lastAsk,omitempty"`
-	Bid        bocpd45Side                `json:"bid"`
-	Ask        bocpd45Side                `json:"ask"`
-	Samples    []bocpd45CalibrationSample `json:"samples,omitempty"`
-	Updates    int                        `json:"updates"`
-	Pending    *bocpd45PendingLabel       `json:"pending,omitempty"`
-	NextAnchor time.Time                  `json:"nextAnchor,omitempty"`
-	Matured    int                        `json:"matured"`
+	LastBid              float64                    `json:"lastBid,omitempty"`
+	LastAsk              float64                    `json:"lastAsk,omitempty"`
+	Bid                  bocpd45Side                `json:"bid"`
+	Ask                  bocpd45Side                `json:"ask"`
+	Samples              []bocpd45CalibrationSample `json:"samples,omitempty"`
+	Updates              int                        `json:"updates"`
+	Pending              *bocpd45PendingLabel       `json:"pending,omitempty"`
+	NextAnchor           time.Time                  `json:"nextAnchor,omitempty"`
+	Matured              int                        `json:"matured"`
+	LastCalibrationAt    time.Time                  `json:"lastCalibrationAt,omitempty"`
+	LastCalibrationFitAt time.Time                  `json:"lastCalibrationFitAt,omitempty"`
 }
 
 // BOCPD45Snapshot separates the uncalibrated posterior from the probability
@@ -112,21 +116,25 @@ type BOCPD45Snapshot struct {
 	CalibrationSamples               int
 	MaturedLabels                    int
 	PendingMaturesAt                 time.Time
+	CalibrationAge                   time.Duration
+	CalibrationStale                 bool
 }
 
 // BOCPD45Model combines a short-run BOCPD sign posterior and a rolling Platt
 // map. It is independent of inventory targeting and order sizing.
 type BOCPD45Model struct {
-	config           BOCPD45Config
-	lastBid, lastAsk float64
-	bid, ask         bocpd45Side
-	samples          []bocpd45CalibrationSample
-	updates          int
-	calibrationReady bool
-	theta            [2]float64
-	pending          *bocpd45PendingLabel
-	nextAnchor       time.Time
-	matured          int
+	config               BOCPD45Config
+	lastBid, lastAsk     float64
+	bid, ask             bocpd45Side
+	samples              []bocpd45CalibrationSample
+	updates              int
+	calibrationReady     bool
+	theta                [2]float64
+	pending              *bocpd45PendingLabel
+	nextAnchor           time.Time
+	matured              int
+	lastCalibrationAt    time.Time
+	lastCalibrationFitAt time.Time
 }
 
 func NewBOCPD45Model(config BOCPD45Config) *BOCPD45Model {
@@ -168,7 +176,7 @@ func (m *BOCPD45Model) Observe(at time.Time, bid, ask float64, gap bool) {
 			if move > 0 {
 				label = 1
 			}
-			m.updateCalibration(pending.RawProbability, label)
+			m.updateCalibrationAt(at, pending.RawProbability, label)
 			m.matured++
 		}
 	}
@@ -279,6 +287,13 @@ func (m *BOCPD45Model) rawSnapshot() BOCPD45Snapshot {
 }
 
 func (m *BOCPD45Model) Snapshot() BOCPD45Snapshot {
+	return m.SnapshotAt(time.Time{})
+}
+
+// SnapshotAt returns a freshness-aware view without mutating the model. The
+// raw BOCPD path remains usable during a calibration pause, but a Platt map
+// older than two calibration windows is no longer reported as current.
+func (m *BOCPD45Model) SnapshotAt(now time.Time) BOCPD45Snapshot {
 	out := m.rawSnapshot()
 	if m == nil {
 		return out
@@ -289,29 +304,64 @@ func (m *BOCPD45Model) Snapshot() BOCPD45Snapshot {
 	if m.pending != nil {
 		out.PendingMaturesAt = m.pending.MaturesAt
 	}
-	if out.Ready && m.config.Calibration == "platt" && m.calibrationReady {
+	if !now.IsZero() && !m.lastCalibrationFitAt.IsZero() && now.After(m.lastCalibrationFitAt) {
+		out.CalibrationAge = now.Sub(m.lastCalibrationFitAt)
+		out.CalibrationStale = out.CalibrationAge > m.calibrationMaxAge()
+	}
+	if out.Ready && m.config.Calibration == "platt" && m.calibrationReady && !out.CalibrationStale {
 		out.UpProbability = m.predictCalibration(out.RawUpProbability)
 		out.Direction = math.Max(-1, math.Min(1, 2*out.UpProbability-1))
+	}
+	if out.CalibrationStale {
+		out.CalibrationReady = false
 	}
 	return out
 }
 
 func (m *BOCPD45Model) updateCalibration(probability, label float64) {
+	m.updateCalibrationAt(time.Time{}, probability, label)
+}
+
+func (m *BOCPD45Model) calibrationMaxAge() time.Duration {
+	window := time.Duration(m.config.CalibrationWindow)
+	if window <= 0 {
+		window = 6 * time.Hour
+	}
+	return 2 * window
+}
+
+func (m *BOCPD45Model) updateCalibrationAt(at time.Time, probability, label float64) {
 	if m.config.Calibration != "platt" || (label != 0 && label != 1) {
 		return
 	}
-	m.samples = append(m.samples, bocpd45CalibrationSample{Probability: clampBOCPD45Probability(probability), Label: label})
+	m.samples = append(m.samples, bocpd45CalibrationSample{
+		At: at, Probability: clampBOCPD45Probability(probability), Label: label,
+	})
+	if !at.IsZero() {
+		cutoff := at.Add(-time.Duration(m.config.CalibrationWindow))
+		first := sort.Search(len(m.samples), func(index int) bool {
+			return m.samples[index].At.IsZero() || !m.samples[index].At.Before(cutoff)
+		})
+		if first > 0 {
+			m.samples = append([]bocpd45CalibrationSample(nil), m.samples[first:]...)
+		}
+		m.lastCalibrationAt = at
+	}
+	// Timestamp trimming is authoritative for live data. This second cap is a
+	// hard memory bound for legacy/synthetic callers that omit timestamps.
 	maximum := int(time.Duration(m.config.CalibrationWindow) / time.Duration(m.config.Horizon))
 	if maximum < m.config.MinimumSamples {
 		maximum = m.config.MinimumSamples
 	}
 	if len(m.samples) > maximum {
-		copy(m.samples, m.samples[len(m.samples)-maximum:])
-		m.samples = m.samples[:maximum]
+		m.samples = append([]bocpd45CalibrationSample(nil), m.samples[len(m.samples)-maximum:]...)
 	}
 	m.updates++
 	if len(m.samples) >= m.config.MinimumSamples && (!m.calibrationReady || m.updates%m.config.RefitEvery == 0) {
 		m.refitCalibration()
+		if !at.IsZero() {
+			m.lastCalibrationFitAt = at
+		}
 	}
 }
 
@@ -383,6 +433,7 @@ func (m *BOCPD45Model) checkpoint() *bocpd45Checkpoint {
 		LastBid: m.lastBid, LastAsk: m.lastAsk, Bid: m.bid, Ask: m.ask,
 		Samples: append([]bocpd45CalibrationSample(nil), m.samples...), Updates: m.updates,
 		NextAnchor: m.nextAnchor, Matured: m.matured,
+		LastCalibrationAt: m.lastCalibrationAt, LastCalibrationFitAt: m.lastCalibrationFitAt,
 	}
 	if m.pending != nil {
 		pending := *m.pending
@@ -399,6 +450,17 @@ func (m *BOCPD45Model) restore(state *bocpd45Checkpoint) error {
 	m.bid, m.ask = state.Bid, state.Ask
 	m.samples = append([]bocpd45CalibrationSample(nil), state.Samples...)
 	m.updates, m.nextAnchor, m.matured = state.Updates, state.NextAnchor, state.Matured
+	m.lastCalibrationAt, m.lastCalibrationFitAt = state.LastCalibrationAt, state.LastCalibrationFitAt
+	if m.lastCalibrationAt.IsZero() || m.lastCalibrationFitAt.IsZero() {
+		for _, sample := range m.samples {
+			if sample.At.After(m.lastCalibrationAt) {
+				m.lastCalibrationAt = sample.At
+			}
+		}
+		if m.lastCalibrationFitAt.IsZero() {
+			m.lastCalibrationFitAt = m.lastCalibrationAt
+		}
+	}
 	if state.Pending != nil {
 		pending := *state.Pending
 		m.pending = &pending

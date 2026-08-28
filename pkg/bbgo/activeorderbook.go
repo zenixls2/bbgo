@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,18 @@ const DefaultOrderCancelTimeout = 15 * time.Second
 
 const activeOrderTerminalRetention = 10 * time.Minute
 const activeOrderTerminalCapacity = 2048
+
+// isAlreadyTerminalOrderError identifies the benign cancel/fill race returned
+// by Binance when a websocket fill has won the race with a REST cancellation.
+// It is intentionally narrow: other cancel failures still require a warning
+// and the existing retry/verification path.
+func isAlreadyTerminalOrderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "-2011") && strings.Contains(s, "unknown order")
+}
 
 // ActiveOrderBook manages the local active order books.
 //
@@ -221,7 +234,11 @@ func (b *ActiveOrderBook) GracefulCancel(ctx context.Context, ex types.Exchange,
 
 		// since ctx might be canceled, we should use background context here
 		if err := ex.CancelOrders(context.Background(), orders...); err != nil {
-			b.logger.WithError(err).Warnf("[ActiveOrderBook] can not cancel %d %s orders", len(orders), b.Symbol)
+			if isAlreadyTerminalOrderError(err) {
+				b.logger.WithError(err).Debugf("[ActiveOrderBook] order was already terminal while cancelling %d %s orders", len(orders), b.Symbol)
+			} else {
+				b.logger.WithError(err).Warnf("[ActiveOrderBook] can not cancel %d %s orders", len(orders), b.Symbol)
+			}
 		}
 
 		b.logger.Debugf("[ActiveOrderBook] waiting %s for %d %s orders to be cancelled...", waitTime, len(orders), b.Symbol)

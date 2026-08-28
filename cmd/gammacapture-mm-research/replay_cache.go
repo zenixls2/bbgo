@@ -5,9 +5,11 @@ import (
 	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/c9s/bbgo/pkg/types"
@@ -26,6 +28,7 @@ type replayDatasetCacheHeader struct {
 	From              time.Time               `json:"from"`
 	To                time.Time               `json:"to"`
 	ExactFrom         time.Time               `json:"exactFrom"`
+	BBOInterval       time.Duration           `json:"bboInterval"`
 	ConfigFingerprint string                  `json:"configFingerprint"`
 	Files             []replayFileFingerprint `json:"files"`
 }
@@ -122,7 +125,22 @@ func loadMacroReplayDataset(path, symbol string, from, to, exactFrom time.Time, 
 // never compacted. This is sufficient to seed the production Fast path models
 // without making a multi-hour warm-up dominate replay memory and CPU.
 func loadWarmReplayDataset(path, symbol string, from, to, exactFrom time.Time, configFingerprint, cacheDir string) ([]bboSnapshot, []tick, bool) {
-	return loadReplayDataset(path, symbol, from, to, exactFrom, configFingerprint, cacheDir, "warm-1s")
+	return loadWarmReplayDatasetAtInterval(path, symbol, from, to, exactFrom, configFingerprint, cacheDir, 0)
+}
+
+// loadWarmReplayDatasetAtInterval applies the requested replay BBO interval
+// while parsing the archive.  Keeping the compaction before model replay is
+// materially cheaper than loading every raw row and compacting the resulting
+// slice afterward, especially for multi-day production comparisons.
+func loadWarmReplayDatasetAtInterval(path, symbol string, from, to, exactFrom time.Time, configFingerprint, cacheDir string, bboInterval time.Duration) ([]bboSnapshot, []tick, bool) {
+	return loadReplayDatasetWithInterval(path, symbol, from, to, exactFrom, configFingerprint, cacheDir, "warm-1s", bboInterval)
+}
+
+// loadWarmReplayDatasetAtIntervals is an explicitly approximate research
+// variant. The ordinary loader retains one warmup BBO per second; this helper
+// also coarsens warmup only when the caller supplies a positive warmInterval.
+func loadWarmReplayDatasetAtIntervals(path, symbol string, from, to, exactFrom time.Time, configFingerprint, cacheDir string, bboInterval, warmInterval time.Duration) ([]bboSnapshot, []tick, bool) {
+	return loadReplayDatasetWithIntervalAndWarmInterval(path, symbol, from, to, exactFrom, configFingerprint, cacheDir, "warm-interval", bboInterval, warmInterval)
 }
 
 // loadExactReplayDataset is used by the ordinary event replay and preserves
@@ -133,12 +151,20 @@ func loadExactReplayDataset(path, symbol string, from, to time.Time, configFinge
 }
 
 func loadReplayDataset(path, symbol string, from, to, exactFrom time.Time, configFingerprint, cacheDir, mode string) ([]bboSnapshot, []tick, bool) {
+	return loadReplayDatasetWithInterval(path, symbol, from, to, exactFrom, configFingerprint, cacheDir, mode, 0)
+}
+
+func loadReplayDatasetWithInterval(path, symbol string, from, to, exactFrom time.Time, configFingerprint, cacheDir, mode string, bboInterval time.Duration) ([]bboSnapshot, []tick, bool) {
+	return loadReplayDatasetWithIntervalAndWarmInterval(path, symbol, from, to, exactFrom, configFingerprint, cacheDir, mode, bboInterval, 0)
+}
+
+func loadReplayDatasetWithIntervalAndWarmInterval(path, symbol string, from, to, exactFrom time.Time, configFingerprint, cacheDir, mode string, bboInterval, warmInterval time.Duration) ([]bboSnapshot, []tick, bool) {
 	bboFiles := replayCaptureFilesOverlapping(replayCaptureFiles(path, symbol, "bookticker"), symbol, "bookticker", from, to)
 	tradeFiles := replayCaptureFilesOverlapping(replayCaptureFiles(path, symbol, "trades"), symbol, "trades", from, to)
 	files := append(append([]string(nil), bboFiles...), tradeFiles...)
 	header := replayDatasetCacheHeader{
 		Version: replayDatasetCacheVersion, Mode: mode, Symbol: symbol,
-		From: from, To: to, ExactFrom: exactFrom, ConfigFingerprint: configFingerprint,
+		From: from, To: to, ExactFrom: exactFrom, BBOInterval: bboInterval, ConfigFingerprint: configFingerprint,
 		Files: replayFileFingerprints(files),
 	}
 	cachePath := replayDatasetCachePath(cacheDir, symbol, header.Mode, header)
@@ -147,9 +173,11 @@ func loadReplayDataset(path, symbol string, from, to, exactFrom time.Time, confi
 			return cachedBooks(cached.Books), cachedTrades(cached.Trades), true
 		}
 	}
-	books := readBBOFiles(bboFiles, from, to)
-	if mode == "macro-1s" || mode == "warm-1s" {
-		books = compactMacroReplayBBO(books, exactFrom)
+	var books []bboSnapshot
+	if mode == "macro-1s" || mode == "warm-1s" || bboInterval > 0 {
+		books = readBBOFilesCompactedWithWarmInterval(bboFiles, from, to, exactFrom, bboInterval, warmInterval)
+	} else {
+		books = readBBOFiles(bboFiles, from, to)
 	}
 	trades := readLiveTradesFiles(tradeFiles, from, to)
 	if cachePath != "" {
@@ -158,6 +186,88 @@ func loadReplayDataset(path, symbol string, from, to, exactFrom time.Time, confi
 		})
 	}
 	return books, trades, false
+}
+
+// readBBOFilesCompacted performs the warm-up and optional fixed-interval
+// reduction in one pass.  Before exactFrom, warm-1s semantics retain the last
+// BBO in each second.  At and after exactFrom, a positive interval retains the
+// last BBO in each requested bucket; zero keeps the exact event stream.  This
+// is equivalent to the previous post-load compaction but avoids a raw-event
+// allocation and sort for the discarded rows.
+func readBBOFilesCompacted(files []string, from, to, exactFrom time.Time, interval time.Duration) []bboSnapshot {
+	return readBBOFilesCompactedWithWarmInterval(files, from, to, exactFrom, interval, 0)
+}
+
+func readBBOFilesCompactedWithWarmInterval(files []string, from, to, exactFrom time.Time, interval, warmInterval time.Duration) []bboSnapshot {
+	out := make([]bboSnapshot, 0, 4096)
+	var pending bboSnapshot
+	var pendingBucket time.Time
+	var pendingWarm bool
+	pendingValid := false
+	flush := func() {
+		if pendingValid {
+			out = append(out, pending)
+			pendingValid = false
+		}
+	}
+	for _, filename := range files {
+		file, err := os.Open(filename)
+		if err != nil {
+			continue
+		}
+		reader := newReplayIndexedCaptureReader(file, filename, from)
+		for {
+			row, readErr := reader.Read()
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil || len(row) < 5 {
+				continue
+			}
+			when, parseErr := time.Parse(time.RFC3339Nano, row[0])
+			if parseErr != nil || when.Before(from) || !when.Before(to) {
+				continue
+			}
+			bid, e1 := strconv.ParseFloat(row[1], 64)
+			bidSize, e2 := strconv.ParseFloat(row[2], 64)
+			ask, e3 := strconv.ParseFloat(row[3], 64)
+			askSize, e4 := strconv.ParseFloat(row[4], 64)
+			if e1 != nil || e2 != nil || e3 != nil || e4 != nil || bid <= 0 || ask <= bid {
+				continue
+			}
+			value := bboSnapshot{time: when, bid: bid, bidSize: bidSize, ask: ask, askSize: askSize}
+			warm := !exactFrom.IsZero() && when.Before(exactFrom)
+			bucketWidth := interval
+			if warm {
+				// The default production-compatible preload keeps one BBO per
+				// second. A focused research replay may explicitly coarsen warmup;
+				// never infer that approximation from the score interval.
+				bucketWidth = time.Second
+				if warmInterval > 0 {
+					bucketWidth = warmInterval
+				}
+			}
+			if bucketWidth <= 0 {
+				flush()
+				out = append(out, value)
+				continue
+			}
+			bucket := when.Truncate(bucketWidth)
+			if !pendingValid || pendingWarm != warm || !pendingBucket.Equal(bucket) {
+				flush()
+				pending = value
+				pendingBucket = bucket
+				pendingWarm = warm
+				pendingValid = true
+				continue
+			}
+			pending = value
+		}
+		_ = file.Close()
+	}
+	flush()
+	sort.SliceStable(out, func(i, j int) bool { return out[i].time.Before(out[j].time) })
+	return out
 }
 
 func readReplayDatasetCache(path string, expected replayDatasetCacheHeader) (replayDatasetCache, bool) {

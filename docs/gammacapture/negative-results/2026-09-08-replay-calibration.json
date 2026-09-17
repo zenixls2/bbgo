@@ -1,0 +1,68 @@
+{
+  "recordType": "FailureRecord",
+  "recordId": "gammacapture-ethjpy-replay-calibration-20260908",
+  "date": "2026-09-08",
+  "symbol": "ETHJPY",
+  "scope": {
+    "scoreFrom": "2026-09-07T17:22:05Z",
+    "scoreTo": "2026-09-07T23:44:00Z",
+    "warmupFrom": "2026-09-02T15:00:00Z",
+    "calibrationFrom": "2026-09-03T15:00:00Z",
+    "calibrationTo": "2026-09-04T15:00:00Z"
+  },
+  "hypothesis": "The optimized route-separated production replay can provide sufficient execution evidence to support live route promotion and queue/fill tuning.",
+  "expectedResult": "Complete valid replay, calibrated queue/fill model, stable candidate evidence, and live/replay execution parity sufficient for promotion.",
+  "actualResult": {
+    "process": "proc_9c2fd4dadc85",
+    "exitCode": 0,
+    "jsonValid": true,
+    "replayCacheHit": true,
+    "calibrationPassed": false,
+    "calibrationAbsoluteSideError": 12,
+    "actualMakerSamples": 18,
+    "actualMakerBuySamples": 5,
+    "actualMakerSellSamples": 13,
+    "requiredTotalSamples": 42,
+    "requiredPerSideSamples": 21,
+    "queueMultiplier": 0,
+    "queueSource": "explicit-queue-assumption",
+    "executionIntegrity": "ok",
+    "liveReplayParity": "not established"
+  },
+  "impact": [
+    "Synthetic replay fills cannot be used to tune or promote live execution policy.",
+    "The zero queue multiplier is an assumption, not a calibrated queue estimate.",
+    "Route source changes remain un-deployed and live tuning remains blocked.",
+    "The broad repository gate remains blocked by unrelated pkg/strategy/xfundingv2/TestTWAPOrderExecutor_CancelOrder."
+  ],
+  "rootCause": [
+    "Insufficient independent private maker lifecycle observations, especially BUY-side observations.",
+    "Replay execution model does not yet reproduce live callback ordering, queue position, latency, reservation timing, and private fill population closely enough to establish parity.",
+    "A broad unrelated repository test failure prevents a full-repository green release claim."
+  ],
+  "competingExplanations": [
+    "The route policy may be economically weak in the observed window, but this cannot be separated from execution-model mismatch with the current calibration failure.",
+    "Live and replay may differ because of exchange/private-event timing and order lifecycle state rather than target-selection logic."
+  ],
+  "missedGate": [
+    "Private-fill calibration gate",
+    "Live/replay execution parity gate",
+    "Full repository test gate"
+  ],
+  "requiredPrevention": [
+    "Collect at least 24 additional independent maker lifecycle observations, including at least 16 BUY and 8 SELL, under the declared protocol.",
+    "Calibrate non-zero queue candidates using private fills; do not infer queue from public BBO touches.",
+    "Add persisted-episode and exchange-callback integration replay coverage with latency, partial-fill, reservation, and replan timing.",
+    "Keep route decision coverage, replay integrity, calibration, parity, and broad test status as separate gates.",
+    "Keep live deployment fail-closed until all required gates pass."
+  ],
+  "artifacts": {
+    "replayJson": "/home/zenixls2/workspace/gammacapture-replay-verification-route-production-optimized-v3-20260908.json",
+    "replayJsonSha256": "a432323244ffb7613fbc9c5ed93b259eccc412e960350bf152dd90fa23ff08a8",
+    "replayStderr": "/home/zenixls2/workspace/gammacapture-replay-verification-route-production-optimized-v3-20260908.stderr.log",
+    "decisionReport": "/home/zenixls2/workspace/gammacapture-replay-optimization-deployment-decision-20260908.md",
+    "cacheBenchmark": "/home/zenixls2/workspace/gammacapture-route-cache-benchmark-20260908.log"
+  },
+  "decision": "NO-GO",
+  "deploymentStatus": "not deployed; no live restart; no live orders modified"
+}

@@ -1,0 +1,221 @@
+{
+  "recordType": "FailureRecord",
+  "recordId": "gammacapture-ethjpy-causal-target-route-fill-collapse-20260908",
+  "date": "2026-09-08",
+  "symbol": "ETHJPY",
+  "hypothesis": "A causal pivot CE target with maker-first BUY and risk-reducing-IOC SELL can improve quote uptime and inventory drawdown without collapsing executable BUY fills or round trips.",
+  "expectedResult": "Across non-overlapping score windows, candidate execution remains sufficiently diverse and executable, quote uptime improves without excessive refresh churn, max drawdown does not worsen, and route decisions match the declared maker/IOC contract.",
+  "researchContext": {
+    "repository": "/home/zenixls2/src/bbgo",
+    "commit": "b1606c4149c3dae6e924fbf732f2a07217e9035a",
+    "binary": "/home/zenixls2/workspace/gammacapture-causal-boundary-risk-fix-20260908",
+    "binarySha256": "8e27059cc23206469a8bb0608da941798a989e99eb1f98a37a0738c2d2a38efa",
+    "candidateConfig": "/home/zenixls2/workspace/gammacapture-candidate-ethjpy-20260908.yaml",
+    "candidateConfigSha256": "c1cb7fdb00a252c444f754d3f90a613f691978929b0258d34b8953c4365c2340",
+    "researchOnlyControlConfig": "/home/zenixls2/workspace/gammacapture-candidate-ethjpy-20260908-buy-ioc-control.yaml",
+    "researchOnlyControlConfigSha256": "94b2fb9762b940d59a747eb36aaec51efeb244216b47863116153f094275c612",
+    "queueMultiplier": 0,
+    "queueSource": "explicit-queue-assumption",
+    "calibration": {
+      "actualPrivateMakerBuySamples": 5,
+      "actualPrivateMakerSellSamples": 13,
+      "requiredPerSide": 21,
+      "requiredTotal": 42,
+      "calibrationPassed": false
+    }
+  },
+  "windows": [
+    {
+      "name": "current-score-window",
+      "scoreFrom": "2026-09-07T17:22:05Z",
+      "scoreTo": "2026-09-07T23:44:00Z",
+      "warmupFrom": "2026-09-02T15:00:00Z",
+      "calibrationFrom": "2026-09-03T15:00:00Z",
+      "calibrationTo": "2026-09-04T15:00:00Z",
+      "data": {
+        "bboEvents": 232272,
+        "tradeEvents": 130496,
+        "dataGaps": 0,
+        "chronologicalOrderPassed": true,
+        "inputAndScoreCountersMatch": true
+      },
+      "baseline": {
+        "fills": 10,
+        "buyFills": 3,
+        "sellFills": 7,
+        "roundTrips": 3,
+        "quoteRefreshes": 29,
+        "quoteUptimePct": 84.72164085391377,
+        "averageQuoteLifeSeconds": 514.6089957976666,
+        "netPnLJPY": -9.267681582876321,
+        "maximumDrawdownPct": 0.6118047400778716
+      },
+      "makerFirstCandidate": {
+        "routeConfig": {
+          "buyRoute": "maker-first",
+          "sellRoute": "risk-reducing-ioc"
+        },
+        "fills": 5,
+        "buyFills": 0,
+        "sellFills": 5,
+        "roundTrips": 0,
+        "quoteRefreshes": 56,
+        "quoteUptimePct": 99.87442444537463,
+        "averageQuoteLifeSeconds": 303.9564249375,
+        "netPnLJPY": 0.4182675012762047,
+        "maximumDrawdownPct": 0.4283766364595067,
+        "fastTargetRouteDecisions": {
+          "makerFirstBuy": 16,
+          "riskReducingIocSell": 1,
+          "triggeredFastTargetIoc": 1
+        },
+        "executionIntegrityStatus": "ok"
+      },
+      "buyIocControl": {
+        "routeConfig": {
+          "buyRoute": "ioc",
+          "sellRoute": "risk-reducing-ioc"
+        },
+        "fills": 7,
+        "buyFills": 3,
+        "sellFills": 4,
+        "roundTrips": 3,
+        "quoteRefreshes": 52,
+        "quoteUptimePct": 87.56802009208874,
+        "averageQuoteLifeSeconds": 522.178456303625,
+        "netPnLJPY": 1.9627227658093034,
+        "maximumDrawdownPct": 0.4251529245591457,
+        "executionIntegrityStatus": "ok",
+        "promotionEligible": false
+      },
+      "artifacts": {
+        "makerFirstReplay": "/home/zenixls2/workspace/gammacapture-causal-route-separated-final-20260908.json",
+        "makerFirstReplaySha256": "1c4f26e136fede11302c71d81d8469734db2e97a75b94348084486742fa51e69",
+        "buyIocControlReplay": "/home/zenixls2/workspace/gammacapture-causal-buy-ioc-control-20260908.json",
+        "buyIocControlReplaySha256": "932914e83fec8007f009269db424905116dc2de6ee8e66e398745f12f9a916bf"
+      }
+    },
+    {
+      "name": "non-overlapping-prior-window",
+      "scoreFrom": "2026-09-05T17:22:05Z",
+      "scoreTo": "2026-09-05T23:44:00Z",
+      "warmupFrom": "2026-09-02T15:00:00Z",
+      "calibrationFrom": "2026-09-03T15:00:00Z",
+      "calibrationTo": "2026-09-04T15:00:00Z",
+      "data": {
+        "bboEvents": 149702,
+        "tradeEvents": 89260,
+        "dataGaps": 0,
+        "chronologicalOrderPassed": true,
+        "inputAndScoreCountersMatch": true
+      },
+      "baseline": {
+        "fills": 6,
+        "buyFills": 1,
+        "sellFills": 5,
+        "roundTrips": 1,
+        "quoteRefreshes": 21,
+        "quoteUptimePct": 55.32152011590327,
+        "averageQuoteLifeSeconds": 784.706188759,
+        "netPnLJPY": 0.46406812674013054,
+        "maximumDrawdownPct": 0.4417641134360128
+      },
+      "makerFirstCandidate": {
+        "routeConfig": {
+          "buyRoute": "maker-first",
+          "sellRoute": "risk-reducing-ioc"
+        },
+        "fills": 1,
+        "buyFills": 0,
+        "sellFills": 1,
+        "roundTrips": 0,
+        "quoteRefreshes": 1,
+        "quoteUptimePct": 2.97559344700769,
+        "averageQuoteLifeSeconds": 676.9402360736667,
+        "netPnLJPY": -9.667727395559268,
+        "maximumDrawdownPct": 0.3424009777217877,
+        "fastTargetRouteDecisions": {
+          "makerFirstBuy": 3,
+          "riskReducingIocSell": 1,
+          "triggeredFastTargetIoc": 1
+        },
+        "executionIntegrityStatus": "candidate-fill-collapse"
+      },
+      "buyIocControl": {
+        "routeConfig": {
+          "buyRoute": "ioc",
+          "sellRoute": "risk-reducing-ioc"
+        },
+        "fills": 1,
+        "buyFills": 0,
+        "sellFills": 1,
+        "roundTrips": 0,
+        "quoteRefreshes": 1,
+        "quoteUptimePct": 2.97559344700769,
+        "averageQuoteLifeSeconds": 676.9402360736667,
+        "netPnLJPY": -9.667727395559268,
+        "maximumDrawdownPct": 0.3424009777217877,
+        "fastTargetRouteDecisions": {
+          "iocBuy": 3,
+          "riskReducingIocSell": 1,
+          "triggeredFastTargetIoc": 1
+        },
+        "executionIntegrityStatus": "candidate-fill-collapse",
+        "promotionEligible": false
+      },
+      "artifacts": {
+        "makerFirstReplay": "/home/zenixls2/workspace/gammacapture-causal-route-prev-maker-20260908.json",
+        "makerFirstReplaySha256": "e1bb21c0bbf1164727e42851bef6db4c50b2895beff8f8c46acfe58110af1883",
+        "buyIocControlReplay": "/home/zenixls2/workspace/gammacapture-causal-route-prev-ioc-20260908.json",
+        "buyIocControlReplaySha256": "b09ba258929b4f09816ad42130cc95c3d2b8d47e1b8cc541724fd5f7647843ae"
+      }
+    }
+  ],
+  "actualResult": "The declared maker-first/risk-reducing-IOC candidate does not maintain executable BUY participation across the two checked windows. In the current window it increases uptime but produces zero BUY fills and zero round trips; in the prior non-overlapping window it collapses to one SELL fill and 2.976% uptime. Changing only BUY route to IOC recovers BUY/round-trip diversity in the current window but does not recover it in the prior window.",
+  "rootCause": [
+    "The causal target can move to a hard low-inventory target while terminal-wealth rejection leaves a non-bilateral base plan; the continuity floor is intentionally not applied in that state, so the candidate can stop quoting despite an exposure-increasing target gap.",
+    "The maker-first BUY route explicitly suppresses every Fast BUY IOC request, even when the passive maker path produces no executable BUY fill in the replay window.",
+    "Several candidate BUY target gaps are below exchange minimum quantity, so changing route alone cannot make those requests executable without an independent, pre-declared target/quantity rule.",
+    "Private maker calibration is insufficient and queueMultiplier=0 remains an assumption; live/replay execution parity is not established."
+  ],
+  "competingExplanations": [
+    "The replay maker-fill and callback model may underrepresent live passive BUY fills; this remains unresolved until private maker calibration and parity are completed.",
+    "The observed target boundary may be regime-specific, but the same failure pattern appears in both checked windows and must not be dismissed as a single-window artifact.",
+    "The current causal target prior/actuation parameters may be too extreme, but changing them is a separate pre-registered experiment and is not justified by these results alone."
+  ],
+  "missedGates": [
+    "Candidate execution-integrity / fill-diversity gate",
+    "Quote uptime versus refresh-churn and quote-life gate",
+    "Private maker calibration gate",
+    "Live/replay execution parity gate",
+    "Untouched multi-window validation gate",
+    "Full repository test gate"
+  ],
+  "requiredPrevention": [
+    "Do not promote either maker-first or buy-IOC control based on these replay results.",
+    "Require a pre-declared multi-window criterion for BUY participation, round trips, fill ratio, uptime, churn, and drawdown before route selection.",
+    "Keep minimum quantity/notional, stale-BBO, adverse-selection, inventory hard-limit, terminal-wealth, and SELL risk-reducing safety gates unchanged.",
+    "Add an explicit observable distinction between target-restoring exposure-increasing BUY rejection, risk-reducing SELL actuation, and maker-first route suppression.",
+    "Collect the missing independent private maker samples, including BUY-side samples, and calibrate a non-zero queue model before economic tuning.",
+    "Add persisted-episode route integration replay for callback ordering, latency, partial fills, reservation timing, stale-BBO replan, and maker-first quote planning."
+  ],
+  "nextExperiment": {
+    "status": "research-only",
+    "candidateRevision": "buyRoute=ioc control is a diagnostic arm, not a deployment recommendation",
+    "requiredBeforeAnyPatchPromotion": [
+      "Pre-register target-boundary handling experiment without weakening terminal-wealth admission.",
+      "Run at least one additional non-overlapping window with the same frozen parameters.",
+      "Re-run focused and race tests after any source change.",
+      "Re-run calibrated/private-fill and live/replay parity gates."
+    ]
+  },
+  "deploymentStatus": "NO-GO; baseline remains live; no candidate deployment, no capture restart, and no live orders modified",
+  "liveBoundaryAtVerification": {
+    "service": "gammacapture-strategy.service",
+    "activeState": "active",
+    "subState": "running",
+    "mainPID": 2282522,
+    "nRestarts": 0,
+    "baselineBinarySha256": "bfd6dfb95916a5e87eadece8a1260841b9bf2c14434c73b452499e709899f06e"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "recordType": "FailureRecord",
+  "recordVersion": 1,
+  "recordedAt": "2026-09-08",
+  "id": "gammacapture-sell-only-hybrid-fill-collapse-20260908",
+  "status": "confirmed_research_failure",
+  "hypothesis": "Using candidate only for SELL/risk-reducing execution while retaining baseline BUY/other policy will improve drawdown without reducing useful trading.",
+  "expected": "SELL completion and inventory reduction improve while round trips, quote uptime, PnL and fill activity remain non-inferior to baseline.",
+  "actual": {
+    "window": "2026-09-05T17:22:05Z/2026-09-05T23:44:00Z",
+    "baseline": {"fills": 6, "sellFills": 5, "buyFills": 1, "roundTrips": 1, "quoteUptimePct": 55.32152011590327, "netPnLJPY": 0.46406812674013054, "maximumDrawdownPct": 0.4417641134360128},
+    "hybrid": {"fills": 1, "sellFills": 1, "buyFills": 0, "roundTrips": 0, "quoteUptimePct": 35.506519558676025, "netPnLJPY": -9.667727395559268, "maximumDrawdownPct": 0.3424009777217877, "fastRiskReducingIOCfills": 1, "fastRiskReducingIOCquantity": 0.01592604},
+    "failureMode": "candidate-fill-collapse / liquidation-induced trade collapse"
+  },
+  "rootCause": "The SELL-only target activated a full-inventory risk-reducing IOC. Once inventory reached zero, the baseline BUY side had no executable inventory-replenishment opportunity under the existing gates in this window. The resulting lower drawdown was obtained by liquidation and loss of round trips, not by a stable two-sided policy.",
+  "competingExplanations": [
+    "The explicit queueMultiplier=0 replay assumption may overstate maker fills and does not model L2 queue priority.",
+    "The calibration sample is insufficient and asymmetric (5 BUY / 13 SELL versus 21 per side required).",
+    "Real exchange latency, partial fills, callback ordering and stale-BBO replan parity are not established."
+  ],
+  "missedGates": [
+    "Across-window stability",
+    "No fill-collapse / no near-zero-trading promotion gate",
+    "Calibration passed",
+    "Live/replay execution parity passed"
+  ],
+  "prevention": [
+    "Keep candidate/hybrid research-only and keep all hard risk gates unchanged.",
+    "Reject a result when lower drawdown coincides with zero BUY, zero round trips, or materially lower fill activity.",
+    "Require multiple non-overlapping windows, non-zero calibrated queue model, partial-fill/latency simulation and private-fill calibration before promotion.",
+    "Retain the sell-only fallback counter and fast-target SELL source in replay artifacts."
+  ],
+  "artifacts": {
+    "evidence": "/home/zenixls2/workspace/gammacapture-sell-only-hybrid-evidence-20260908.json",
+    "replay": "/home/zenixls2/workspace/gammacapture-sell-only-hybrid-prev-20260908.json",
+    "replaySHA256": "e0cdc472ca4bd283bc4238883715c41cbc67e52b7fea53b42081b495fe63d1bc",
+    "config": "/home/zenixls2/workspace/gammacapture-sell-only-hybrid-baseline-overlay-20260908.yaml",
+    "binarySHA256": "433545a9a26ae129120f4feef8b1a76efc3d7cc880822b79020e7274950fc1b5"
+  },
+  "decision": "NO-GO",
+  "applicability": {"symbol": "ETHJPY", "regime": "short replay window; exact market regime not generalized", "version": "b1606c4149c3dae6e924fbf732f2a07217e9035a"}
+}

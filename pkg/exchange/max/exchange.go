@@ -495,7 +495,16 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (err
 			req := e.v3client.NewCancelWalletOrderAllRequest(walletType)
 			req.GroupID(groupID)
 
-			if _, err := req.Do(ctx); err != nil {
+			if err := retryOnNonceError(ctx, func() error {
+				_, err := req.Do(ctx)
+				if isMaxNonceError(err) {
+					log.WithError(err).Warnf(
+						"cancel group id %d orders encountered nonce error",
+						groupID,
+					)
+				}
+				return err
+			}); err != nil {
 				log.WithError(err).Errorf("group id %d order cancel error", groupID)
 				err2 = err
 			}
@@ -515,7 +524,16 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (err
 			return fmt.Errorf("order id or client order id is not defined, order=%+v", o)
 		}
 
-		if _, err := req.Do(ctx); err != nil {
+		if err := retryOnNonceError(ctx, func() error {
+			_, err := req.Do(ctx)
+			if isMaxNonceError(err) {
+				log.WithError(err).WithFields(logFields).Warnf(
+					"cancel order encountered nonce error, order=%v",
+					o.AsQuery(),
+				)
+			}
+			return err
+		}); err != nil {
 			log.WithError(err).WithFields(logFields).Errorf("order cancel error")
 			err2 = err
 		}

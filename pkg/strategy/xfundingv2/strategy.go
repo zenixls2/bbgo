@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -15,10 +14,12 @@ import (
 	"github.com/c9s/bbgo/pkg/exchange/binance"
 	"github.com/c9s/bbgo/pkg/exchange/binance/binanceapi"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
+	"github.com/c9s/bbgo/pkg/interact"
 	"github.com/c9s/bbgo/pkg/profile/timeprofile"
 	"github.com/c9s/bbgo/pkg/risk/circuitbreaker"
 	"github.com/c9s/bbgo/pkg/slack/slackalert"
 	"github.com/c9s/bbgo/pkg/types"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
@@ -34,6 +35,7 @@ type CriticalErrorConfig struct {
 	MaxRemainingNotional fixedpoint.Value `json:"maxRemainingNotional"`
 	MaxFundingRateFlip   fixedpoint.Value `json:"maxFundingRateFlip"`
 	MaxMoqDeviation      fixedpoint.Value `json:"maxMoqDeviation"`
+	MaxQuoteDeviation    fixedpoint.Value `json:"maxQuoteDeviation"`
 }
 
 func (c *CriticalErrorConfig) Defaults() {
@@ -47,6 +49,10 @@ func (c *CriticalErrorConfig) Defaults() {
 		// max tolerance of 5x of the minium order quantity of the market.
 		c.MaxMoqDeviation = fixedpoint.NewFromInt(5)
 	}
+	if c.MaxQuoteDeviation.IsZero() {
+		// max tolerance of position deviation in quote currency
+		c.MaxQuoteDeviation = fixedpoint.NewFromFloat(500.0)
+	}
 }
 
 type Strategy struct {
@@ -56,36 +62,64 @@ type Strategy struct {
 	// lock before update the strategy state, such as current round, selected market, etc
 	mu sync.Mutex
 
-	DryRun              bool `json:"dryRun"`
-	ClosingAllOnStartup bool `json:"closingAllOnStartup"`
+	DryRun                 bool     `json:"dryRun"`
+	ClosingAllOnStartup    bool     `json:"closingAllOnStartup"`
+	RemoveOnStartupSymbols []string `json:"removeOnStartupSymbols"`
+
+	// AppliedStartupRemovals records the symbols whose active rounds have already been
+	// removed on a previous startup for the current RemoveOnStartupSymbols config.
+	AppliedStartupRemovals map[string]struct{} `persistence:"appliedStartupRemovals"`
+
+	InstanceTag string `json:"instanceTag"`
 
 	// Session configuration
 	SpotSession    string `json:"spotSession"`
 	FuturesSession string `json:"futuresSession"`
 
+	FuturesAccountUpdatePeriod types.Duration `json:"futuresAccountUpdatePeriod"`
+	futuresAccountUpdater      *FuturesAccountUpdater
+
 	// CandidateSymbols is the list of symbols to consider for selection
 	// IMPORTANT: xfundingv2 is now assuming trading on U-major pairs
-	CandidateSymbols       []string         `json:"candidateSymbols"`
-	OpenPositionInterval   types.Duration   `json:"openPositionInterval"`
-	TransitRoundInterval   types.Duration   `json:"transitRoundInterval"`
-	RoundRebalanceInterval types.Duration   `json:"roundRebalanceInterval"`
-	MaxClosingLossRatio    fixedpoint.Value `json:"maxClosingLossRatio"`
+	CandidateSymbols       []string       `json:"candidateSymbols"`
+	OpenPositionInterval   types.Duration `json:"openPositionInterval"`
+	TransitRoundInterval   types.Duration `json:"transitRoundInterval"`
+	RoundRebalanceInterval types.Duration `json:"roundRebalanceInterval"`
+
+	// round closing conditions
+	// TODO: move all the closing conditions into a separate struct
+	MaxClosingLossRatio              fixedpoint.Value `json:"maxClosingLossRatio"`
+	MinExitRate                      fixedpoint.Value `json:"minExitRate"`
+	HardMinExitRate                  fixedpoint.Value `json:"hardMinExitRate"`
+	ExitPnLRatio                     fixedpoint.Value `json:"exitPnLRatio"`
+	ConsecutiveNegFundingIncomeLimit int              `json:"consecutiveNegFundingIncomeLimit"`
 
 	// TickSymbol is the symbol used for ticking the strategy, default to the first candidate symbol
 	TickSymbol   string         `json:"tickSymbol"`
 	TickInterval types.Interval `json:"tickInterval"`
 
-	FeeSymbol       string                      `json:"feeSymbol"`
-	FeeDiscountRate map[string]fixedpoint.Value `json:"feeDiscountRate"`
-	QuoteCurrency   string                      `json:"quoteCurrency"`
+	FeeSymbol             string                      `json:"feeSymbol"`
+	MinNotionalMultiplier fixedpoint.Value            `json:"minNotionalMultiplier"`
+	FeeDiscountRate       map[string]fixedpoint.Value `json:"feeDiscountRate"`
+	QuoteCurrency         string                      `json:"quoteCurrency"`
 
 	PendingRoundGracePeriod types.Duration   `json:"pendingRoundGracePeriod"`
 	MaxPendingRoundRetry    int              `json:"maxPendingRoundRetry"`
 	TWAPWorkerConfig        TWAPWorkerConfig `json:"twap"`
 
+	// followerTWAPWorkerConfig is derived from TWAPWorkerConfig (the leader config)
+	// with taker orders, so the follower TWAP worker can hedge the leader's fills
+	// reliably by crossing the spread. Set in Defaults.
+	UseFollowerTWAPWorkerConfig bool `json:"useFollowerTWAPWorkerConfig"`
+	followerTWAPWorkerConfig    TWAPWorkerConfig
+
 	// Market selection criteria
 	MarketSelectionConfig *MarketSelectionConfig      `json:"marketSelection,omitempty"`
 	MaxPositionExposure   map[string]fixedpoint.Value `json:"maxPositionExposure"`
+	// TradeBalanceRatio is the ratio of the asset balance to be invested on the spot market.
+	TradeBalanceRatio fixedpoint.Value `json:"tradeBalanceRatio"`
+	// LastTradeBalanceRatio is the ratio of the asset balance to be invested on the spot market for the last candidate symbol.
+	LastTradeBalanceRatio fixedpoint.Value `json:"lastTradeBalanceRatio"`
 
 	HaltRoundNotificationInterval types.Duration `json:"haltRoundNotificationInterval"`
 	haltNotificationLimiters      map[string]*rate.Limiter
@@ -146,13 +180,23 @@ type Strategy struct {
 	logger     logrus.FieldLogger
 	logLimiter *rate.Limiter
 
+	// slackEvtID is the interactive-message dispatch key for this strategy
+	// instance. It's for the interactive close round feature.
+	slackEvtID string
+
 	lastTickTime time.Time
+
+	RebalanceInterval types.Duration `json:"rebalanceInterval"`
+	lastRebalanceTime time.Time
 
 	// roundInsertService persists closed round records into the database.
 	// nil when no database is configured (e.g. backtesting).
 	roundInsertService *RoundInsertService
 
 	fundingIncomeC chan time.Time
+
+	TradesBufferSize          int `json:"tradesBufferSize"`
+	spotTradeC, futuresTradeC chan types.Trade
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -163,11 +207,14 @@ func (s *Strategy) ID() string {
 }
 
 func (s *Strategy) InstanceID() string {
-	symbols := strings.Join(s.CandidateSymbols, "_")
-	return fmt.Sprintf("%s-%s-%s-futures", ID, symbols, s.MarketSelectionConfig.FuturesDirection)
+	return fmt.Sprintf("%s-%s-%s-futures", ID, s.InstanceTag, s.MarketSelectionConfig.FuturesDirection)
 }
 
 func (s *Strategy) Defaults() error {
+	if s.FuturesAccountUpdatePeriod.Duration() == 0 {
+		s.FuturesAccountUpdatePeriod = types.Duration(time.Minute * 5)
+	}
+
 	if len(s.CandidateSymbols) == 0 {
 		return errors.New("empty candidateSymbols")
 	}
@@ -198,6 +245,35 @@ func (s *Strategy) Defaults() error {
 		s.MarketSelectionConfig = &MarketSelectionConfig{}
 	}
 	s.MarketSelectionConfig.Defaults()
+
+	if s.MinExitRate.IsZero() {
+		// default to 4% (ref: US short-term treasury rate)
+		s.MinExitRate = fixedpoint.NewFromFloat(0.04) // 4%
+	}
+	s.MinExitRate = fixedpoint.Min(
+		s.MinExitRate,
+		s.MarketSelectionConfig.MinAnnualizedRate,
+	)
+
+	if s.HardMinExitRate.IsZero() {
+		s.HardMinExitRate = s.MinExitRate.Div(fixedpoint.Two)
+	}
+
+	if s.ExitPnLRatio.IsZero() {
+		s.ExitPnLRatio = fixedpoint.NewFromFloat(0.0005) // 0.05%
+	}
+
+	if s.ConsecutiveNegFundingIncomeLimit == 0 {
+		s.ConsecutiveNegFundingIncomeLimit = 3
+	}
+
+	if s.TradeBalanceRatio.IsZero() {
+		s.TradeBalanceRatio = fixedpoint.NewFromFloat(0.8)
+	}
+	if s.LastTradeBalanceRatio.IsZero() {
+		s.LastTradeBalanceRatio = fixedpoint.NewFromFloat(0.9)
+	}
+
 	if s.QuoteCurrency == "" {
 		s.QuoteCurrency = "USDT"
 	}
@@ -231,9 +307,20 @@ func (s *Strategy) Defaults() error {
 	if _, ok := s.FeeDiscountRate["futures"]; !ok {
 		s.FeeDiscountRate["futures"] = fixedpoint.NewFromFloat(0.10)
 	}
+	if s.MinNotionalMultiplier.IsZero() {
+		s.MinNotionalMultiplier = fixedpoint.NewFromFloat(1.3)
+	}
 
 	if s.Leverage.IsZero() {
 		s.Leverage = fixedpoint.NewFromInt(2)
+	}
+
+	if s.RebalanceInterval.Duration() == 0 {
+		s.RebalanceInterval = types.Duration(time.Hour)
+	}
+
+	if s.TradesBufferSize == 0 {
+		s.TradesBufferSize = 100
 	}
 
 	return nil
@@ -274,6 +361,13 @@ func (s *Strategy) Initialize() error {
 	s.futuresMarkPrices = make(map[string]fixedpoint.Value)
 	s.spotLastPrices = make(map[string]fixedpoint.Value)
 
+	s.followerTWAPWorkerConfig = s.TWAPWorkerConfig
+	// If follower twap enabled, the follower TWAP worker always crosses the spread with
+	// taker orders so it can hedge the leader's fills reliably; the leader keeps the configured order type.
+	if s.UseFollowerTWAPWorkerConfig {
+		s.followerTWAPWorkerConfig.OrderType = TWAPOrderTypeTaker
+	}
+
 	return nil
 }
 
@@ -294,6 +388,28 @@ func (s *Strategy) Validate() error {
 	if s.MaxClosingLossRatio.Sign() > 0 {
 		return fmt.Errorf("maxClosingLossRatio should be negative: %s", s.MaxClosingLossRatio)
 	}
+
+	if s.InstanceTag == "" {
+		return errors.New("instanceTag is required")
+	}
+
+	if s.MinExitRate.Sign() < 0 {
+		return fmt.Errorf("minExitRate should be positive: %s", s.MinExitRate)
+	}
+	if s.HardMinExitRate.Sign() < 0 {
+		return fmt.Errorf("hardMinExitRate should be positive: %s", s.HardMinExitRate)
+	}
+	if s.HardMinExitRate.Compare(s.MinExitRate) > 0 {
+		return fmt.Errorf("expecting hardMinExitRate ≤ minExitRate, got %s and %s", s.HardMinExitRate, s.MinExitRate)
+	}
+	if s.MinNotionalMultiplier.Compare(fixedpoint.One) < 0 {
+		return fmt.Errorf("minNotionalMultiplier should be greater than or equal to 1: %s", s.MinNotionalMultiplier)
+	}
+
+	if err := s.TWAPWorkerConfig.Validate(); err != nil {
+		return fmt.Errorf("invalid TWAP worker config: %w", err)
+	}
+
 	return nil
 }
 
@@ -334,13 +450,16 @@ func (s *Strategy) CrossRun(
 	if s.ActiveRounds == nil {
 		s.ActiveRounds = make(map[string]*ArbitrageRound)
 	}
-	if s.PendingRounds == nil {
-		s.PendingRounds = make(map[string]*PendingRound)
-	}
 	if s.ClosedRoundTasks == nil {
 		s.ClosedRoundTasks = make(map[string]*CloseRoundTask)
 	}
-	s.logger.Debugf("active rounds: %d, pending rounds: %d, closed rounds: %d", len(s.ActiveRounds), len(s.PendingRounds), len(s.ClosedRoundTasks))
+	s.logger.Debugf("active rounds: %d, closed rounds: %d", len(s.ActiveRounds), len(s.ClosedRoundTasks))
+
+	// cleanup pending rounds on startup
+	s.PendingRounds = make(map[string]*PendingRound)
+
+	// remove the symbols that are configured to be removed on startup
+	s.removeRoundsOnStartup()
 
 	s.spotSession = sessions[s.SpotSession]
 	s.futuresSession = sessions[s.FuturesSession]
@@ -678,12 +797,14 @@ func (s *Strategy) CrossRun(
 			return err
 		}
 
+		currentTime := time.Now()
 		for _, round := range s.ActiveRounds {
-			if err := round.SyncFundingFeeRecords(s.ctx, time.Now()); err != nil {
+			if err := round.SyncFundingFeeRecords(s.ctx, currentTime); err != nil {
 				return fmt.Errorf("failed to sync funding fee records for round %s: %w", round.SpotSymbol(), err)
 			}
 			s.logger.Debugf("funding fee records synced for round %s", round)
 		}
+		s.closeDelistedRounds(currentTime)
 	}
 
 	// setup metrics for positions
@@ -706,6 +827,9 @@ func (s *Strategy) CrossRun(
 	// start the last price updater worker
 	s.runLastPriceWorker(s.ctx)
 
+	// start futures account updater
+	s.runFuturesAccountUpdater(s.ctx)
+
 	// setup callbacks
 	s.spotSession.MarketDataStream.OnKLineClosed(types.KLineWith(s.TickSymbol, s.TickInterval, func(kline types.KLine) {
 		// end time of the kline is hh:mm:ss.999 -> add 1ms to round it up
@@ -713,52 +837,34 @@ func (s *Strategy) CrossRun(
 	}))
 
 	// trade update callbacks
-	s.spotSession.UserDataStream.OnTradeUpdate(func(trade types.Trade) {
-		// lock the strategy to ensure all the updates to the active rounds are seen
+	// run trade buffer workers in case there are many trades in a short period of time
+	s.spotTradeC = s.runTradeBufferWorker(s.TradesBufferSize, func(trade types.Trade) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
 		for _, round := range s.allRounds() {
 			if round.HasOrder(trade.OrderID) {
-				round.HandleSpotTrade(trade, s.spotSession.Account, trade.Time.Time())
-
-				spotFilledPosition := round.SpotWorker().FilledPosition()
-				filledRatio := spotFilledPosition.Div(round.TriggeredTargetPosition()).Abs()
-				if round.State() == RoundClosing {
-					filledRatio = fixedpoint.One.Sub(filledRatio)
-				}
-				roundPositionFilledRatioMetrics.With(
-					prometheus.Labels{
-						"strategy_id": s.InstanceID(),
-						"symbol":      round.SpotSymbol(),
-						"accountType": "spot",
-					},
-				).Set(filledRatio.Float64())
+				round.HandleSpotTrade(trade, s.spotSession.GetAccount(), trade.Time.Time())
 			}
 		}
 	})
-	s.futuresSession.UserDataStream.OnTradeUpdate(func(trade types.Trade) {
+	s.futuresTradeC = s.runTradeBufferWorker(s.TradesBufferSize, func(trade types.Trade) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
 		for _, round := range s.allRounds() {
 			if round.HasOrder(trade.OrderID) {
-				round.HandleFuturesTrade(trade, s.futuresSession.Account, trade.Time.Time())
-
-				futuresFilledPosition := round.FuturesWorker().FilledPosition()
-				filledRatio := futuresFilledPosition.Div(round.TriggeredTargetPosition()).Abs()
-				if round.State() == RoundClosing {
-					filledRatio = fixedpoint.One.Sub(filledRatio)
-				}
-				roundPositionFilledRatioMetrics.With(
-					prometheus.Labels{
-						"strategy_id": s.InstanceID(),
-						"symbol":      round.SpotSymbol(),
-						"accountType": "futures",
-					},
-				).Set(filledRatio.Float64())
+				round.HandleFuturesTrade(trade, s.futuresSession.GetAccount(), trade.Time.Time())
 			}
 		}
+	})
+	s.spotSession.UserDataStream.OnTradeUpdate(func(trade types.Trade) {
+		// queue the trade to be processed by the spot trade buffer worker
+		s.spotTradeC <- trade
+	})
+	s.futuresSession.UserDataStream.OnTradeUpdate(func(trade types.Trade) {
+		// queue the trade to be processed by the futures trade buffer worker
+		s.futuresTradeC <- trade
 	})
 
 	// order update callbacks
@@ -790,14 +896,16 @@ func (s *Strategy) CrossRun(
 			if round.State() == RoundClosing {
 				continue
 			}
-			round.SetClosing(time.Now(), s.TWAPWorkerConfig.ClosingDuration)
 			spotPrice, futuresPrice, _ := s.getLastPrices(
 				round.SpotSymbol(),
 				round.FuturesSymbol(),
 			)
-			bbgo.Notify("⚠️ Round is set to closing state on startup", round.NewNotification(spotPrice, futuresPrice))
+			round.SetClosing(time.Now(), s.TWAPWorkerConfig.ClosingDuration, futuresPrice)
+			bbgo.Notify("⚠️ Round is set to closing state on startup: %s",
+				round.String(),
+				round.NewNotification(spotPrice, futuresPrice),
+			)
 		}
-		s.PendingRounds = make(map[string]*PendingRound)
 		s.mu.Unlock()
 	}
 	bbgo.Notify("✅ Strategy %s is up and running with %d candidate symbols: %v",
@@ -805,6 +913,15 @@ func (s *Strategy) CrossRun(
 		len(s.candidateSymbols),
 		s.candidateSymbols,
 	)
+
+	// wire the interactive "Close Round" button. It's always on when a Slack
+	// interaction dispatcher is available; silently skipped otherwise.
+	if dispatcher, err := interact.GetDispatcher(); err != nil {
+		s.logger.Warnf("xfundingv2 interactive close round disabled: %s", err)
+	} else {
+		s.slackEvtID = uuid.NewString()
+		setupCloseRoundInteraction(s, dispatcher)
+	}
 
 	// Register shutdown handler to persist state
 	bbgo.OnShutdown(s.ctx, func(ctx context.Context, wg *sync.WaitGroup) {
@@ -864,6 +981,15 @@ func (s *Strategy) tick(ctx context.Context, tickTime time.Time) {
 			tickDurationMetrics.With(prometheus.Labels{
 				"strategy_id": s.InstanceID(),
 			}).Set(duration.Seconds())
+
+			tradesBufferUntilizationMetrics.With(prometheus.Labels{
+				"strategy_id": s.InstanceID(),
+				"channel":     "spot",
+			}).Set(float64(len(s.spotTradeC)) / float64(s.TradesBufferSize))
+			tradesBufferUntilizationMetrics.With(prometheus.Labels{
+				"strategy_id": s.InstanceID(),
+				"channel":     "futures",
+			}).Set(float64(len(s.futuresTradeC)) / float64(s.TradesBufferSize))
 		}()
 	}
 	// lock the strategy to ensure all the updates to the active rounds are seen
@@ -893,6 +1019,15 @@ func (s *Strategy) tick(ctx context.Context, tickTime time.Time) {
 	}
 	s.lastTickTime = tickTime
 
+	select {
+	case s.futuresAccountUpdater.C <- tickTime:
+	default:
+		s.logger.Warnf(
+			"futures account updater tick channel is full, skip tick time: %s",
+			tickTime,
+		)
+	}
+
 	// start processing
 	// 1. process existing active rounds
 	// We need to tick the active rounds first since we need to proceed the underlying workers to update the positions.
@@ -905,54 +1040,30 @@ func (s *Strategy) tick(ctx context.Context, tickTime time.Time) {
 		round.Tick(ctx, tickTime, spotOrderBook, futuresOrderBook)
 
 		// 1.2 transit active rounds
+		spotPrice, futuresPrice, lastPricesOk := s.getLastPrices(
+			round.SpotSymbol(),
+			round.FuturesSymbol(),
+		)
 		posDeviation := round.CheckPositionDeviation(
 			tickTime,
 			s.CriticalErrorConfig.MaxMoqDeviation,
+			s.CriticalErrorConfig.MaxQuoteDeviation,
+			spotPrice,
 			time.Minute*15,
 		)
-		// record the round spot/futures positions
-		roundPositionMetrics.With(
-			prometheus.Labels{
-				"strategy_id": s.InstanceID(),
-				"symbol":      round.SpotSymbol(),
-				"accountType": "spot",
-			},
-		).Set(posDeviation.SpotFilled.Float64())
-		roundPositionMetrics.With(
-			prometheus.Labels{
-				"strategy_id": s.InstanceID(),
-				"symbol":      round.FuturesSymbol(),
-				"accountType": "futures",
-			},
-		).Set(posDeviation.FuturesFilled.Float64())
-		roundQuantityDeviationMetrics.With(
-			prometheus.Labels{
-				"strategy_id": s.InstanceID(),
-				"symbol":      round.SpotSymbol(),
-			},
-		).Set(posDeviation.DeviatedQuantity.Float64())
-
 		if round.State() != RoundReady {
 			// check if the round is halted or should be halted
 			halted := round.IsHalted()
 			roundSymbol := round.SpotSymbol()
 			if !halted && posDeviation.DeviateTooLong {
+				s.logger.Warnf("round %s position deviation: %+v", roundSymbol, posDeviation)
 				// the round is originally not halted but the deviation is too large -> we need to halt the round
 				round.Halt(tickTime)
-				s.logger.Warnf("round %s halted due to large hedge deviation: spot filled %s, futures filled %s (deviation %s)",
-					roundSymbol,
-					posDeviation.SpotFilled,
-					posDeviation.FuturesFilled,
-					posDeviation.DeviatedQuantity,
-				)
-				spotPrice, futuresPrice, _ := s.getLastPrices(
-					round.SpotSymbol(),
-					round.FuturesSymbol(),
-				)
-				bbgo.Notify("💥 Round %s halted due to large hedge deviation. Manual intervention is required: spot filled %s, futures filled %s (deviation: %s)",
+				bbgo.Notify("💥 Round %s halted due to large hedge deviation. Might need manual intervention: spot filled %s, futures filled %s (deviation: %s@%s)",
 					roundSymbol,
 					posDeviation.SpotFilled, posDeviation.FuturesFilled,
 					posDeviation.DeviatedQuantity,
+					posDeviation.LastPrice,
 					round.NewCriticalNotification(spotPrice, futuresPrice),
 				)
 				continue
@@ -960,14 +1071,11 @@ func (s *Strategy) tick(ctx context.Context, tickTime time.Time) {
 				// the deviation is back to normal, resume the round
 				haltedAt := round.HaltedAt()
 				round.Resume()
-				s.logger.Infof("round %s resumed as hedge deviation back to normal: spot filled %s, futures filled %s",
+				s.logger.Infof("round %s resumed as hedge deviation back to normal: spot filled %s, futures filled %s, last price %s",
 					roundSymbol,
 					posDeviation.SpotFilled,
 					posDeviation.FuturesFilled,
-				)
-				spotPrice, futuresPrice, _ := s.getLastPrices(
-					round.SpotSymbol(),
-					round.FuturesSymbol(),
+					posDeviation.LastPrice,
 				)
 				bbgo.Notify("✅ Round %s resumed as hedge deviation back to normal. It was halted at %s.",
 					roundSymbol,
@@ -987,7 +1095,7 @@ func (s *Strategy) tick(ctx context.Context, tickTime time.Time) {
 				)
 				if found && limiter.AllowN(tickTime, 1) {
 					// send notification for rounds that have been halted for a while.
-					bbgo.Notify("💥 Round %s halted for %s (since %s). Manual intervention is required",
+					bbgo.Notify("💥 Round %s halted for %s (since %s). Might need manual intervention",
 						roundSymbol,
 						elapsed.String(),
 						haltedAt.Format(time.RFC3339),
@@ -999,6 +1107,13 @@ func (s *Strategy) tick(ctx context.Context, tickTime time.Time) {
 		}
 
 		s.transitRound(ctx, round, tickTime)
+
+		futuresAccount := s.futuresSession.GetAccount()
+		if lastPricesOk && futuresAccount != nil {
+			round.RecordMetrics(futuresAccount.FuturesInfo, posDeviation, spotPrice, futuresPrice)
+		} else {
+			s.logger.Warnf("unable to record metrics for round %s, lastPricesOk: %v, futuresAccount: %v", round.SpotSymbol(), lastPricesOk, futuresAccount)
+		}
 		// all transitions are done, check if the state has changed
 		currentState := round.State()
 		if oriState != currentState {
@@ -1009,34 +1124,31 @@ func (s *Strategy) tick(ctx context.Context, tickTime time.Time) {
 			notification := round.NewNotification(spotPrice, futuresPrice)
 			switch currentState {
 			case RoundReady:
-				bbgo.Notify("🟢 Round entered ready state: %s",
-					round.SpotSymbol(),
+				args := []any{
 					notification,
-				)
+				}
+				if s.slackEvtID != "" {
+					args = append(args, newInteractiveCloseRound(round, s.slackEvtID, spotPrice, futuresPrice))
+				}
+				bbgo.Notify("🟢 Round entered ready state: "+round.SpotSymbol(), args...)
 			case RoundClosing:
-				bbgo.Notify("🟡 Round is closing: %s",
-					round.SpotSymbol(),
-					notification,
-				)
+				bbgo.Notify("🟡 Round is closing: "+round.SpotSymbol(), notification)
 			case RoundClosed:
-				bbgo.Notify("🔴 Round is closed: %s",
-					round.SpotSymbol(),
-					notification,
-				)
-			}
-		}
+				// no need to attach a notification here for closed round
+				// since there will be other notifications for it
+				bbgo.Notify("🔴 Round is closed: " + round.String())
 
-		// enque closed active rounds
-		if round.State() == RoundClosed {
-			s.logger.Infof("move round to closed queue: %s", round)
-			// stop the round
-			round.Stop()
-			// remove from active round queue
-			delete(s.ActiveRounds, round.SpotSymbol())
-			// add to closed round queue for cleanup
-			s.ClosedRoundTasks[round.SpotSymbol()] = &CloseRoundTask{
-				Round:    round,
-				RetryCnt: 0,
+				// enque closed active rounds
+				s.logger.Infof("move round to closed queue: %s", round)
+				// stop the round
+				round.Stop()
+				// remove from active round queue
+				delete(s.ActiveRounds, round.SpotSymbol())
+				// add to closed round queue for cleanup
+				s.ClosedRoundTasks[round.SpotSymbol()] = &CloseRoundTask{
+					Round:    round,
+					RetryCnt: 0,
+				}
 			}
 		}
 	}
@@ -1064,14 +1176,18 @@ func (s *Strategy) tick(ctx context.Context, tickTime time.Time) {
 
 		task.LastTriedTime = tickTime
 		task.RetryCnt++
+		spotPrice, futuresPrice, _ := s.getLastPrices(
+			round.SpotSymbol(),
+			round.FuturesSymbol(),
+		)
 		if err := s.handleClosedRound(closeRoundCtx, task, tickTime); err != nil {
-			s.logger.WithError(err).Errorf("failed to handle closed round: %s", task.Round)
+			bbgo.Notify(
+				"❌ Failed to handle closed round: %s",
+				err.Error(),
+				task.Round.NewCriticalNotification(spotPrice, futuresPrice),
+			)
 		} else {
 			s.closedRoundStats(task.Round, tickTime)
-			spotPrice, futuresPrice, _ := s.getLastPrices(
-				round.SpotSymbol(),
-				round.FuturesSymbol(),
-			)
 			bbgo.Notify("✅ Successfully handled closed round: %s", round.String(), round.NewNotification(spotPrice, futuresPrice))
 			delete(s.ClosedRoundTasks, task.Round.SpotSymbol())
 		}
@@ -1096,11 +1212,14 @@ func (s *Strategy) tick(ctx context.Context, tickTime time.Time) {
 		s.notifyStats()
 		s.lastStatsTime = tickTime.Truncate(period)
 	}
+
+	// 6. strategy level rebalance
+	s.rebalance(tickTime)
 }
 
 func (s *Strategy) transitRound(ctx context.Context, round *ArbitrageRound, currentTime time.Time) {
 	// still in the first funding interval, do not transit
-	if round.NumHoldingIntervals(currentTime) <= 1 {
+	if round.NumHoldingIntervals(currentTime) < 1 {
 		if round.LastUpdateTime().IsZero() {
 			round.SetUpdateTime(currentTime)
 		}
@@ -1116,83 +1235,89 @@ func (s *Strategy) transitRound(ctx context.Context, round *ArbitrageRound, curr
 		return
 	}
 
+	// update the funding rate
+	timedCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+
+	index, err := s.futuresService.QueryPremiumIndex(timedCtx, round.FuturesSymbol())
+	if err != nil {
+		s.logger.WithError(err).Warnf("failed to query premium index for round: %s", round.String())
+		return
+	}
+	// update the last funding rate for the round metrics
+	round.SetLastFundingRate(index.LastFundingRate)
+
 	oriState := round.State()
 	switch oriState {
 	case RoundOpening, RoundReady:
-		s.transitOpeningOrReadyRoundToClosing(ctx, round, currentTime)
+		s.transitOpeningOrReadyRoundToClosing(round, index, currentTime)
 	case RoundClosing:
-		s.transitClosingRound(ctx, round, currentTime)
+		s.transitClosingRound(round, currentTime)
 	}
 	s.logger.Debugf("transit state for round %s: %s -> %s", round.SpotSymbol(), oriState, round.State())
 	round.SetUpdateTime(currentTime)
 }
 
-func (s *Strategy) transitOpeningOrReadyRoundToClosing(ctx context.Context, round *ArbitrageRound, currentTime time.Time) {
+func (s *Strategy) transitOpeningOrReadyRoundToClosing(round *ArbitrageRound, index *types.PremiumIndex, currentTime time.Time) {
 	// if the current funding rate is still favorable, stay in current state, otherwise transit to closing
-	timedCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
+	lastAnnualizedFundingRate := AnnualizedRate(index.LastFundingRate, round.syncState.FundingIntervalHours)
+	spotPrice, futuresPrice, pricesOk := s.getLastPrices(
+		round.SpotSymbol(),
+		round.FuturesSymbol(),
+	)
 
-	fundingRate, err := s.futuresService.QueryPremiumIndex(timedCtx, round.FuturesSymbol())
-	if err != nil {
+	if !pricesOk {
+		s.logger.Warnf(
+			"[transitOpeningOrReadyRoundToClosing] failed to get last prices, skipping transit: %s",
+			round.String(),
+		)
 		return
 	}
 
-	// the funding rate has flipped
-	if round.TriggeredFundingRate().Sign()*fundingRate.LastFundingRate.Sign() <= 0 {
-		spotPrice, futuresPrice, _ := s.getLastPrices(
-			round.SpotSymbol(),
-			round.FuturesSymbol(),
-		)
-		rateDiffAbs := fundingRate.LastFundingRate.Sub(round.TriggeredFundingRate()).Abs()
+	withinMinHoldingTime := round.NumHoldingIntervals(currentTime) < round.MinHoldingIntervals()
+	if round.TriggeredFundingRate().Sign()*index.LastFundingRate.Sign() <= 0 {
+		// the funding rate has flipped
+		rateDiffAbs := index.LastFundingRate.Sub(round.TriggeredFundingRate()).Abs()
 		if rateDiffAbs.Compare(s.CriticalErrorConfig.MaxFundingRateFlip) > 0 {
-			bbgo.Notify("🚨 Round funding rate flip is too large: %s -> %s (threshold %s), closing round",
+			bbgo.Notify("🚨 Round funding rate flip is too large: %s -> %s (threshold %s), closing: %s",
 				round.TriggeredFundingRate(),
-				fundingRate.LastFundingRate,
+				index.LastFundingRate,
 				s.CriticalErrorConfig.MaxFundingRateFlip,
+				round.String(),
 				round.NewCriticalNotification(spotPrice, futuresPrice),
 			)
-			round.SetClosing(currentTime, s.TWAPWorkerConfig.ClosingDuration)
+			round.SetClosing(currentTime, s.TWAPWorkerConfig.ClosingDuration, futuresPrice)
 			return
-		} else {
-			bbgo.Notify("⚠️ Round funding rate flipped %s -> %s (%s)",
-				round.TriggeredFundingRate(), fundingRate.LastFundingRate, round.SpotSymbol(),
-				round.NewNotification(spotPrice, futuresPrice),
-			)
 		}
 
 		// the round is still within the min holding time, keep holding
-		if round.NumHoldingIntervals(currentTime) < round.MinHoldingIntervals() {
+		if withinMinHoldingTime {
 			s.logger.Infof(
 				"[transitOpeningOrReadyRound] still within min holding hours, keep holding, current funding rate %s: %s",
-				fundingRate.LastFundingRate, round,
+				index.LastFundingRate, round,
 			)
 			return
 		}
 
 		// the round is beyond the max holding time, transit to closing
 		if currentTime.Sub(round.StartedAt()) >= s.MarketSelectionConfig.MaxHoldingDuration.Duration() {
-			s.logger.Infof(
-				"[transitOpeningOrReadyRound %s] max holding hours reached, transit state %s -> closing, current funding rate %s: %s",
-				currentTime.Format(time.RFC3339), round.State(), fundingRate.LastFundingRate, round,
+			bbgo.Notify(
+				"⚠️ Max holding hours reached, transit state %s -> closing, current funding rate %s: %s",
+				round.State(), index.LastFundingRate, round.String(),
+				round.NewNotification(spotPrice, futuresPrice),
 			)
-			round.SetClosing(currentTime, s.TWAPWorkerConfig.ClosingDuration)
+			round.SetClosing(currentTime, s.TWAPWorkerConfig.ClosingDuration, futuresPrice)
 			return
 		}
 		// the round is already beyond the min holding time and the funding rate has flipped
 		// check if the unrealized PnL is positive
-		spotPrice, futuresPrice, ok := s.getLastPrices(round.SpotSymbol(), round.FuturesSymbol())
-		if !ok {
-			s.logger.Warnf("[transitOpeningOrReadyRound] order book not found for symbols: %s", round.SpotSymbol())
-			return
-		}
-
 		futuresPosition := round.FuturesWorker().FilledPosition()
 		futuresPositionNotional := futuresPosition.Abs().Mul(futuresPrice)
 		// short position -> last funding rate is negative due to the flipped rate
 		// long position -> last funding rate is positive due to the flipped rate
 		// the product of the flipped rate and the position is positive
 		// we need to negate the product to get the next funding income, which should be negative -> expected loss
-		nextFundingIncome := fundingRate.LastFundingRate.Mul(futuresPosition).Neg()
+		nextFundingIncome := index.LastFundingRate.Mul(futuresPosition).Neg()
 		unrealizedPnL := round.UnrealizedPnL(spotPrice, futuresPrice)
 		unrealizedTotalPnL := unrealizedPnL.TotalPnL()
 		// the unrealized PnL is positive or the expected unrealized net PnL is below the max closing loss ratio, transit to closing
@@ -1200,30 +1325,101 @@ func (s *Strategy) transitOpeningOrReadyRoundToClosing(ctx context.Context, roun
 		// NOTE: MaxClosingLossRatio is negative
 		if unrealizedTotalPnL.Sign() > 0 || unrealizedTotalPnL.Add(nextFundingIncome).Div(futuresPositionNotional).Compare(s.MaxClosingLossRatio) < 0 {
 			s.logger.Debugf(
-				"[transitOpeningOrReadyRound %s] unrealized total PnL: %s, next funding income: %s, futures position notional: %s, max closing loss ratio: %s",
+				"[transitOpeningOrReadyRound] unrealized total PnL: %s, next funding income: %s, futures position notional: %s, max closing loss ratio: %s",
 				unrealizedTotalPnL, nextFundingIncome, futuresPositionNotional, s.MaxClosingLossRatio,
 			)
-			s.logger.Infof(
-				"[transitOpeningOrReadyRound %s] transit state %s -> closing, current funding rate %s: %s",
-				currentTime.Format(time.RFC3339), round.State(), fundingRate.LastFundingRate, round)
-			round.SetClosing(currentTime, s.TWAPWorkerConfig.ClosingDuration)
+			bbgo.Notify(
+				"⚠️ Unrealized total PnL too large (%s), transit state %s -> closing, current funding rate %s: %s",
+				unrealizedTotalPnL, round.State(), index.LastFundingRate, round.String(),
+				round.NewNotification(spotPrice, futuresPrice),
+			)
+			round.SetClosing(currentTime, s.TWAPWorkerConfig.ClosingDuration, futuresPrice)
 			return
+		}
+
+		if withinMinHoldingTime {
+			// if it's within the minimum holding time, add an interactive close round notification
+			msg := fmt.Sprintf(
+				"⚠️ Round funding rate flipped %s -> %s (%s)",
+				round.TriggeredFundingRate().String(), index.LastFundingRate.String(), round.SpotSymbol(),
+			)
+			if s.slackEvtID != "" {
+				spotPrice, futuresPrice, _ := s.getLastPrices(
+					round.SpotSymbol(),
+					round.FuturesSymbol(),
+				)
+				// send a interactive close round notification when funding rate flipped
+				closeRoundNotification := newInteractiveCloseRound(round, s.slackEvtID, spotPrice, futuresPrice).SetText(msg)
+				bbgo.Notify(closeRoundNotification)
+			} else {
+				bbgo.Notify(msg)
+			}
 		}
 	}
 
+	negFundingIncomeCnt := 0
+	for _, record := range round.FundingRecordsDescending(3) {
+		if record.Amount.Sign() < 0 {
+			negFundingIncomeCnt++
+		}
+	}
+	if negFundingIncomeCnt >= s.ConsecutiveNegFundingIncomeLimit {
+		bbgo.Notify(
+			"⚠️ Consecutive negative funding income detected (%d), transit state %s -> closing: %s",
+			negFundingIncomeCnt, round.State(), round.String(),
+			round.NewNotification(spotPrice, futuresPrice),
+		)
+		round.SetClosing(currentTime, s.TWAPWorkerConfig.ClosingDuration, futuresPrice)
+		return
+	}
+
+	if round.State() != RoundReady {
+		return
+	}
+	// from here, the round is ready
+
+	if lastAnnualizedFundingRate.Abs().Compare(s.MinExitRate) <= 0 && !withinMinHoldingTime {
+		// check hard min exit rate
+		if lastAnnualizedFundingRate.Abs().Compare(s.HardMinExitRate) <= 0 {
+			bbgo.Notify("⚠️ Last funding rate %s(annualized %s) is below the hard min exit rate %s, transit state %s -> closing: %s",
+				index.LastFundingRate, lastAnnualizedFundingRate, s.HardMinExitRate, round.State(), round.String(),
+				round.NewNotification(spotPrice, futuresPrice),
+			)
+			round.SetClosing(currentTime, s.TWAPWorkerConfig.ClosingDuration, futuresPrice)
+			return
+		}
+		// check min exit rate and total PnL
+		unrealizedPnL := round.UnrealizedPnL(spotPrice, futuresPrice)
+		spotNotional := unrealizedPnL.SpotNotional()
+		totalPnL := unrealizedPnL.TotalPnL()
+		if totalPnL.Sign() > 0 && totalPnL.Div(spotNotional).Compare(s.ExitPnLRatio) >= 0 {
+			// the round is generating profit but the funding rate is below the soft min exit rate, transit to closing
+			bbgo.Notify("⚠️ Last funding rate %s(annualized %s) is below the soft min exit rate %s with total PnL %s, transit state %s -> closing: %s",
+				index.LastFundingRate, lastAnnualizedFundingRate, s.MinExitRate, totalPnL, round.State(), round.String(),
+				round.NewNotification(spotPrice, futuresPrice),
+			)
+			round.SetClosing(currentTime, s.TWAPWorkerConfig.ClosingDuration, futuresPrice)
+			return
+		} else {
+			s.logger.Infof("[transitOpeningOrReadyRound] last funding rate %s(annualized %s) is below the min exit rate %s with total PnL %s, keep holding: %s",
+				index.LastFundingRate, lastAnnualizedFundingRate, s.MinExitRate, totalPnL, round.String())
+		}
+	}
+
+	// nothing critical happened
 	if s.allowLog(currentTime) {
 		s.logger.Infof(
 			"[transitOpeningOrReadyRound %s] round stays %s, current funding rate %s: %s",
-			currentTime.Format(time.RFC3339), round.State(), fundingRate.LastFundingRate, round,
+			currentTime.Format(time.RFC3339), round.State().String(), index.LastFundingRate.String(), round.String(),
 		)
 	}
 }
 
-func (s *Strategy) transitClosingRound(ctx context.Context, round *ArbitrageRound, currentTime time.Time) {
+func (s *Strategy) transitClosingRound(round *ArbitrageRound, currentTime time.Time) {
 	// the round is expired and is in closing state, keep it closing until it's closed
 	if s.allowLog(currentTime) {
 		s.logger.Infof("[transitClosingRound %s] round is closing: %s",
-			currentTime.Format(time.RFC3339), round)
+			currentTime.Format(time.RFC3339), round.String())
 	}
 }
 
@@ -1244,92 +1440,88 @@ func (s *Strategy) checkOpenNewRound(ctx context.Context, currentTime time.Time)
 		return
 	}
 
-	// Only open new round when there is none
-	// TODO: support multiple rounds for different symbols concurrently (e.g BTCUSDT and ETHUSDT)
-	if len(s.allRounds()) == 0 {
-		candidates, err := s.preliminaryMarketSelector.SelectMarkets(ctx, s.candidateSymbols)
-		if err != nil {
-			s.logger.WithError(err).Warn("failed to select market candidates")
-			return
+	var legitSymbols []string
+	for _, symbol := range s.candidateSymbols {
+		if s.canOpenRound(symbol, currentTime) {
+			legitSymbols = append(legitSymbols, symbol)
 		}
-		if len(candidates) == 0 {
-			// no candidates, nothing to do
-			return
-		}
-		s.logger.Debugf("candidates: %+v", candidates)
+	}
 
-		var legitCandidates []MarketCandidate
-		for _, candidate := range candidates {
-			if s.canOpenRound(candidate.Symbol, currentTime) {
-				legitCandidates = append(legitCandidates, candidate)
-			}
-		}
-		s.logger.Debugf("legit candidates: %+v", legitCandidates)
-		selectedCandidate := s.selectMostProfitableMarket(legitCandidates)
-		if selectedCandidate == nil {
-			// no profitable candidate found, nothing to do
+	candidates, err := s.preliminaryMarketSelector.
+		SetActiveRounds(s.ActiveRounds).
+		SelectMarkets(ctx, legitSymbols)
+	if err != nil {
+		s.logger.WithError(err).Warn("failed to select market candidates")
+		return
+	}
+	if len(candidates) == 0 {
+		// no candidates, nothing to do
+		return
+	}
+	s.logger.Debugf("candidates: %+v", candidates)
+
+	selectedCandidate := s.selectMostProfitableMarket(candidates)
+	if selectedCandidate == nil {
+		// no profitable candidate found, nothing to do
+		return
+	}
+	s.logger.Debugf("most profitable candidate for new round: %+v", selectedCandidate)
+
+	// open new round if the estimated break-even holding interval is within the max holding hours
+	if selectedCandidate.MinHoldingDuration <= s.MarketSelectionConfig.MaxHoldingDuration.Duration() {
+		spotExecutor := s.spotGeneralOrderExecutors[selectedCandidate.Symbol]
+		spotTwap, err := NewTWAPWorker(ctx, selectedCandidate.Symbol, s.spotSession, spotExecutor, s.TWAPWorkerConfig)
+		spotTwap.SetLogger(s.logger)
+		spotTwap.Executor().SetDryRun(s.DryRun)
+		if err != nil || spotTwap == nil {
+			s.logger.WithError(err).Errorf("failed to create TWAP worker for spot %s", selectedCandidate.Symbol)
 			return
 		}
-		s.logger.Debugf("most profitable candidate for new round: %+v", selectedCandidate)
-
-		// open new round if the estimated break-even holding interval is within the max holding hours
-		if selectedCandidate.MinHoldingDuration <= s.MarketSelectionConfig.MaxHoldingDuration.Duration() {
-			spotExecutor := s.spotGeneralOrderExecutors[selectedCandidate.Symbol]
-			spotTwap, err := NewTWAPWorker(ctx, selectedCandidate.Symbol, s.spotSession, spotExecutor, s.TWAPWorkerConfig)
-			spotTwap.SetLogger(s.logger)
-			spotTwap.Executor().SetDryRun(s.DryRun)
-			if err != nil || spotTwap == nil {
-				s.logger.WithError(err).Errorf("failed to create TWAP worker for spot %s", selectedCandidate.Symbol)
-				return
-			}
-			spotTwap.SetTargetPosition(selectedCandidate.TargetFuturesPosition.Neg())
-			futuresExecutor := s.futuresGeneralOrderExecutors[selectedCandidate.Symbol]
-			futuresTwap, err := NewTWAPWorker(ctx, selectedCandidate.Symbol, s.futuresSession, futuresExecutor, s.TWAPWorkerConfig)
-			futuresTwap.SetLogger(s.logger)
-			futuresTwap.Executor().SetDryRun(s.DryRun)
-			if err != nil || futuresTwap == nil {
-				s.logger.WithError(err).Errorf("failed to create TWAP worker for futures %s", selectedCandidate.Symbol)
-				return
-			}
-			round := NewArbitrageRound(
-				selectedCandidate.PremiumIndex,
-				s.spotSession.Exchange.Name(),
-				s.futuresSession.Exchange.Name(),
-				selectedCandidate.MinHoldingIntervals,
-				selectedCandidate.FundingIntervalHours,
-				s.Leverage,
-				spotTwap,
-				futuresTwap,
-				s.futuresService,
-				s.MarketSelectionConfig.FuturesDirection,
-				s.RoundRebalanceInterval.Duration(),
-			)
-			round.SetLogger(s.logger)
-			round.SetSpotExchangeFeeRates(
-				s.costEstimator.GetSpotFeeRate(),
-			)
-			round.SetFuturesExchangeFeeRates(
-				s.costEstimator.GetFuturesFeeRate(),
-			)
-			round.SetSlackAlert(s.SlackAlert)
-			roundAnnualizedTriggerRateMetrics.With(
-				prometheus.Labels{
-					"strategy_id": s.InstanceID(),
-					"symbol":      selectedCandidate.Symbol,
-				},
-			).Set(round.AnnualizedRate().Float64())
-			// enqueue the new round to pending rounds for further processing
-			s.PendingRounds[selectedCandidate.Symbol] = &PendingRound{
-				Round: round,
-			}
-			bbgo.Notify("🆕 Created new pending round: %s", round.SpotSymbol())
-		} else {
-			s.logger.Debugf("selected candidate %s min holding duration too long: %s > %s, skipping",
-				selectedCandidate.Symbol,
-				selectedCandidate.MinHoldingDuration,
-				s.MarketSelectionConfig.MaxHoldingDuration.Duration(),
-			)
+		spotTwap.SetTargetPosition(selectedCandidate.TargetFuturesPosition.Neg())
+		futuresExecutor := s.futuresGeneralOrderExecutors[selectedCandidate.Symbol]
+		// during opening, futures is the follower -> use taker orders to hedge reliably
+		futuresTwap, err := NewTWAPWorker(ctx, selectedCandidate.Symbol, s.futuresSession, futuresExecutor, s.followerTWAPWorkerConfig)
+		futuresTwap.SetLogger(s.logger)
+		futuresTwap.Executor().SetDryRun(s.DryRun)
+		if err != nil || futuresTwap == nil {
+			s.logger.WithError(err).Errorf("failed to create TWAP worker for futures %s", selectedCandidate.Symbol)
+			return
 		}
+		round := NewArbitrageRound(
+			selectedCandidate.PremiumIndex,
+			s.spotSession.Exchange.Name(),
+			s.futuresSession.Exchange.Name(),
+			selectedCandidate.MinHoldingIntervals,
+			selectedCandidate.FundingIntervalHours,
+			s.Leverage,
+			spotTwap,
+			futuresTwap,
+			s.futuresService,
+			s.MarketSelectionConfig.FuturesDirection,
+			s.RoundRebalanceInterval.Duration(),
+		)
+		round.SetupMetrics(s)
+		round.SetLogger(s.logger)
+		// provide the leader/follower configs so the round can flip roles when closing
+		round.SetTWAPConfigs(s.TWAPWorkerConfig, s.followerTWAPWorkerConfig)
+		round.SetSpotExchangeFeeRates(
+			s.costEstimator.GetSpotFeeRate(),
+		)
+		round.SetFuturesExchangeFeeRates(
+			s.costEstimator.GetFuturesFeeRate(),
+		)
+		round.SetSlackAlert(s.SlackAlert)
+		// enqueue the new round to pending rounds for further processing
+		s.PendingRounds[selectedCandidate.Symbol] = &PendingRound{
+			Round: round,
+		}
+		bbgo.Notify("🆕 Created new pending round: %s", round.SpotSymbol())
+	} else {
+		s.logger.Debugf("selected candidate %s min holding duration too long: %s > %s, skipping",
+			selectedCandidate.Symbol,
+			selectedCandidate.MinHoldingDuration,
+			s.MarketSelectionConfig.MaxHoldingDuration.Duration(),
+		)
 	}
 }
 
@@ -1357,6 +1549,8 @@ func (s *Strategy) filterMarketByCapSize(ctx context.Context, symbols []string) 
 		}
 		if _, found := topAssets[market.BaseCurrency]; found {
 			candidateSymbols = append(candidateSymbols, symbol)
+		} else {
+			bbgo.Notify("skipping %s as it's not in the top cap assets", symbol)
 		}
 	}
 	return candidateSymbols
@@ -1370,7 +1564,7 @@ func (s *Strategy) filterMarketBothListed(symbols []string) []string {
 		if spotOk && futuresOk {
 			candidateSymbols = append(candidateSymbols, symbol)
 		} else {
-			s.logger.Infof("skipping %s as it's not listed on both spot and futures", symbol)
+			bbgo.Notify("skipping %s as it's not listed on both spot and futures", symbol)
 		}
 	}
 	return candidateSymbols
@@ -1403,7 +1597,7 @@ func (s *Strategy) filterMarketCollateralRate(ctx context.Context, symbols []str
 		if rate.Compare(s.MarketSelectionConfig.MinCollateralRate) >= 0 {
 			candidateSymbols = append(candidateSymbols, market.Symbol)
 		} else {
-			s.logger.Infof("skipping %s due to low collateral rate: %s", market.Symbol, rate.String())
+			bbgo.Notify("skipping %s due to low collateral rate: %s", market.Symbol, rate.String())
 		}
 	}
 	return candidateSymbols
@@ -1442,7 +1636,10 @@ func (s *Strategy) selectMostProfitableMarket(candidates []MarketCandidate) *Mar
 			if !ok {
 				continue
 			}
-			totalQuoteAmount := quoteBalance.Available.Mul(s.MarketSelectionConfig.TradeBalanceRatio)
+			totalQuoteAmount := s.quoteAmountForBet(quoteBalance.Available)
+			if totalQuoteAmount.IsZero() {
+				continue
+			}
 			// long spot -> trade on the sell side of the order book
 			// targetSize = totalQuoteAmount / (price * feeRateFactor)
 			sellBook := s.spotOrderBooks[candidate.Symbol].SideBook(types.SideTypeSell)
@@ -1469,7 +1666,7 @@ func (s *Strategy) selectMostProfitableMarket(candidates []MarketCandidate) *Mar
 			}
 			// totalQuoteAmount = price * totalBase and targetSize = totalQuoteAmount / (price * feeRateFactor)
 			// so targetSize = totalBase / feeRateFactor
-			totalBase := baseBalance.Available.Mul(s.MarketSelectionConfig.TradeBalanceRatio)
+			totalBase := baseBalance.Available.Mul(s.TradeBalanceRatio)
 			targetSize = totalBase.Div(feeRateFactor)
 			// long futures -> trade on the sell side of the order book
 			sellBook := s.futuresOrderBooks[candidate.Symbol].SideBook(types.SideTypeSell)
@@ -1528,6 +1725,15 @@ func (s *Strategy) selectMostProfitableMarket(candidates []MarketCandidate) *Mar
 	return bestCandidate
 }
 
+func (s *Strategy) quoteAmountForBet(quoteAvailable fixedpoint.Value) fixedpoint.Value {
+	remainingCandidates := len(s.candidateSymbols) - len(s.ActiveRounds)
+	if remainingCandidates == 1 {
+		// the last symbol, use all the available quote balance for the bet
+		return quoteAvailable.Mul(s.LastTradeBalanceRatio)
+	}
+	return quoteAvailable.Mul(s.TradeBalanceRatio)
+}
+
 func (s *Strategy) calculateMinHoldingIntervals(candidate MarketCandidate, bestPrice, targetPosition fixedpoint.Value) (fixedpoint.Value, error) {
 	s.costEstimator.SetTargetPosition(targetPosition)
 	spotOrderBook, spotFound := s.spotOrderBooks[candidate.Symbol]
@@ -1557,6 +1763,9 @@ func (s *Strategy) calculateMinHoldingIntervals(candidate MarketCandidate, bestP
 		return fixedpoint.Zero, fmt.Errorf("estimated funding fee per interval is zero for candidate %s", candidate.Symbol)
 	}
 	breakEvenIntervals := totalCost.Div(estimateFundingFeePerInterval).Round(0, fixedpoint.Up)
+	if breakEvenIntervals.Sign() <= 0 {
+		breakEvenIntervals = fixedpoint.One
+	}
 	return breakEvenIntervals, nil
 }
 
@@ -1624,24 +1833,21 @@ func (s *Strategy) handleClosedRound(ctx context.Context, task *CloseRoundTask, 
 	// get balance
 	balance, ok := account.Balance(asset)
 	if !ok {
-		return fmt.Errorf("[handleClosedRound] balance not found for asset %s when handling round exit: %s", asset, round)
-	}
-	// compute the amount to transfer back to spot account
-	residualAmount := s.computeResidualCollateral(task, balance)
+		// the exchange may skip the asset with 0 balance, so we assume the balance is 0 if it's not found
+		s.logger.Warnf("[handleClosedRound] balance not found for asset %s when handling round exit: %s", asset, round.String())
+	} else {
+		// compute the amount to transfer back to spot account
+		residualAmount := s.computeResidualCollateral(task, balance)
 
-	// transfer the collateral back to spot account when the available balance is sufficient
-	if residualAmount.Sign() > 0 {
-		if err := s.futuresService.TransferFuturesAccountAsset(ctx, asset, residualAmount, types.TransferOut); err != nil {
-			return fmt.Errorf("[handleClosedRound] failed to transfer %s %s during round exit: %w", balance.Available, asset, err)
-		} else {
-			spotPrice, futuresPrice, _ := s.getLastPrices(
-				round.SpotSymbol(),
-				round.FuturesSymbol(),
-			)
-			bbgo.Notify("⬅️ Transferred %s %s back to spot account",
-				balance.Available,
+		// transfer the collateral back to spot account when the available balance is sufficient
+		if residualAmount.Sign() > 0 {
+			if err := s.futuresService.TransferFuturesAccountAsset(ctx, asset, residualAmount, types.TransferOut); err != nil {
+				return fmt.Errorf("[handleClosedRound] failed to transfer %s %s during round exit: %w", balance.Available, asset, err)
+			}
+			bbgo.Notify("⬅️ Transferred %s %s back to spot account for closed round: %s",
+				residualAmount,
 				asset,
-				round.NewNotification(spotPrice, futuresPrice),
+				round.String(),
 			)
 		}
 	}
@@ -1662,14 +1868,6 @@ func (s *Strategy) closedRoundStats(round *ArbitrageRound, tickTime time.Time) {
 	} else {
 		s.logger.Warnf("circuit breaker not found for symbol %s when recording profit: %s", round.SpotSymbol(), pnl)
 	}
-	labels := prometheus.Labels{
-		"strategy_id": s.InstanceID(),
-		"symbol":      round.SpotSymbol(),
-	}
-	roundHoldingIntervalMetrics.With(labels).Set(
-		float64(round.NumHoldingIntervals(tickTime)),
-	)
-	roundNetPnLMetrics.With(labels).Set(pnl.NetPnL().Float64())
 
 	// insert closed round records into database
 	if s.roundInsertService != nil {
@@ -1734,23 +1932,6 @@ func (s *Strategy) newDebugLogger() *logrus.Entry {
 }
 
 func (s *Strategy) notifyStats() {
-	var activeRoundNotifications []any
-	for _, round := range s.ActiveRounds {
-		spotPrice, futuresPrice, ok := s.getLastPrices(
-			round.SpotSymbol(),
-			round.FuturesSymbol(),
-		)
-		if !ok {
-			continue
-		}
-		activeRoundNotifications = append(activeRoundNotifications, round.NewNotification(spotPrice, futuresPrice))
-		if s.roundInsertService != nil {
-			if err := s.roundInsertService.InsertActiveRound(round, spotPrice, futuresPrice); err != nil {
-				s.logger.WithError(err).Warnf("failed to insert active round to database: %s", round)
-			}
-		}
-	}
-
 	var pendingRoundNotifications []any
 	for _, pendingRound := range s.PendingRounds {
 		spotPrice, futuresPrice, _ := s.getLastPrices(
@@ -1764,13 +1945,52 @@ func (s *Strategy) notifyStats() {
 		len(s.ActiveRounds),
 		len(s.PendingRounds),
 	)
-	if len(activeRoundNotifications) > 0 {
-		bbgo.Notify("Active Rounds", activeRoundNotifications...)
+	for _, round := range s.sortedActiveRounds() {
+		spotPrice, futuresPrice, ok := s.getLastPrices(
+			round.SpotSymbol(),
+			round.FuturesSymbol(),
+		)
+		if !ok {
+			s.logger.Warnf(
+				"failed to get last prices, skipping notification: %s",
+				round.String(),
+			)
+			continue
+		}
+
+		// additionally emit an interactive "Close Round" message for Ready rounds
+		// so an operator can close them on demand. The plain attachment above is
+		// left unchanged, so the round still appears in the "Active Rounds" batch.
+		if round.State() == RoundReady && s.slackEvtID != "" {
+			bbgo.Notify(
+				round.NewNotification(spotPrice, futuresPrice),
+				newInteractiveCloseRound(round, s.slackEvtID, spotPrice, futuresPrice),
+			)
+		} else {
+			bbgo.Notify(round.NewNotification(spotPrice, futuresPrice))
+		}
+
+		if s.roundInsertService != nil {
+			if err := s.roundInsertService.InsertActiveRound(round, spotPrice, futuresPrice); err != nil {
+				s.logger.WithError(err).Warnf("failed to insert active round to database: %s", round)
+			}
+		}
 	}
 	if len(pendingRoundNotifications) > 0 {
 		bbgo.Notify("Pending Rounds", pendingRoundNotifications...)
 	}
 
+}
+
+func (s *Strategy) sortedActiveRounds() []*ArbitrageRound {
+	var rounds []*ArbitrageRound
+	for _, round := range s.ActiveRounds {
+		rounds = append(rounds, round)
+	}
+	sort.Slice(rounds, func(i, j int) bool {
+		return rounds[i].StartedAt().Before(rounds[j].StartedAt())
+	})
+	return rounds
 }
 
 func (s *Strategy) runFundingIncomeWorker(ctx context.Context) {
@@ -1906,6 +2126,7 @@ func (s *Strategy) runLastPriceWorker(ctx context.Context) {
 
 	s.updateLastPriceC = make(chan time.Time, 5)
 	s.logger.Info("starting last price worker")
+	s.updateLastPrices(ctx)
 	go func() {
 		defer s.logger.Info("last price worker exited")
 		for {
@@ -1928,20 +2149,218 @@ func (s *Strategy) updateLastPrices(ctx context.Context) error {
 	timedCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
 	defer cancel()
 
+	updatedSymbols := make(map[string]struct{})
 	for _, symbol := range s.candidateSymbols {
-		// update spot price
-		if ticker, err := s.spotSession.Exchange.QueryTicker(timedCtx, symbol); err != nil {
-			return err
-		} else {
-			s.spotLastPrices[symbol] = ticker.Last
+		if err := s.updateLastPricesForSymbol(timedCtx, symbol); err != nil {
+			s.logger.WithError(err).Warnf("failed to update last prices for %s", symbol)
 		}
+		updatedSymbols[symbol] = struct{}{}
+	}
 
-		// update futures price
-		if index, err := s.futuresService.QueryPremiumIndex(timedCtx, symbol); err != nil {
-			return err
-		} else {
-			s.futuresMarkPrices[symbol] = index.MarkPrice
+	for _, round := range s.allRounds() {
+		symbol := round.SpotSymbol()
+		if _, found := updatedSymbols[symbol]; !found {
+			if err := s.updateLastPricesForSymbol(timedCtx, symbol); err != nil {
+				s.logger.WithError(err).Warnf("failed to update last prices for %s", symbol)
+			}
 		}
 	}
 	return nil
+}
+
+func (s *Strategy) updateLastPricesForSymbol(ctx context.Context, symbol string) error {
+	// update spot price
+	if ticker, err := s.spotSession.Exchange.QueryTicker(ctx, symbol); err != nil {
+		return err
+	} else {
+		s.spotLastPrices[symbol] = ticker.Last
+	}
+
+	// update futures price
+	if index, err := s.futuresService.QueryPremiumIndex(ctx, symbol); err != nil {
+		return err
+	} else {
+		s.futuresMarkPrices[symbol] = index.MarkPrice
+	}
+	return nil
+}
+
+func (s *Strategy) closeDelistedRounds(currentTime time.Time) {
+	listedCandidates := make(map[string]struct{})
+	for _, symbol := range s.CandidateSymbols {
+		listedCandidates[symbol] = struct{}{}
+	}
+
+	for _, round := range s.allRounds() {
+		state := round.State()
+		if state == RoundClosed {
+			continue
+		}
+		symbol := round.SpotSymbol()
+		_, futuresPrice, _ := s.getLastPrices(round.SpotSymbol(), round.FuturesSymbol())
+		if _, found := listedCandidates[symbol]; !found {
+			s.logger.Warnf(
+				"delisted round detected, closing it: %s",
+				round.String(),
+			)
+			round.SetClosing(currentTime, s.TWAPWorkerConfig.ClosingDuration, futuresPrice)
+		}
+	}
+
+}
+
+func (s *Strategy) removeRoundsOnStartup() {
+	if bbgo.IsBackTesting {
+		return
+	}
+	if s.AppliedStartupRemovals == nil {
+		s.AppliedStartupRemovals = make(map[string]struct{})
+	}
+
+	configured := make(map[string]struct{}, len(s.RemoveOnStartupSymbols))
+	for _, symbol := range s.RemoveOnStartupSymbols {
+		configured[symbol] = struct{}{}
+	}
+
+	// prune symbols that are no longer configured so that re-adding them later triggers
+	// the removal again. This is what removes the need for the two-step reset: to remove a
+	// round again (same or different symbol) the operator just edits RemoveOnStartupSymbols.
+	for symbol := range s.AppliedStartupRemovals {
+		if _, ok := configured[symbol]; !ok {
+			delete(s.AppliedStartupRemovals, symbol)
+		}
+	}
+
+	for _, symbol := range s.RemoveOnStartupSymbols {
+		// already removed on a previous startup with the same config; skip so we don't
+		// delete a round that was legitimately re-opened on the same symbol after removal.
+		if _, done := s.AppliedStartupRemovals[symbol]; done {
+			continue
+		}
+		// mark as handled regardless of whether an active round currently exists, so that
+		// a round opened later on the same symbol is not deleted on the next restart.
+		s.AppliedStartupRemovals[symbol] = struct{}{}
+
+		round, found := s.ActiveRounds[symbol]
+		if !found {
+			s.logger.Warnf("no active round found for symbol %s to remove on startup", symbol)
+			continue
+		}
+		s.logger.Warnf(
+			"removing active round on startup for symbol %s: %s",
+			symbol, round.String(),
+		)
+		delete(s.ActiveRounds, symbol)
+		delete(s.SpotPositions, round.SpotSymbol())
+		delete(s.FuturesPositions, round.FuturesSymbol())
+	}
+}
+
+func (s *Strategy) rebalance(currentTime time.Time) {
+	if bbgo.IsBackTesting {
+		// no need for rebalancing when backtesting
+		return
+	}
+
+	if !s.lastRebalanceTime.IsZero() && currentTime.Sub(s.lastRebalanceTime) < s.RebalanceInterval.Duration() {
+		return
+	}
+	s.lastRebalanceTime = currentTime
+
+	if s.MarketSelectionConfig.FuturesDirection == types.PositionShort {
+		// short futures
+		// 1. check if there is quote asset on futures account
+		// transfer them back to the spot account if any
+		futuresBalances := s.futuresSession.GetAccount().Balances()
+		quoteBalance := futuresBalances[s.QuoteCurrency]
+		if quoteBalance.Available.Sign() > 0 {
+			s.logger.Infof("detected positive quote currency on futures account: %s", quoteBalance.Available.String())
+			if err := s.futuresService.TransferFuturesAccountAsset(s.ctx, s.QuoteCurrency, quoteBalance.Available, types.TransferOut); err != nil {
+				s.logger.WithError(err).Warnf("failed to transfer quote currency to the spot account: %s", quoteBalance.Available.String())
+			} else {
+				s.logger.Infof("transferred %s %s from futures account to spot account", quoteBalance.Available.String(), s.QuoteCurrency)
+			}
+		}
+		for _, symbol := range s.candidateSymbols {
+			// skip active round
+			if _, found := s.ActiveRounds[symbol]; found {
+				continue
+			}
+			// the symbol has no active round, check for the base assets on spot and futures accounts
+
+			// 2. check if there is base asset left on the futures account
+			// if there is base asset left on the futures account, transfer it back to the spot account
+			futuresMarket, ok := s.futuresSession.Market(symbol)
+			if !ok {
+				continue
+			}
+			baseBalanceFutures := futuresBalances[futuresMarket.BaseCurrency]
+			transferred := false
+			if baseBalanceFutures.Available.Sign() > 0 {
+				s.logger.Infof("detected positive base currency on futures account: %s %s", baseBalanceFutures.Available.String(), futuresMarket.BaseCurrency)
+				if err := s.futuresService.TransferFuturesAccountAsset(s.ctx, futuresMarket.BaseCurrency, baseBalanceFutures.Available, types.TransferOut); err != nil {
+					s.logger.WithError(err).Warnf("failed to transfer base currency to the spot account for symbol %s: %s", symbol, baseBalanceFutures.Available.String())
+				} else {
+					transferred = true
+					s.logger.Infof("transferred %s %s from futures account to spot account", baseBalanceFutures.Available.String(), futuresMarket.BaseCurrency)
+				}
+			}
+			if transferred {
+				// simple hack: sleep 5 seconds to wait for the balance update
+				time.Sleep(5 * time.Second)
+			}
+			// 3. check if there is base asset on the spot account
+			// if it's not dust, sell it by market order
+			spotMarket, _ := s.spotSession.Market(symbol)
+			spotPrice := s.spotLastPrices[symbol]
+			spotBalances := s.spotSession.GetAccount().Balances()
+			baseBalanceSpot := spotBalances[spotMarket.BaseCurrency]
+			if baseBalanceSpot.Available.Sign() > 0 && !spotMarket.IsDustQuantity(baseBalanceSpot.Available, spotPrice) {
+				s.logger.Infof("non-dust base asset detected on the spot account: %s %s", baseBalanceSpot.Available.String(), spotMarket.BaseCurrency)
+				// check if there is open order for this symbol
+				executor := s.spotGeneralOrderExecutors[symbol]
+				openOrderBook := executor.ActiveMakerOrders()
+				if openOrderBook.NumOfOrders() > 0 {
+					continue
+				}
+				orderForm := types.SubmitOrder{
+					Symbol:   symbol,
+					Market:   spotMarket,
+					Side:     types.SideTypeSell,
+					Type:     types.OrderTypeMarket,
+					Quantity: baseBalanceSpot.Available,
+				}
+				// place a market sell order for the base asset
+				createdOrders, err := executor.SubmitOrders(
+					s.ctx,
+					orderForm,
+				)
+				if err != nil || len(createdOrders) == 0 {
+					s.logger.WithError(err).Warnf("failed to submit market sell order: %v", orderForm)
+				} else {
+					s.logger.Infof("rebalancing market sell order submitted: %v", createdOrders[0].AsQuery())
+				}
+			}
+		}
+	}
+}
+
+func (s *Strategy) runTradeBufferWorker(bufferSize int, handle func(types.Trade)) chan types.Trade {
+	tradeC := make(chan types.Trade, bufferSize)
+
+	go func() {
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case trade, ok := <-tradeC:
+				if !ok {
+					return
+				}
+				handle(trade)
+			}
+		}
+	}()
+
+	return tradeC
 }

@@ -13,6 +13,7 @@ import (
 
 func (r *ArbitrageRound) Initialize(ctx context.Context, s *Strategy) error {
 	r.SetLogger(s.logger)
+	r.SetupMetrics(s)
 	if s.futuresSession.Exchange.Name() != r.syncState.FuturesExchangeName {
 		return fmt.Errorf("[ArbitrageRound] futures exchange name mismatch: expected %s, got %s",
 			r.syncState.FuturesExchangeName, s.futuresSession.Exchange.Name())
@@ -60,6 +61,10 @@ func (r *ArbitrageRound) Initialize(ctx context.Context, s *Strategy) error {
 		return errors.New("[ArbitrageRound] futures worker is nil")
 	}
 	r.rebalanceInterval = s.RoundRebalanceInterval.Duration()
+
+	// re-supply leader/follower configs so a restored round flips roles correctly
+	// when it later closes. Restored workers keep their persisted order type.
+	r.SetTWAPConfigs(s.TWAPWorkerConfig, s.followerTWAPWorkerConfig)
 
 	return nil
 }

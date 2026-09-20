@@ -76,13 +76,35 @@ func (c *TWAPWorkerConfig) Defaults() {
 	}
 }
 
+func (c *TWAPWorkerConfig) Validate() error {
+	if c.Duration <= 0 {
+		return fmt.Errorf("duration must be positive")
+	}
+	if c.ClosingDuration <= 0 {
+		return fmt.Errorf("closing duration must be positive")
+	}
+	if c.NumSlices <= 0 {
+		return fmt.Errorf("numSlices must be positive")
+	}
+	if c.OrderType != TWAPOrderTypeMaker && c.OrderType != TWAPOrderTypeTaker {
+		return fmt.Errorf("invalid order type: %s", c.OrderType)
+	}
+	if c.CheckInterval <= 0 {
+		return fmt.Errorf("check interval must be positive")
+	}
+	if c.MinSliceNotional.Sign() < 0 {
+		return fmt.Errorf("minSliceNotional must be non-negative")
+	}
+	return nil
+}
+
 type TWAPWorker struct {
 	syncState   TWAPWorkerSyncState
 	activeOrder *types.Order
 
-	account *types.Account
-	ctx     context.Context
-	logger  logrus.FieldLogger
+	getAccount func() *types.Account
+	ctx        context.Context
+	logger     logrus.FieldLogger
 }
 
 func NewTWAPWorker(
@@ -109,7 +131,7 @@ func NewTWAPWorker(
 		},
 	}
 	w.ctx = ctx
-	w.account = session.Account
+	w.getAccount = session.GetAccount
 	w.syncState.TWAPExecutor = NewTWAPExecutor(
 		w.ctx,
 		service,
@@ -124,6 +146,19 @@ func NewTWAPWorker(
 // SetTargetPosition sets the target position for the TWAP worker.
 func (w *TWAPWorker) SetTargetPosition(targetPosition fixedpoint.Value) {
 	w.syncState.TargetPosition = targetPosition
+}
+
+// OrderType returns the worker's configured order type (maker or taker).
+func (w *TWAPWorker) OrderType() TWAPOrderType {
+	return w.syncState.Config.OrderType
+}
+
+// SetConfig replaces the worker's config parameters and propagates them to the
+// underlying executor. It only touches config (e.g. to switch order type when
+// the leader/follower role flips); runtime state is preserved.
+func (w *TWAPWorker) SetConfig(config TWAPWorkerConfig) {
+	w.syncState.Config = config
+	w.syncState.TWAPExecutor.SetConfig(config)
 }
 
 func (w *TWAPWorker) SetLogger(logger logrus.FieldLogger) {
@@ -323,6 +358,7 @@ func (w *TWAPWorker) Tick(currentTime time.Time, orderBook types.OrderBook) erro
 			if w.syncState.CurrentIntervalEnd.After(w.syncState.EndAt) {
 				w.syncState.CurrentIntervalEnd = w.syncState.EndAt
 			}
+			w.logger.Infof("[TWAP Tick] interval updated: start=%s, end=%s", w.syncState.CurrentIntervalStart, w.syncState.CurrentIntervalEnd)
 		}
 		if currentTime.After(w.syncState.EndAt) {
 			w.syncState.State = TWAPWorkerStateDone
@@ -424,17 +460,17 @@ func (w *TWAPWorker) Tick(currentTime time.Time, orderBook types.OrderBook) erro
 	// from here, active order is not nil
 
 	// we are within current interval and we have a better price
-	if w.shouldUpdateActiveOrder(orderBook) && currentTime.Before(w.syncState.CurrentIntervalEnd) {
+	if currentTime.Before(w.syncState.CurrentIntervalEnd) && w.shouldUpdateActiveOrder(orderBook) {
 		// throttle order updates to avoid excessive cancel-and-replace
 		if !w.syncState.LastCheckTime.IsZero() && currentTime.Sub(w.syncState.LastCheckTime) < w.syncState.Config.CheckInterval.Duration() {
 			return nil
 		}
 		w.syncState.LastCheckTime = currentTime
-		w.logger.Debugf("try to update active order: %s", w.activeOrder)
+		w.logger.Infof("try to update active order: %s", w.activeOrder)
 
-		// the remaining quantity of the active order is dust, no need to update
+		// the remaining quantity of the active order is not dust, checked in shouldUpdateActiveOrder()
 		remaining := w.activeOrder.GetRemainingQuantity()
-		w.logger.Debugf("active order remaining quantity: %s", remaining)
+		w.logger.Infof("active order remaining quantity: %s", remaining)
 
 		if err := w.syncState.TWAPExecutor.CancelOrder(w.ctx, *w.activeOrder); err != nil {
 			w.logger.WithError(err).Warnf("[TWAP tick] failed to cancel active order: %s", w.activeOrder)
@@ -469,7 +505,7 @@ func (w *TWAPWorker) Tick(currentTime time.Time, orderBook types.OrderBook) erro
 		return nil
 	}
 
-	w.logger.Debugf("current interval ended, placing next slice order: %s > %s", currentTime, w.syncState.CurrentIntervalEnd)
+	w.logger.Infof("current interval ended, placing next slice order: %s > %s", currentTime, w.syncState.CurrentIntervalEnd)
 	// currentTime is after current interval end, time to place the next slice order
 	if oldActiveOrder := w.syncAndResetActiveOrder(); oldActiveOrder != nil && !oldActiveOrder.GetRemainingQuantity().IsZero() {
 		// cancel the old active order before placing the next slice order
@@ -485,6 +521,7 @@ func (w *TWAPWorker) Tick(currentTime time.Time, orderBook types.OrderBook) erro
 		w.logger.Infof("slice quantity is dust, skip creating new active order: %s@%s", sliceQty, midPrice)
 		return nil
 	}
+	w.logger.Infof("placing next slice order (%s): %s", w.syncState.Symbol, sliceQty)
 	createdOrder, err := w.syncState.TWAPExecutor.PlaceOrder(
 		sliceQty,
 		orderSide(remaining),
@@ -563,14 +600,14 @@ func (w *TWAPWorker) calculateSliceQuantity(currentTime time.Time, remaining fix
 		case types.SideTypeSell:
 			// check available base for sell
 			base := w.Market().BaseCurrency
-			if baseBalance, ok := w.account.Balance(base); ok {
+			if baseBalance, ok := w.getAccount().Balance(base); ok {
 				w.logger.Debugf("available balance on spot: %s %s", baseBalance.Available, base)
 				sliceQty = fixedpoint.Min(sliceQty, baseBalance.Available)
 			}
 		case types.SideTypeBuy:
 			// check available quote for buy
 			quote := w.Market().QuoteCurrency
-			if quoteBalance, ok := w.account.Balance(quote); !price.IsZero() && ok {
+			if quoteBalance, ok := w.getAccount().Balance(quote); !price.IsZero() && ok {
 				w.logger.Debugf("available balance on spot: %s %s", quoteBalance.Available, quote)
 				// calculate the max quantity we can buy with the available quote balance
 				maxBuyQty := quoteBalance.Available.Div(price)
@@ -590,8 +627,17 @@ func (w *TWAPWorker) shouldUpdateActiveOrder(orderBook types.OrderBook) bool {
 		return false
 	}
 
-	// taker orders are IOC — always refresh
+	remaining := w.activeOrder.GetRemainingQuantity()
+	// the current active order is filled -> do not update
+	if w.activeOrder.Status == types.OrderStatusFilled || remaining.IsZero() {
+		w.logger.Infof("[TWAP shouldUpdateOrder] active order is filled, should not update: %s", w.activeOrder)
+		return false
+	}
+	// from here on, the active order is not filled
+
+	// taker order are IOC and it's not filled -> always update
 	if w.syncState.Config.OrderType == TWAPOrderTypeTaker {
+		w.logger.Infof("[TWAP shouldUpdateOrder] taker order is not filled, should update: %s", w.activeOrder)
 		return true
 	}
 
@@ -601,15 +647,14 @@ func (w *TWAPWorker) shouldUpdateActiveOrder(orderBook types.OrderBook) bool {
 		return false
 	}
 
-	remaining := w.activeOrder.GetRemainingQuantity()
 	if w.Market().IsDustQuantity(remaining, newPrice) {
-		w.logger.Debugf("[TWAP shouldUpdateOrder] remaining quantity of active order is dust, should not update order: %s@%s", remaining, newPrice)
+		w.logger.Infof("[TWAP shouldUpdateOrder] remaining quantity of active order is dust, should not update order: %s@%s", remaining, newPrice)
 		return false
 	}
 
 	// remaining is not dust but canceled
 	if w.activeOrder.Status == types.OrderStatusCanceled {
-		w.logger.Debugf("[TWAP shouldUpdateOrder] non-dust active order is canceled: %s", w.activeOrder)
+		w.logger.Infof("[TWAP shouldUpdateOrder] non-dust active order is canceled: %s", w.activeOrder)
 		return true
 	}
 
@@ -620,7 +665,7 @@ func (w *TWAPWorker) shouldUpdateActiveOrder(orderBook types.OrderBook) bool {
 	case types.SideTypeSell:
 		newPriceBtter = newPrice.Compare(w.activeOrder.Price) > 0
 	}
-	w.logger.Debugf("[TWAP shouldUpdateOrder] order update check: current price=%s, new price=%s, better=%t",
+	w.logger.Infof("[TWAP shouldUpdateOrder] order update check: current price=%s, new price=%s, better=%t",
 		w.activeOrder.Price.String(), newPrice.String(), newPriceBtter)
 	return newPriceBtter
 }

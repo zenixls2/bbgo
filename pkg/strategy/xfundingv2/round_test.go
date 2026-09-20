@@ -194,6 +194,81 @@ func TestArbitrageRound_NumHoldingIntervals(t *testing.T) {
 	})
 }
 
+func Test_dynamicHoldingIntervals(t *testing.T) {
+	// avgFeeIncome is held at 1.0 so that breakEvenIntervals == |totalPnL|,
+	// which keeps the expected values easy to reason about.
+	avgFeeIncome := Number(1.0)
+
+	t.Run("holds at configured value when no adjustment is warranted", func(t *testing.T) {
+		cases := []struct {
+			name                   string
+			avgFeeIncome           fixedpoint.Value
+			totalPnL               fixedpoint.Value
+			oriMinHoldingIntervals int
+			numHoldingIntervals    int
+			expected               int
+		}{
+			// profitable or non-positive fee income → the position can be closed
+			// immediately, so fall back to the elapsed holding intervals.
+			{"positive total pnl", avgFeeIncome, Number(5.0), 3, 2, 2},
+			{"non-positive average funding income", fixedpoint.Zero, Number(-5.0), 3, 2, 2},
+			{"negative average funding income", Number(-1.0), Number(-5.0), 3, 2, 2},
+			// break-even below one interval → keep the configured value.
+			{"zero total pnl", avgFeeIncome, fixedpoint.Zero, 3, 2, 3},
+			{"breakeven below one interval", avgFeeIncome, Number(-0.5), 3, 2, 3},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				got := dynamicHoldingIntervals(c.avgFeeIncome, c.totalPnL, c.oriMinHoldingIntervals, c.numHoldingIntervals)
+				assert.Equal(t, c.expected, got)
+			})
+		}
+	})
+
+	t.Run("rounds breakeven intervals up", func(t *testing.T) {
+		// |totalPnL| / avgFeeIncome = 2.5 → ceil = 3 → 0 + 3 = 3.
+		got := dynamicHoldingIntervals(avgFeeIncome, Number(-2.5), 3, 0)
+		assert.Equal(t, 3, got)
+	})
+
+	t.Run("increases then decreases as the loss grows then recovers", func(t *testing.T) {
+		// Each step feeds the previous step's result back in as
+		// oriMinHoldingIntervals, mirroring how MinHoldingIntervals persists the
+		// adjusted value across calls. numHoldingIntervals grows monotonically
+		// with elapsed time; the loss first deepens and then recovers.
+		const baseline = 3
+
+		steps := []struct {
+			name                string
+			totalPnL            fixedpoint.Value
+			numHoldingIntervals int
+			expected            int
+		}{
+			// increasing: the loss deepens faster than time elapses.
+			{"no loss yet", Number(5.0), 0, 0},   // profit → close immediately at elapsed intervals
+			{"loss appears", Number(-3.0), 0, 3}, // 0 + ceil(3/1)
+			{"loss grows", Number(-5.0), 1, 6},   // 1 + ceil(5/1)
+			{"loss deepens", Number(-6.0), 2, 8}, // 2 + ceil(6/1)
+			// decreasing: the loss shrinks as funding income accrues.
+			{"loss recovering", Number(-4.0), 3, 7},      // 3 + ceil(4/1)
+			{"loss shrinks further", Number(-2.0), 4, 6}, // 4 + ceil(2/1)
+			{"back to profit", Number(1.0), 5, 5},        // profit → close immediately at elapsed intervals
+		}
+
+		ori := baseline
+		got := make([]int, 0, len(steps))
+		for _, step := range steps {
+			out := dynamicHoldingIntervals(avgFeeIncome, step.totalPnL, ori, step.numHoldingIntervals)
+			assert.Equalf(t, step.expected, out, "step %q", step.name)
+			got = append(got, out)
+			ori = out
+		}
+
+		// The sequence first increases (0 → 8) then decreases (8 → 5).
+		assert.Equal(t, []int{0, 3, 6, 8, 7, 6, 5}, got)
+	})
+}
+
 func TestArbitrageRound_TotalFundingIncome(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -543,7 +618,7 @@ func runLeaderFollowerScenario(t *testing.T, sc directionScenario) {
 	//      the spot worker tick its own closing slice.
 	// =========================================================================
 	closeTime := startTime.Add(20 * time.Minute)
-	round.SetClosing(closeTime, types.Duration(10*time.Minute))
+	round.SetClosing(closeTime, types.Duration(10*time.Minute), fixedpoint.Zero)
 	assert.Equal(t, RoundClosing, round.State())
 	assert.Equal(t, fixedpoint.Zero, futuresWorker.TargetPosition(),
 		"SetClosing drives the futures target to zero so it leads the close")
@@ -643,4 +718,50 @@ func setupDeltaNeutralMockExchange(mockExchange *mocks.MockExchange, mockOrderQu
 	mockOrderQuery.EXPECT().
 		QueryOrderTrades(gomock.Any(), gomock.Any()).
 		Return([]types.Trade{}, nil).AnyTimes()
+}
+
+func TestArbitrageRound_FollowerUsesTakerOrders(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// leader keeps the configured (maker) order type; follower is derived as taker.
+	leaderConfig := TWAPWorkerConfig{
+		Duration:  types.Duration(10 * time.Minute),
+		NumSlices: 2,
+		OrderType: TWAPOrderTypeMaker,
+	}
+	followerConfig := leaderConfig
+	followerConfig.OrderType = TWAPOrderTypeTaker
+
+	// mirror checkOpenNewRound: spot (opening leader) uses the leader config,
+	// futures (opening follower) uses the follower config.
+	spotWorker, _, _, _ := newTestTWAPWorker(t, ctrl, leaderConfig)
+	spotWorker.SetTargetPosition(Number(1.0))
+	futuresWorker, _, _, _ := newTestTWAPWorker(t, ctrl, followerConfig)
+	futuresWorker.SetTargetPosition(Number(-1.0))
+
+	fundingRate := &types.PremiumIndex{
+		LastFundingRate: Number(0.001),
+		NextFundingTime: time.Date(2024, 1, 1, 8, 0, 0, 0, time.UTC),
+	}
+	round := NewArbitrageRound(
+		fundingRate,
+		types.ExchangeBinance, types.ExchangeBinance,
+		3, 8, Number(3), spotWorker, futuresWorker, &mockFuturesService{},
+		types.PositionShort, time.Minute)
+	round.SetLogger(logrus.WithField("test", "follower_taker"))
+	round.SetTWAPConfigs(leaderConfig, followerConfig)
+
+	// opening: spot leads (maker), futures follows (taker)
+	assert.Equal(t, TWAPOrderTypeMaker, round.SpotWorker().OrderType())
+	assert.Equal(t, TWAPOrderTypeTaker, round.FuturesWorker().OrderType())
+
+	round.SetClosing(time.Date(2024, 1, 1, 2, 0, 0, 0, time.UTC), types.Duration(time.Hour), fixedpoint.Zero)
+
+	// closing flips: futures leads (maker), spot follows (taker)
+	assert.Equal(t, TWAPOrderTypeTaker, round.SpotWorker().OrderType())
+	assert.Equal(t, TWAPOrderTypeMaker, round.FuturesWorker().OrderType())
+	// executor configs stay in sync with their workers
+	assert.Equal(t, TWAPOrderTypeTaker, round.SpotWorker().Executor().syncState.Config.OrderType)
+	assert.Equal(t, TWAPOrderTypeMaker, round.FuturesWorker().Executor().syncState.Config.OrderType)
 }

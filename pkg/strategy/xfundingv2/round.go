@@ -3,11 +3,13 @@ package xfundingv2
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"github.com/slack-go/slack"
 
@@ -54,9 +56,15 @@ type ArbitrageRound struct {
 	futuresWorker *TWAPWorker
 	haltedAt      time.Time
 
+	// leader/follower TWAP configs, supplied by the strategy. The follower always
+	// uses taker orders. Not persisted; re-supplied on construction and restore.
+	leaderTWAPConfig   TWAPWorkerConfig
+	followerTWAPConfig TWAPWorkerConfig
+
 	lastRebalanceTime time.Time
 	rebalanceInterval time.Duration
 
+	lastFundingRate           fixedpoint.Value
 	lastFundingIncomeSyncTime time.Time
 
 	futuresService                                FuturesService
@@ -64,6 +72,18 @@ type ArbitrageRound struct {
 
 	spotSession, futuresSession *bbgo.ExchangeSession
 	retryTransferTickC          chan time.Time
+
+	// metrics
+	fundingRateMetric                               prometheus.Gauge
+	annualizedFundingRateMetric                     prometheus.Gauge
+	totalPnLMetric                                  prometheus.Gauge
+	spotPositionMetric, futuresPositionMetric       prometheus.Gauge
+	spotFilledRatioMetric, futuresFilledRatioMetric prometheus.Gauge
+	quantityDeviationMetric                         prometheus.Gauge
+	quantityQuoteDeviationMetric                    prometheus.Gauge
+	spotFuturesBasisRateMetric                      prometheus.Gauge
+	maintMarginRatioMetric                          prometheus.Gauge
+	liqDistanceMetric                               prometheus.Gauge
 
 	logger     logrus.FieldLogger
 	slackAlert slackalert.SlackAlert
@@ -85,6 +105,9 @@ func NewArbitrageRound(
 	}
 	fundingIntervalStart := fundingRate.NextFundingTime.Add(-time.Duration(fundingIntervalHours) * time.Hour)
 	fundingIntervalEnd := fundingRate.NextFundingTime.Add(-time.Second)
+	if minHoldingIntervals <= 0 {
+		minHoldingIntervals = 1
+	}
 	return &ArbitrageRound{
 		syncState: ArbitrageRoundSyncState{
 			ID:                          uuid.NewString(),
@@ -112,6 +135,216 @@ func NewArbitrageRound(
 		rebalanceInterval:  rebalanceInterval,
 		futuresService:     futuresService,
 		retryTransferTickC: make(chan time.Time, 100),
+	}
+}
+
+func (r *ArbitrageRound) SetupMetrics(s *Strategy) {
+	id := s.InstanceID()
+	symbol := r.SpotSymbol()
+
+	r.fundingRateMetric = fundingRateMetrics.With(
+		prometheus.Labels{
+			"symbol": symbol,
+		},
+	)
+	r.annualizedFundingRateMetric = annualizedFundingRateMetrics.With(
+		prometheus.Labels{
+			"symbol": symbol,
+		},
+	)
+
+	r.totalPnLMetric = roundTotalPnLMetrics.With(
+		prometheus.Labels{
+			"strategy_id": id,
+			"symbol":      symbol,
+		},
+	)
+
+	r.spotPositionMetric = roundPositionMetrics.With(
+		prometheus.Labels{
+			"strategy_id": id,
+			"symbol":      symbol,
+			"accountType": "spot",
+		},
+	)
+	r.futuresPositionMetric = roundPositionMetrics.With(
+		prometheus.Labels{
+			"strategy_id": id,
+			"symbol":      symbol,
+			"accountType": "futures",
+		},
+	)
+	r.spotFilledRatioMetric = roundPositionFilledRatioMetrics.With(
+		prometheus.Labels{
+			"strategy_id": id,
+			"symbol":      symbol,
+			"accountType": "spot",
+		},
+	)
+	r.futuresFilledRatioMetric = roundPositionFilledRatioMetrics.With(
+		prometheus.Labels{
+			"strategy_id": id,
+			"symbol":      symbol,
+			"accountType": "futures",
+		},
+	)
+
+	r.quantityDeviationMetric = roundQuantityDeviationMetrics.With(
+		prometheus.Labels{
+			"strategy_id": id,
+			"symbol":      symbol,
+		},
+	)
+	r.quantityQuoteDeviationMetric = roundQuantityQuoteDeviationMetrics.With(
+		prometheus.Labels{
+			"strategy_id": id,
+			"symbol":      symbol,
+		},
+	)
+
+	r.spotFuturesBasisRateMetric = spotFuturesBasisRateMetrics.With(
+		prometheus.Labels{
+			"strategy_id": id,
+			"symbol":      symbol,
+		},
+	)
+
+	r.maintMarginRatioMetric = maintMarginRatioMetrics.With(
+		prometheus.Labels{
+			"strategy_id": id,
+			"symbol":      symbol,
+		},
+	)
+
+	r.liqDistanceMetric = liquidationDistanceRateMetrics.With(
+		prometheus.Labels{
+			"strategy_id": id,
+			"symbol":      symbol,
+		},
+	)
+}
+
+func (r *ArbitrageRound) RecordMetrics(futuresAccount *types.FuturesAccount, posDeviation PositionDeviation, spotPrice, futuresPrice fixedpoint.Value) {
+	if r.totalPnLMetric != nil {
+		unrealizedPnL := r.UnrealizedPnL(spotPrice, futuresPrice)
+		r.totalPnLMetric.Set(unrealizedPnL.TotalPnL().Float64())
+	} else {
+		r.logger.Warnf(
+			"unable to record total PnL metric for round %s", r.SpotSymbol(),
+		)
+	}
+
+	if !r.lastFundingRate.IsZero() && r.fundingRateMetric != nil && r.annualizedFundingRateMetric != nil {
+		annualizedRate := AnnualizedRate(r.lastFundingRate, r.syncState.FundingIntervalHours)
+		r.fundingRateMetric.Set(r.lastFundingRate.Float64())
+		r.annualizedFundingRateMetric.Set(annualizedRate.Float64())
+	} else {
+		r.logger.Warnf(
+			"unable to record funding rate metrics for round %s: lastFundingRate=%s, fundingRateMetric=%v, annualizedFundingRateMetric=%v",
+			r.SpotSymbol(),
+			r.lastFundingRate.String(),
+			r.fundingRateMetric,
+			r.annualizedFundingRateMetric,
+		)
+	}
+
+	if r.spotPositionMetric != nil && r.futuresPositionMetric != nil {
+		r.spotPositionMetric.Set(posDeviation.SpotFilled.Float64())
+		r.futuresPositionMetric.Set(posDeviation.FuturesFilled.Float64())
+	} else {
+		r.logger.Warnf(
+			"unable to record position metrics for round %s: spotPositionMetric=%v, futuresPositionMetric=%v",
+			r.SpotSymbol(),
+			r.spotPositionMetric,
+			r.futuresPositionMetric,
+		)
+	}
+
+	if r.spotFilledRatioMetric != nil && r.futuresFilledRatioMetric != nil {
+		spotFilledPosition := r.SpotWorker().FilledPosition()
+		spotFilledRatio := spotFilledPosition.Div(r.TriggeredTargetPosition()).Abs()
+		futuresFilledPosition := r.FuturesWorker().FilledPosition()
+		futuresFilledRatio := futuresFilledPosition.Div(r.TriggeredTargetPosition()).Abs()
+		if r.State() == RoundClosing {
+			spotFilledRatio = fixedpoint.One.Sub(spotFilledRatio)
+			futuresFilledRatio = fixedpoint.One.Sub(futuresFilledRatio)
+		}
+		r.spotFilledRatioMetric.Set(spotFilledRatio.Float64())
+		r.futuresFilledRatioMetric.Set(futuresFilledRatio.Float64())
+	} else {
+		r.logger.Warnf(
+			"unable to record filled ratio metrics for round %s: spotFilledRatioMetric=%v, futuresFilledRatioMetric=%v",
+			r.SpotSymbol(),
+			r.spotFilledRatioMetric,
+			r.futuresFilledRatioMetric,
+		)
+	}
+
+	if r.quantityDeviationMetric != nil && r.quantityQuoteDeviationMetric != nil {
+		r.quantityDeviationMetric.Set(posDeviation.DeviatedQuantity.Float64())
+		r.quantityQuoteDeviationMetric.Set(posDeviation.DeviatedQuoteQuantity.Float64())
+	} else {
+		r.logger.Warnf(
+			"unable to record quantity deviation metrics for round %s",
+			r.SpotSymbol(),
+		)
+	}
+
+	if futuresAccount != nil {
+		openPositions := futuresAccount.Positions.OpenPositions()
+		key := types.PositionKey{
+			Symbol: r.FuturesSymbol(),
+			Side:   r.syncState.DirectionPolicy.Direction,
+		}
+		pos, found := openPositions[key]
+		if !found {
+			// the side is "BOTH" on Binance when the position is one-way (non-hedged)
+			key.Side = types.PositionType("BOTH")
+			pos, found = openPositions[key]
+		}
+		if found && pos.PositionRisk != nil {
+			if r.maintMarginRatioMetric != nil {
+				marginRatio := pos.PositionRisk.MaintMargin.Div(futuresAccount.TotalMarginBalance)
+				r.maintMarginRatioMetric.Set(marginRatio.Float64())
+			} else {
+				r.logger.Warnf(
+					"unable to record maintenance margin ratio metric for round %s",
+					r.SpotSymbol(),
+				)
+			}
+
+			if r.liqDistanceMetric != nil && !futuresPrice.IsZero() {
+				liqPrice := pos.PositionRisk.LiquidationPrice
+				liqDistance := liqPrice.Sub(futuresPrice).Div(futuresPrice)
+				r.liqDistanceMetric.Set(liqDistance.Float64())
+			} else {
+				r.logger.Warnf(
+					"unable to record liquidation distance metric for round %s: liqDistanceMetric=%v, futuresPrice=%s",
+					r.SpotSymbol(),
+					r.liqDistanceMetric,
+					futuresPrice.String(),
+				)
+			}
+		} else {
+			r.logger.Warnf("position not found for key: %+v", key)
+		}
+	} else {
+		r.logger.Warnf(
+			"unable to record maintenance margin ratio and liquidation distance metrics for round %s: futuresAccount is nil",
+			r.SpotSymbol(),
+		)
+	}
+
+	if r.spotFuturesBasisRateMetric != nil && !spotPrice.IsZero() {
+		basisRate := spotPrice.Sub(futuresPrice).Div(spotPrice)
+		r.spotFuturesBasisRateMetric.Set(basisRate.Float64())
+	} else {
+		r.logger.Warnf(
+			"unable to record spot-futures basis rate metric for round %s: spotFuturesBasisRateMetric=%v, spotPrice=%s",
+			r.SpotSymbol(),
+			r.spotFuturesBasisRateMetric,
+			spotPrice.String(),
+		)
 	}
 }
 
@@ -190,6 +423,13 @@ func (r *ArbitrageRound) FuturesFeeAssetAmount() fixedpoint.Value {
 	defer r.mu.Unlock()
 
 	return r.syncState.FuturesFeeAssetAmount
+}
+
+func (r *ArbitrageRound) SetLastFundingRate(rate fixedpoint.Value) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.lastFundingRate = rate
 }
 
 // RequiredFeeAssetAmount returns the required fee asset amount for the round based on its current state and position.
@@ -281,7 +521,72 @@ func (r *ArbitrageRound) NumHoldingIntervals(currentTime time.Time) int {
 }
 
 func (r *ArbitrageRound) MinHoldingIntervals() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	return r.syncState.MinHoldingIntervals
+}
+
+func (r *ArbitrageRound) updateMinHoldingIntervals(currentTime time.Time, spotPrice, futuresPrice fixedpoint.Value) {
+	// only enable the dynamic adjustment of min holding intervals when there are
+	// 1. a valid spot and futures price
+	// 2. enough funding fee records to calculate the average funding income
+	if spotPrice.IsZero() || futuresPrice.IsZero() || len(r.syncState.FundingFeeRecords) <= 6 {
+		return
+	}
+
+	oriMinHoldingIntervals := r.syncState.MinHoldingIntervals
+	avgFeeIncome := r.avgFundingIncome()
+	totalPnL := r.unrealizedPnL(spotPrice, futuresPrice).TotalPnL()
+	numHoldingIntervals := r.NumHoldingIntervals(currentTime)
+	r.syncState.MinHoldingIntervals = dynamicHoldingIntervals(
+		avgFeeIncome, totalPnL, oriMinHoldingIntervals, numHoldingIntervals,
+	)
+	if r.syncState.MinHoldingIntervals != oriMinHoldingIntervals {
+		r.logger.Infof(
+			"[ArbitrageRound] adjusted min holding intervals (%s), total PnL %s, avg fee income %s: %d -> %d",
+			r.SpotSymbol(),
+			totalPnL,
+			avgFeeIncome,
+			oriMinHoldingIntervals,
+			r.syncState.MinHoldingIntervals,
+		)
+	}
+}
+
+func (r *ArbitrageRound) FundingRecordsDescending(limit int) []FundingFee {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var records []FundingFee
+	for _, record := range r.syncState.FundingFeeRecords {
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].Time.After(records[j].Time)
+	})
+
+	if limit < 0 || len(records) <= limit {
+		return records
+	}
+
+	return records[:limit]
+}
+
+// dynamicHoldingIntervals adjusts the min holding intervals based on the current total PnL
+// hold the position until the total PnL breaks even with the average funding income
+func dynamicHoldingIntervals(avgFeeIncome, totalPnL fixedpoint.Value, oriMinHoldingIntervals, numHoldingIntervals int) int {
+	// if total PnL is positive or fee income is negative, assume the position can be closed immediately
+	if totalPnL.Sign() > 0 || avgFeeIncome.Sign() <= 0 {
+		return numHoldingIntervals
+	}
+
+	breakEvenIntervals := totalPnL.Abs().Div(avgFeeIncome)
+	if breakEvenIntervals.Compare(fixedpoint.One) < 0 {
+		return oriMinHoldingIntervals
+	}
+	breakEvenIntervals = breakEvenIntervals.Round(0, fixedpoint.Up)
+	return numHoldingIntervals + breakEvenIntervals.Int()
 }
 
 func (r *ArbitrageRound) TargetPosition() fixedpoint.Value {
@@ -350,8 +655,28 @@ type roundNotification struct {
 }
 
 func (n *roundNotification) SlackAttachment() slack.Attachment {
+	var fields []slack.AttachmentField
+	var spotAvgCost, futuresAvgCost fixedpoint.Value
+
+	spotActiveOrder := n.spotWorker.activeOrder
+
+	if n.hasStarted() {
+		if n.State() == RoundClosed {
+			realizedPnL := n.RealizedPnL()
+			spotAvgCost = realizedPnL.SpotPosition.AverageCost
+			futuresAvgCost = realizedPnL.FuturesPosition.AverageCost
+		} else {
+			unrealizedPnL := n.UnrealizedPnL(
+				n.spotPrice,
+				n.futuresPrice,
+			)
+			spotAvgCost = unrealizedPnL.SpotPosition.AverageCost
+			futuresAvgCost = unrealizedPnL.FuturesPosition.AverageCost
+		}
+	}
+
 	title := fmt.Sprintf("Arbitrage Round %s (%s)", n.SpotSymbol(), n.syncState.State)
-	fields := []slack.AttachmentField{
+	fields = append(fields, []slack.AttachmentField{
 		{
 			Title: "Round ID",
 			Value: n.syncState.ID,
@@ -360,8 +685,82 @@ func (n *roundNotification) SlackAttachment() slack.Attachment {
 		{
 			Title: "Triggered Spot Position",
 			Value: n.syncState.TriggeredSpotTargetPosition.String(),
+			Short: false, // use the whole row for the position
+		},
+	}...)
+
+	spotTarget := n.spotWorker.TargetPosition()
+	futuresTarget := n.futuresWorker.TargetPosition()
+	fields = append(fields, []slack.AttachmentField{
+		{
+			Title: "Spot Filled Position",
+			Value: fmt.Sprintf("%s(%s)@%s", n.spotWorker.FilledPosition().String(), spotTarget.String(), spotAvgCost.String()),
 			Short: true,
 		},
+		{
+			Title: "Futures Filled Position",
+			Value: fmt.Sprintf("%s(%s)@%s", n.futuresWorker.FilledPosition().String(), futuresTarget.String(), futuresAvgCost.String()),
+			Short: true,
+		},
+	}...)
+
+	spotOrderField := slack.AttachmentField{
+		Title: "Spot Active Order",
+		Value: "NONE",
+		Short: true,
+	}
+	if spotActiveOrder != nil {
+		spotOrderField.Value = fmt.Sprintf(
+			"%s %s/%s@%s",
+			spotActiveOrder.Side,
+			spotActiveOrder.ExecutedQuantity,
+			spotActiveOrder.Quantity,
+			spotActiveOrder.Price,
+		)
+	}
+	futuresActiveOrder := n.futuresWorker.activeOrder
+	futuresOrderField := slack.AttachmentField{
+		Title: "Futures Active Order",
+		Value: "NONE",
+		Short: true,
+	}
+	if futuresActiveOrder != nil {
+		futuresOrderField.Value = fmt.Sprintf(
+			"%s %s/%s@%s",
+			futuresActiveOrder.Side,
+			futuresActiveOrder.ExecutedQuantity,
+			futuresActiveOrder.Quantity,
+			futuresActiveOrder.Price,
+		)
+	}
+
+	fields = append(fields,
+		spotOrderField,
+		futuresOrderField,
+	)
+
+	if n.hasStarted() {
+		if n.State() == RoundClosed {
+			realizedPnL := n.RealizedPnL()
+			fields = append(fields, realizedPnLFields(realizedPnL)...)
+		} else {
+			unrealizedPnL := n.UnrealizedPnL(
+				n.spotPrice,
+				n.futuresPrice,
+			)
+			fields = append(fields, unrealizedPnLFields(unrealizedPnL)...)
+		}
+	}
+	avgFundingIncome := n.ArbitrageRound.AvgFundingIncome()
+	if !avgFundingIncome.IsZero() {
+		fields = append(fields, slack.AttachmentField{
+			Title: "Average Funding Income",
+			Value: avgFundingIncome.String(),
+			Short: true,
+		})
+	}
+
+	fields = append(fields, []slack.AttachmentField{
 		{
 			Title: "Funding Interval in Hours",
 			Value: fmt.Sprintf("%d", n.syncState.FundingIntervalHours),
@@ -377,12 +776,29 @@ func (n *roundNotification) SlackAttachment() slack.Attachment {
 			Value: n.AnnualizedRate().Percentage(),
 			Short: true,
 		},
-		{
-			Title: "Start Time",
-			Value: n.syncState.StartAt.Format(time.RFC3339),
-			Short: true,
-		},
+	}...)
+
+	if !n.lastFundingRate.IsZero() {
+		fields = append(fields, []slack.AttachmentField{
+			{
+				Title: "Last Funding Rate",
+				Value: n.lastFundingRate.Percentage(),
+				Short: true,
+			},
+			{
+				Title: "Annualized Last Funding Rate",
+				Value: AnnualizedRate(n.lastFundingRate, n.syncState.FundingIntervalHours).Percentage(),
+				Short: true,
+			},
+		}...)
 	}
+
+	fields = append(fields, slack.AttachmentField{
+		Title: "Start Time",
+		Value: n.syncState.StartAt.Format(time.RFC3339),
+		Short: true,
+	})
+
 	switch n.State() {
 	case RoundClosing:
 		fields = append(fields,
@@ -424,69 +840,8 @@ func (n *roundNotification) SlackAttachment() slack.Attachment {
 				Short: true,
 			},
 		)
+	default:
 	}
-	var spotAvgCost, futuresAvgCost fixedpoint.Value
-	if n.hasStarted() {
-		if n.State() == RoundClosed {
-			realizedPnL := n.RealizedPnL()
-			spotAvgCost = realizedPnL.SpotPosition.AverageCost
-			futuresAvgCost = realizedPnL.FuturesPosition.AverageCost
-			fields = append(fields, realizedPnLFields(realizedPnL)...)
-		} else {
-			unrealizedPnL := n.UnrealizedPnL(
-				n.spotPrice,
-				n.futuresPrice,
-			)
-			spotAvgCost = unrealizedPnL.SpotPosition.AverageCost
-			futuresAvgCost = unrealizedPnL.FuturesPosition.AverageCost
-			fields = append(fields, unrealizedPnLFields(unrealizedPnL)...)
-		}
-	}
-	spotActiveOrder := n.spotWorker.activeOrder
-	spotOrderField := slack.AttachmentField{
-		Title: "Spot Active Order",
-		Value: "NONE",
-		Short: true,
-	}
-	if spotActiveOrder != nil {
-		spotOrderField.Value = fmt.Sprintf(
-			"%s %s/%s@%s",
-			spotActiveOrder.Side,
-			spotActiveOrder.ExecutedQuantity,
-			spotActiveOrder.Quantity,
-			spotActiveOrder.Price,
-		)
-	}
-	futuresActiveOrder := n.futuresWorker.activeOrder
-	futuresOrderField := slack.AttachmentField{
-		Title: "Futures Active Order",
-		Value: "NONE",
-		Short: true,
-	}
-	if futuresActiveOrder != nil {
-		futuresOrderField.Value = fmt.Sprintf(
-			"%s %s/%s@%s",
-			futuresActiveOrder.Side,
-			futuresActiveOrder.ExecutedQuantity,
-			futuresActiveOrder.Quantity,
-			futuresActiveOrder.Price,
-		)
-	}
-
-	fields = append(fields,
-		slack.AttachmentField{
-			Title: "Spot Filled Position",
-			Value: fmt.Sprintf("%s@%s", n.spotWorker.FilledPosition().String(), spotAvgCost.String()),
-			Short: true,
-		},
-		slack.AttachmentField{
-			Title: "Futures Filled Position",
-			Value: fmt.Sprintf("%s@%s", n.futuresWorker.FilledPosition().String(), futuresAvgCost.String()),
-			Short: true,
-		},
-		spotOrderField,
-		futuresOrderField,
-	)
 
 	text := "Arbitrage Round Details"
 	if n.IsCritical && len(n.slackAlert.Mentions) > 0 {
@@ -497,6 +852,7 @@ func (n *roundNotification) SlackAttachment() slack.Attachment {
 		Text:   text,
 		Color:  n.stateColor(),
 		Fields: fields,
+		Footer: fmt.Sprintf("last updated at %s", n.LastUpdateTime().Format(time.RFC3339)),
 	}
 }
 
@@ -701,6 +1057,27 @@ func (r *ArbitrageRound) syncFundingFeeRecords(ctx context.Context, currentTime 
 	return nil
 }
 
+func (r *ArbitrageRound) AvgFundingIncome() fixedpoint.Value {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.avgFundingIncome()
+}
+
+func (r *ArbitrageRound) avgFundingIncome() fixedpoint.Value {
+	if len(r.syncState.FundingFeeRecords) == 0 {
+		return fixedpoint.Zero
+	}
+
+	feeIncomeTotal := fixedpoint.Zero
+	numRecords := fixedpoint.Zero
+	for _, fee := range r.syncState.FundingFeeRecords {
+		feeIncomeTotal = feeIncomeTotal.Add(fee.Amount)
+		numRecords = numRecords.Add(fixedpoint.One)
+	}
+	return feeIncomeTotal.Div(numRecords)
+}
+
 func (r *ArbitrageRound) Start(ctx context.Context,
 	spotSession, futuresSession *bbgo.ExchangeSession,
 	currentTime time.Time,
@@ -775,10 +1152,10 @@ func (r *ArbitrageRound) doRetryTransfers(currentTime time.Time) {
 		switch transfer.Direction {
 		case types.TransferOut:
 			// the round should be in closing state
-			r.handleFuturesTradeForClose(transfer.Trade, r.futuresSession.Account, currentTime)
+			r.handleFuturesTradeForClose(transfer.Trade, r.futuresSession.GetAccount(), currentTime)
 		case types.TransferIn:
 			// the round should be in opening state
-			r.handleSpotTradeForOpen(transfer.Trade, r.spotSession.Account, currentTime)
+			r.handleSpotTradeForOpen(transfer.Trade, r.spotSession.GetAccount(), currentTime)
 		default:
 			r.logger.Warnf("unknown transfer direction for retry: %s", transfer.Direction)
 		}
@@ -926,6 +1303,7 @@ func handleOrderUpdate(twapWorker *TWAPWorker, update types.Order) {
 	activeOrder := twapWorker.ActiveOrder()
 	if activeOrder != nil && activeOrder.OrderID == update.OrderID {
 		activeOrder.Update(update)
+		twapWorker.logger.Infof("[handleOrderUpdate] active order updated: %s", activeOrder)
 	}
 	twapWorker.Executor().UpdateOrder(update)
 }
@@ -1161,6 +1539,14 @@ func (r *ArbitrageRound) FuturesWorker() *TWAPWorker {
 	return r.futuresWorker
 }
 
+// SetTWAPConfigs supplies the leader and follower TWAP configs used to assign
+// worker order types when the round flips roles at closing. The follower config
+// uses taker orders.
+func (r *ArbitrageRound) SetTWAPConfigs(leader, follower TWAPWorkerConfig) {
+	r.leaderTWAPConfig = leader
+	r.followerTWAPConfig = follower
+}
+
 func (r *ArbitrageRound) FuturesMarket() types.Market {
 	return r.futuresWorker.Market()
 }
@@ -1172,7 +1558,7 @@ func (r *ArbitrageRound) State() RoundState {
 	return r.syncState.State
 }
 
-func (r *ArbitrageRound) SetClosing(currentTime time.Time, duration types.Duration) {
+func (r *ArbitrageRound) SetClosing(currentTime time.Time, duration types.Duration, futuresPrice fixedpoint.Value) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -1181,8 +1567,17 @@ func (r *ArbitrageRound) SetClosing(currentTime time.Time, duration types.Durati
 	// re-synced after each futures fill in handleFuturesTradeForClose, so spot
 	// only trades once the collateral has been transferred back from futures.
 	r.futuresWorker.SetTargetPosition(fixedpoint.Zero)
+	futuresRemaining := r.futuresWorker.RemainingQuantity()
+	if !futuresPrice.IsZero() && r.FuturesMarket().IsDustQuantity(futuresRemaining, futuresPrice) {
+		r.spotWorker.SetTargetPosition(fixedpoint.Zero)
+	}
 	r.spotWorker.ResetTime(currentTime, duration)
 	r.futuresWorker.ResetTime(currentTime, duration)
+
+	// closing flips leader/follower: futures now leads (configured order type),
+	// spot now follows (taker orders to hedge reliably).
+	r.futuresWorker.SetConfig(r.leaderTWAPConfig)
+	r.spotWorker.SetConfig(r.followerTWAPConfig)
 
 	r.syncState.State = RoundClosing
 	r.syncState.ClosingAt = currentTime
@@ -1193,7 +1588,7 @@ func (r *ArbitrageRound) SetClosing(currentTime time.Time, duration types.Durati
 
 // setReady updates the round state to ready without locking. The caller must
 // already hold r.mu.
-func (r *ArbitrageRound) setReady(currentTime time.Time) {
+func (r *ArbitrageRound) setReady(currentTime time.Time, spotPrice, futuresPrice fixedpoint.Value) {
 	if !r.syncState.ReadyAt.IsZero() {
 		return
 	}
@@ -1204,6 +1599,22 @@ func (r *ArbitrageRound) setReady(currentTime time.Time) {
 	if oriOrder := r.futuresWorker.syncAndResetActiveOrder(); oriOrder != nil {
 		r.logger.Debugf("[setReady] reseting futures order: %s", oriOrder)
 	}
+
+	// adjust the holding intervals according to the latest mid prices.
+	// setReady is called with r.mu held, so use the unlocked variant to
+	// avoid re-acquiring the (non-reentrant) mutex.
+	unrealizedPnL := r.unrealizedPnL(spotPrice, futuresPrice)
+	totalPnL := unrealizedPnL.TotalPnL()
+	if totalPnL.Sign() < 0 {
+		fundingRate := r.syncState.TriggeredFundingRate
+		futuresNotional := unrealizedPnL.FuturesPosition.AverageCost.Mul(
+			unrealizedPnL.FuturesPosition.Base,
+		)
+		feeIncome := futuresNotional.Mul(fundingRate).Abs()
+		minHolding := totalPnL.Abs().Div(feeIncome).Round(0, fixedpoint.Up).Int()
+		r.syncState.MinHoldingIntervals = minHolding
+	}
+
 	r.syncState.State = RoundReady
 	r.syncState.ReadyAt = currentTime
 }
@@ -1288,7 +1699,7 @@ func (r *ArbitrageRound) Tick(ctx context.Context, currentTime time.Time, spotOr
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.syncState.State == RoundPending || r.isHalted() {
+	if r.syncState.State == RoundPending {
 		// not started yet or halted, do nothing
 		return
 	}
@@ -1300,7 +1711,15 @@ func (r *ArbitrageRound) Tick(ctx context.Context, currentTime time.Time, spotOr
 		})
 	}
 
-	if r.syncState.State == RoundClosed || r.syncState.State == RoundReady {
+	if r.syncState.State == RoundClosed {
+		return
+	}
+	// get mid price
+	spotMidPrice := getMidPrice(spotOrderBook)
+	futuresMidPrice := getMidPrice(futuresOrderBook)
+
+	if r.syncState.State == RoundReady {
+		r.updateMinHoldingIntervals(currentTime, spotMidPrice, futuresMidPrice)
 		return
 	}
 
@@ -1311,30 +1730,44 @@ func (r *ArbitrageRound) Tick(ctx context.Context, currentTime time.Time, spotOr
 	}
 
 	// it's opening or closing, tick the workers
-	if err := r.spotWorker.Tick(currentTime, spotOrderBook); err != nil {
-		r.logger.
-			WithError(err).
-			Warnf(
-				"failed to tick %s spot worker at %s",
-				r.SpotSymbol(), currentTime.Format(time.RFC3339),
-			)
+	tickSpot := true
+	tickFutures := true
+	if r.isHalted() {
+		switch r.syncState.State {
+		case RoundOpening:
+			tickSpot = false
+		case RoundClosing:
+			tickFutures = false
+		}
 	}
-	if err := r.futuresWorker.Tick(currentTime, futuresOrderBook); err != nil {
-		r.logger.
-			WithError(err).
-			Warnf(
-				"failed to tick %s futures worker at %s",
-				r.FuturesSymbol(), currentTime.Format(time.RFC3339),
-			)
+	if tickSpot {
+		if err := r.spotWorker.Tick(currentTime, spotOrderBook); err != nil {
+			r.logger.
+				WithError(err).
+				Warnf(
+					"failed to tick %s spot worker at %s",
+					r.SpotSymbol(), currentTime.Format(time.RFC3339),
+				)
+		} else {
+			r.logger.Infof("spot worker ticked: %s", r.String())
+		}
+	}
+	if tickFutures {
+		if err := r.futuresWorker.Tick(currentTime, futuresOrderBook); err != nil {
+			r.logger.
+				WithError(err).
+				Warnf(
+					"failed to tick %s futures worker at %s",
+					r.FuturesSymbol(), currentTime.Format(time.RFC3339),
+				)
+		} else {
+			r.logger.Infof("futures worker ticked: %s", r.String())
+		}
 	}
 
 	if err := r.rebalance(ctx, currentTime, futuresOrderBook); err != nil {
 		r.logger.WithError(err).Errorf("failed to rebalance round: %s", r.String())
 	}
-
-	// get mid price
-	spotMidPrice := getMidPrice(spotOrderBook)
-	futuresMidPrice := getMidPrice(futuresOrderBook)
 
 	// the state is PositionOpening
 	// check if the spot and futures positions are fully filled -> PositionReady
@@ -1345,7 +1778,7 @@ func (r *ArbitrageRound) Tick(ctx context.Context, currentTime time.Time, spotOr
 		futuresIsDust := r.futuresWorker.Market().IsDustQuantity(futuresRemaining.Abs(), futuresMidPrice)
 
 		if spotIsDust && futuresIsDust {
-			r.setReady(currentTime)
+			r.setReady(currentTime, spotMidPrice, futuresMidPrice)
 			return
 		}
 	}
@@ -1368,13 +1801,15 @@ func (r *ArbitrageRound) Tick(ctx context.Context, currentTime time.Time, spotOr
 }
 
 type PositionDeviation struct {
-	SpotFilled       fixedpoint.Value
-	FuturesFilled    fixedpoint.Value
-	DeviatedQuantity fixedpoint.Value
-	DeviateTooLong   bool
+	SpotFilled            fixedpoint.Value
+	FuturesFilled         fixedpoint.Value
+	DeviatedQuantity      fixedpoint.Value
+	DeviatedQuoteQuantity fixedpoint.Value
+	LastPrice             fixedpoint.Value
+	DeviateTooLong        bool
 }
 
-func (r *ArbitrageRound) CheckPositionDeviation(currentTime time.Time, maxMoqDeviation fixedpoint.Value, duration time.Duration) PositionDeviation {
+func (r *ArbitrageRound) CheckPositionDeviation(currentTime time.Time, maxMoqDeviation, maxQuoteDeviation, lastPrice fixedpoint.Value, duration time.Duration) PositionDeviation {
 	// MOQ: minimum order quantity
 	spotMOQ := r.spotWorker.Market().MinQuantity
 	futuresMOQ := r.futuresWorker.Market().MinQuantity
@@ -1386,7 +1821,8 @@ func (r *ArbitrageRound) CheckPositionDeviation(currentTime time.Time, maxMoqDev
 	spotFilled := r.SpotWorker().FilledPosition()
 	futuresFilled := r.FuturesWorker().FilledPosition()
 	deviation := spotFilled.Add(futuresFilled).Abs()
-	deviationTooLarge := deviation.Compare(thresholdQuantity) >= 0
+	deviationQuote := deviation.Mul(lastPrice)
+	deviationTooLarge := deviation.Compare(thresholdQuantity) >= 0 || deviationQuote.Compare(maxQuoteDeviation) >= 0
 	if deviationTooLarge {
 		if r.syncState.LargeDeviationStartTime.IsZero() {
 			r.syncState.LargeDeviationStartTime = currentTime
@@ -1399,10 +1835,12 @@ func (r *ArbitrageRound) CheckPositionDeviation(currentTime time.Time, maxMoqDev
 		deviateTooLong = true
 	}
 	return PositionDeviation{
-		SpotFilled:       spotFilled,
-		FuturesFilled:    futuresFilled,
-		DeviatedQuantity: deviation,
-		DeviateTooLong:   deviateTooLong,
+		SpotFilled:            spotFilled,
+		FuturesFilled:         futuresFilled,
+		DeviatedQuantity:      deviation,
+		DeviatedQuoteQuantity: deviationQuote,
+		LastPrice:             lastPrice,
+		DeviateTooLong:        deviateTooLong,
 	}
 }
 

@@ -106,14 +106,14 @@ type AggregatedSignalConfig struct {
 	SmoothingType   indicatorv2.SmoothingType `json:"smoothingType"`
 }
 
-type Strategy struct {
-	common.StrategyProfitFixer
-
-	Environment *bbgo.Environment
-
-	// Symbol is the maker Symbol
-	Symbol      string `json:"symbol"`
-	MakerSymbol string `json:"makerSymbol"`
+// StrategyConfig contains all user-configurable json fields for the xmaker
+// strategy. It is embedded anonymously into Strategy so these settings are
+// promoted and remain accessible as s.<Field>.
+type StrategyConfig struct {
+	// DryRun, when true, runs the strategy against live market data but never
+	// submits or cancels real orders on any exchange; intended orders and cancels
+	// are only logged with a [dryRun] prefix.
+	DryRun bool `json:"dryRun"`
 
 	// MakerExchange session name
 	MakerExchange string `json:"makerExchange"`
@@ -129,6 +129,11 @@ type Strategy struct {
 	UpdateInterval      types.Duration `json:"updateInterval"`
 	HedgeInterval       types.Duration `json:"hedgeInterval"`
 	OrderCancelWaitTime types.Duration `json:"orderCancelWaitTime"`
+
+	// AdaptiveQuoteInterval adjusts the quote (place/cancel) interval based on
+	// market volatility (realized volatility from trade returns). When disabled,
+	// the fixed UpdateInterval is used.
+	AdaptiveQuoteInterval *AdaptiveQuoteInterval `json:"adaptiveQuoteInterval,omitempty"`
 
 	EnableSignalMargin bool `json:"enableSignalMargin"`
 
@@ -158,9 +163,6 @@ type Strategy struct {
 	// MinMargin is the minimum margin protection for signal margin
 	MinMargin *fixedpoint.Value `json:"minMargin"`
 
-	UseDepthPrice bool             `json:"useDepthPrice"`
-	DepthQuantity fixedpoint.Value `json:"depthQuantity"`
-
 	// TODO: move SourceDepthLevel to HedgeMarket
 	SourceDepthLevel types.Depth `json:"sourceDepthLevel"`
 	MakerOnly        bool        `json:"makerOnly"`
@@ -187,6 +189,18 @@ type Strategy struct {
 
 	StopHedgeQuoteBalance fixedpoint.Value `json:"stopHedgeQuoteBalance"`
 	StopHedgeBaseBalance  fixedpoint.Value `json:"stopHedgeBaseBalance"`
+
+	// UseQuoteQuantity enables the quantity calculation base on quote amount.
+	// When enabled, the following fields will be interpreted as quote currency instead of base currency:
+	//  - DepthQuantity
+	//  - Quantity
+	//  - QuantityScale: the settings will be interpreted as quote currency
+	UseQuoteQuantity bool `json:"useQuoteQuantity"`
+
+	// UseDepthPrice enables the price calculation based on depth instead of best price.
+	UseDepthPrice bool `json:"useDepthPrice"`
+	// DepthQuantity is the depth quantity to calculate the price based on depth.
+	DepthQuantity fixedpoint.Value `json:"depthQuantity"`
 
 	// Quantity is used for fixed quantity of the first layer
 	Quantity fixedpoint.Value `json:"quantity"`
@@ -229,6 +243,22 @@ type Strategy struct {
 
 	AuthTimeout types.Duration `json:"authTimeout,omitempty"`
 
+	CircuitBreaker *circuitbreaker.BasicCircuitBreaker `json:"circuitBreaker"`
+
+	NoBorrowableCooldown types.Duration `json:"noBorrowableCooldown,omitempty"`
+}
+
+type Strategy struct {
+	common.StrategyProfitFixer
+
+	StrategyConfig
+
+	Environment *bbgo.Environment
+
+	// Symbol is the maker Symbol
+	Symbol      string `json:"symbol"`
+	MakerSymbol string `json:"makerSymbol"`
+
 	// --------------------------------
 	// private field
 
@@ -238,8 +268,7 @@ type Strategy struct {
 
 	state *State
 
-	priceSolver    *pricesolver.SimplePriceSolver
-	CircuitBreaker *circuitbreaker.BasicCircuitBreaker `json:"circuitBreaker"`
+	priceSolver *pricesolver.SimplePriceSolver
 
 	// persistence fields
 	Position    *types.Position `json:"position,omitempty" persistence:"position"`
@@ -279,6 +308,7 @@ type Strategy struct {
 
 	reportProfitStatsRateLimiter *rate.Limiter
 	circuitBreakerAlertLimiter   *rate.Limiter
+	cooldownLogLimiter           *rate.Limiter
 
 	logger logrus.FieldLogger
 
@@ -334,6 +364,8 @@ type Strategy struct {
 	connectorManager *types.ConnectorManager
 
 	profitChanged int64
+
+	cooldownAt time.Time
 }
 
 func (s *Strategy) ID() string {
@@ -359,8 +391,10 @@ func (s *Strategy) CrossSubscribe(sessions map[string]*bbgo.ExchangeSession) {
 
 	makerSession.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: "1m"})
 
-	for _, sig := range s.SignalConfigList.Signals {
-		sig.Signal.Subscribe(sourceSession, s.SourceSymbol)
+	if s.SignalConfigList != nil {
+		for _, sig := range s.SignalConfigList.Signals {
+			sig.Signal.Subscribe(sourceSession, s.SourceSymbol)
+		}
 	}
 
 	subscribeFeeTokenMarkets(sourceSession)
@@ -520,8 +554,10 @@ func (s *Strategy) Initialize() error {
 	s.positionExposure = bbgo.NewPositionExposure(s.Symbol)
 	s.positionExposure.SetLogger(s.logger)
 	s.positionExposure.SetMetricsLabels(ID, s.InstanceID(), s.MakerExchange, s.Symbol)
-	for _, sig := range s.SignalConfigList.Signals {
-		s.logger.Infof("using signal provider: %s", sig)
+	if s.SignalConfigList != nil {
+		for _, sig := range s.SignalConfigList.Signals {
+			s.logger.Infof("using signal provider: %s", sig)
+		}
 	}
 
 	// initialize connector manager
@@ -767,6 +803,9 @@ func (s *Strategy) collectSignalsAndWeights(ctx context.Context) (signals []floa
 
 // TODO: move this AggregateSignal to the signal package
 func (s *Strategy) AggregateSignal(ctx context.Context) (float64, error) {
+	if s.SignalConfigList == nil {
+		return 0.0, nil
+	}
 	sum := 0.0
 	voters := 0.0
 	for _, signalWrapper := range s.SignalConfigList.Signals {
@@ -795,11 +834,16 @@ func (s *Strategy) AggregateSignal(ctx context.Context) (float64, error) {
 
 // getInitialLayerQuantity returns the initial quantity for the layer
 // i is the layer index, starting from 0
-func (s *Strategy) getInitialLayerQuantity(i int) (fixedpoint.Value, error) {
+func (s *Strategy) getInitialLayerQuantity(i int, price fixedpoint.Value) (fixedpoint.Value, error) {
 	if s.QuantityScale != nil {
 		qf, err := s.QuantityScale.Scale(i + 1)
 		if err != nil {
 			return fixedpoint.Zero, fmt.Errorf("quantityScale error: %w", err)
+		}
+
+		if s.UseQuoteQuantity && price.Sign() > 0 {
+			// the quantity scale is in quote currency -> convert to base currency
+			qf = qf / price.Float64()
 		}
 
 		s.logger.Infof("%s scaling bid #%d quantity to %f", s.Symbol, i+1, qf)
@@ -809,11 +853,15 @@ func (s *Strategy) getInitialLayerQuantity(i int) (fixedpoint.Value, error) {
 	}
 
 	q := s.Quantity
+	if s.UseQuoteQuantity && price.Sign() > 0 {
+		// s.Quantity is in quote currency -> convert to base currency
+		q = q.Div(price)
+	}
 
 	if s.QuantityMultiplier.Sign() > 0 && i > 0 {
 		q = fixedpoint.NewFromFloat(
 			q.Float64() * math.Pow(
-				s.QuantityMultiplier.Float64(), float64(i+1),
+				s.QuantityMultiplier.Float64(), float64(i),
 			),
 		)
 	}
@@ -967,6 +1015,21 @@ func (s *Strategy) allowMarginHedge(
 }
 
 func (s *Strategy) updateQuote(ctx context.Context) error {
+	// no-borrowable cooldown gate: cooldownAt is the start time of an active
+	// cooldown (zero = not cooling down). While cooling down, skip quoting
+	// entirely; once the window elapses, reset and resume this cycle.
+	if s.NoBorrowableCooldown.Duration() > 0 && !s.cooldownAt.IsZero() {
+		if time.Since(s.cooldownAt) < s.NoBorrowableCooldown.Duration() {
+			if s.cooldownLogLimiter.Allow() {
+				s.logger.Warnf("%s in no-borrowable cooldown (started %s ago), skip quoting",
+					s.Symbol, time.Since(s.cooldownAt))
+			}
+			return nil
+		}
+
+		s.cooldownAt = time.Time{}
+	}
+
 	if !s.hedgeSession.Connectivity.IsConnected() {
 		s.logger.Warnf("source session is disconnected, skipping update quote")
 		return nil
@@ -984,10 +1047,14 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 
 	cancelMakerOrdersProfile := timeprofile.Start("cancelMakerOrders")
 
-	if err := s.activeMakerOrders.GracefulCancel(ctx, s.makerSession.Exchange); err != nil {
-		s.logger.Warnf("there are some %s orders not canceled, skipping placing maker orders", s.Symbol)
-		s.activeMakerOrders.Print()
-		return nil
+	// In dry-run mode we never place maker orders, so there is nothing to cancel;
+	// skip the cancel call entirely to avoid touching the exchange.
+	if !s.DryRun {
+		if err := s.activeMakerOrders.GracefulCancel(ctx, s.makerSession.Exchange); err != nil {
+			s.logger.Warnf("there are some %s orders not canceled, skipping placing maker orders", s.Symbol)
+			s.activeMakerOrders.Print()
+			return nil
+		}
 	}
 
 	s.cancelOrderDurationMetrics.Observe(float64(cancelMakerOrdersProfile.Stop().Milliseconds()))
@@ -995,6 +1062,18 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 	if s.activeMakerOrders.NumOfOrders() > 0 {
 		s.logger.Warnf("unable to cancel all %s orders, skipping placing maker orders", s.Symbol)
 		return nil
+	}
+
+	// after canceling maker orders, check whether the hedge base asset is
+	// borrowable. If not, enter a cooldown and skip placing new orders this
+	// cycle; following calls back off via the cooldown gate above.
+	if s.NoBorrowableCooldown.Duration() > 0 && s.cooldownAt.IsZero() {
+		if result := getBorrowableAssetResult(s.hedgeSession, s.hedgeMarket, s.logger); result != nil && !result.BaseBorrowable {
+			s.cooldownAt = time.Now()
+			s.logger.Warnf("%s hedge base %s not borrowable on %s, entering %s no-borrowable cooldown",
+				s.Symbol, s.hedgeMarket.BaseCurrency, s.hedgeSession.Name, s.NoBorrowableCooldown.Duration())
+			return nil
+		}
 	}
 
 	sig, err := s.AggregateSignal(ctx)
@@ -1359,7 +1438,7 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 
 	// if depth price is enabled, replace the default best pricing
 	if s.UseDepthPrice {
-		bidCoveredDepth := pricer.NewCoveredDepth(s.depthSourceBook, types.SideTypeBuy, s.DepthQuantity)
+		bidCoveredDepth := pricer.NewCoveredDepth(s.depthSourceBook, types.SideTypeBuy, s.DepthQuantity, s.UseQuoteQuantity)
 		bidSourcePricer = bidCoveredDepth.Pricer()
 		coverBidDepth = bidCoveredDepth.Cover
 	}
@@ -1374,7 +1453,7 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 	askSourcePricer := pricer.FromBestPrice(types.SideTypeSell, s.sourceBook)
 	coverAskDepth := nopCover
 	if s.UseDepthPrice {
-		askCoveredDepth := pricer.NewCoveredDepth(s.depthSourceBook, types.SideTypeSell, s.DepthQuantity)
+		askCoveredDepth := pricer.NewCoveredDepth(s.depthSourceBook, types.SideTypeSell, s.DepthQuantity, s.UseQuoteQuantity)
 		coverAskDepth = askCoveredDepth.Cover
 		askSourcePricer = askCoveredDepth.Pricer()
 	}
@@ -1392,9 +1471,21 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 	if s.SplitHedge != nil && s.SplitHedge.Enabled {
 		s.logger.Infof("%s splitHedge source price ask/bid = %s/%s (%s)", s.Symbol, bestAskPrice.String(), bestBidPrice.String(), calculateSpread(bestAskPrice, bestBidPrice).Percentage())
 
+		disableMakerBid, disableMakerAsk = s.splitHedgeBorrowableCheck(disableMakerBid, disableMakerAsk)
+
 		if !disableMakerBid {
 			for i := 0; i < s.NumLayers; i++ {
-				bidQuantity, err := s.getInitialLayerQuantity(i)
+				bidPrice := bidPriceSpread(i, bestBidPrice)
+				if bidPrice.IsZero() {
+					s.logger.Warnf("no valid bid price, skip quoting")
+					break
+				}
+
+				quotePrice := fixedpoint.Zero
+				if s.UseQuoteQuantity {
+					quotePrice = bidPrice
+				}
+				bidQuantity, err := s.getInitialLayerQuantity(i, quotePrice)
 				if err != nil {
 					return err
 				}
@@ -1402,12 +1493,6 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 				// apply D2 size scale
 				if sizeScale < 1.0 {
 					bidQuantity = bidQuantity.Mul(fixedpoint.NewFromFloat(sizeScale))
-				}
-
-				bidPrice := bidPriceSpread(i, bestBidPrice)
-				if bidPrice.IsZero() {
-					s.logger.Warnf("no valid bid price, skip quoting")
-					break
 				}
 
 				if i == 0 {
@@ -1430,7 +1515,7 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 				// if we bought, then we need to sell the base from the hedge session
 				// if the hedge session is a margin session, we don't need to lock the base asset
 				if makerQuota.QuoteAsset.Lock(requiredQuote) &&
-					(s.hedgeSession.Margin || hedgeQuota.BaseAsset.Lock(bidQuantity)) {
+					(s.DryRun || (s.hedgeSession.Margin || hedgeQuota.BaseAsset.Lock(bidQuantity))) {
 
 					submitOrders = append(
 						submitOrders, types.SubmitOrder{
@@ -1456,7 +1541,17 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 		}
 		if !disableMakerAsk {
 			for i := 0; i < s.NumLayers; i++ {
-				askQuantity, err := s.getInitialLayerQuantity(i)
+				askPrice := askPriceSpread(i, bestAskPrice)
+				if askPrice.IsZero() {
+					s.logger.Warnf("no valid ask price, skip quoting")
+					break
+				}
+
+				quotePrice := fixedpoint.Zero
+				if s.UseQuoteQuantity {
+					quotePrice = askPrice
+				}
+				askQuantity, err := s.getInitialLayerQuantity(i, quotePrice)
 				if err != nil {
 					return err
 				}
@@ -1464,12 +1559,6 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 				// apply D2 size scale
 				if sizeScale < 1.0 {
 					askQuantity = askQuantity.Mul(fixedpoint.NewFromFloat(sizeScale))
-				}
-
-				askPrice := askPriceSpread(i, bestAskPrice)
-				if askPrice.IsZero() {
-					s.logger.Warnf("no valid ask price, skip quoting")
-					break
 				}
 
 				if i == 0 {
@@ -1485,7 +1574,7 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 				}
 
 				if makerQuota.BaseAsset.Lock(requiredBase) &&
-					(s.hedgeSession.Margin || hedgeQuota.QuoteAsset.Lock(requiredBase.Mul(askPrice))) {
+					(s.DryRun || (s.hedgeSession.Margin || hedgeQuota.QuoteAsset.Lock(requiredBase.Mul(askPrice)))) {
 
 					// if we sell on the maker market, then we need to buy the base from the hedge session
 					submitOrders = append(
@@ -1511,24 +1600,16 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 
 			}
 		}
+	} else if s.SyntheticHedge != nil && s.SyntheticHedge.Enabled {
+		// TODO: borrowable check for synthetic hedge
+		s.logger.Debugf("no borrowable check for synthetic hedge...")
 	} else {
+		disableMakerBid, disableMakerAsk = s.simpleHedgeBorrowableCheck(disableMakerBid, disableMakerAsk)
+
 		// default maker order generation
 		s.logger.Infof("%s source book ticker: ask/bid = %s/%s (%s)", s.Symbol, bestAskPrice.String(), bestBidPrice.String(), calculateSpread(bestAskPrice, bestBidPrice).Percentage())
 		if !disableMakerBid {
 			for i := 0; i < s.NumLayers; i++ {
-				bidQuantity, err := s.getInitialLayerQuantity(i)
-				if err != nil {
-					return err
-				}
-
-				// apply D2 size scale
-				if sizeScale < 1.0 {
-					bidQuantity = bidQuantity.Mul(fixedpoint.NewFromFloat(sizeScale))
-				}
-
-				// for maker bid orders
-				coverBidDepth(bidQuantity)
-
 				bidPrice := fixedpoint.Zero
 				if s.SyntheticHedge != nil && s.SyntheticHedge.Enabled {
 					// note: the accumulativeBidQuantity is not used yet,
@@ -1546,6 +1627,28 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 					s.logger.Warnf("no valid bid price, skip quoting")
 					break
 				}
+
+				quotePrice := fixedpoint.Zero
+				if s.UseQuoteQuantity {
+					quotePrice = bidPrice
+				}
+
+				bidQuantity, err := s.getInitialLayerQuantity(i, quotePrice)
+				if err != nil {
+					return err
+				}
+
+				// apply D2 size scale
+				if sizeScale < 1.0 {
+					bidQuantity = bidQuantity.Mul(fixedpoint.NewFromFloat(sizeScale))
+				}
+
+				// for maker bid orders
+				coverQuantity := bidQuantity
+				if s.UseQuoteQuantity {
+					coverQuantity = bidQuantity.Mul(bidPrice)
+				}
+				coverBidDepth(coverQuantity)
 
 				if i == 0 {
 					s.logger.Infof("maker best bid price %f", bidPrice.Float64())
@@ -1567,7 +1670,7 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 				// if we bought, then we need to sell the base from the hedge session
 				// if the hedge session is a margin session, we don't need to lock the base asset
 				if makerQuota.QuoteAsset.Lock(requiredQuote) &&
-					(s.hedgeSession.Margin || hedgeQuota.BaseAsset.Lock(bidQuantity)) {
+					(s.DryRun || (s.hedgeSession.Margin || hedgeQuota.BaseAsset.Lock(bidQuantity))) {
 
 					// if we bought, then we need to sell the base from the hedge session
 					submitOrders = append(
@@ -1597,18 +1700,6 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 		// for maker ask orders
 		if !disableMakerAsk {
 			for i := 0; i < s.NumLayers; i++ {
-				askQuantity, err := s.getInitialLayerQuantity(i)
-				if err != nil {
-					return err
-				}
-
-				// apply D2 size scale
-				if sizeScale < 1.0 {
-					askQuantity = askQuantity.Mul(fixedpoint.NewFromFloat(sizeScale))
-				}
-
-				coverAskDepth(askQuantity)
-
 				askPrice := fixedpoint.Zero
 				if s.SyntheticHedge != nil && s.SyntheticHedge.Enabled {
 					if _, ask, ok := s.SyntheticHedge.GetQuotePrices(); ok {
@@ -1625,6 +1716,26 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 					break
 				}
 
+				quotePrice := fixedpoint.Zero
+				if s.UseQuoteQuantity {
+					quotePrice = askPrice
+				}
+				askQuantity, err := s.getInitialLayerQuantity(i, quotePrice)
+				if err != nil {
+					return err
+				}
+
+				// apply D2 size scale
+				if sizeScale < 1.0 {
+					askQuantity = askQuantity.Mul(fixedpoint.NewFromFloat(sizeScale))
+				}
+
+				coverQuantity := askQuantity
+				if s.UseQuoteQuantity {
+					coverQuantity = askQuantity.Mul(askPrice)
+				}
+				coverAskDepth(coverQuantity)
+
 				if i == 0 {
 					s.logger.Infof("maker best ask price %f", askPrice.Float64())
 					makerBestAskPriceMetrics.With(s.metricsLabels).Set(askPrice.Float64())
@@ -1638,7 +1749,7 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 				}
 
 				if makerQuota.BaseAsset.Lock(requiredBase) &&
-					(s.hedgeSession.Margin || hedgeQuota.QuoteAsset.Lock(requiredBase.Mul(askPrice))) {
+					(s.DryRun || (s.hedgeSession.Margin || hedgeQuota.QuoteAsset.Lock(requiredBase.Mul(askPrice)))) {
 
 					// if we bought, then we need to sell the base from the hedge session
 					submitOrders = append(
@@ -1671,6 +1782,26 @@ func (s *Strategy) updateQuote(ctx context.Context) error {
 
 	if len(submitOrders) == 0 {
 		s.logger.Warnf("no orders generated")
+		return nil
+	}
+
+	if s.DryRun {
+		var buyOrders, sellOrders []types.SubmitOrder
+		for _, order := range submitOrders {
+			if order.Side == types.SideTypeBuy {
+				buyOrders = append(buyOrders, order)
+			} else {
+				sellOrders = append(sellOrders, order)
+			}
+		}
+		s.logger.Info("[dryRun] maker buy orders:")
+		for i, order := range buyOrders {
+			s.logger.Infof("[dryRun] %d: price=%f, quantity=%f, quote quantity=%s", i, order.Price.Float64(), order.Quantity.Float64(), order.Quantity.Mul(order.Price))
+		}
+		s.logger.Info("[dryRun] maker sell orders:")
+		for i, order := range sellOrders {
+			s.logger.Infof("[dryRun] %d: price=%f, quantity=%f, quote quantity=%s", i, order.Price.Float64(), order.Quantity.Float64(), order.Quantity.Mul(order.Price))
+		}
 		return nil
 	}
 
@@ -1809,6 +1940,11 @@ func (s *Strategy) tryArbitrage(ctx context.Context, quote *Quote, disableBid, d
 	}
 
 	if len(iocOrders) == 0 {
+		return false, nil
+	}
+
+	if s.DryRun {
+		s.logger.Infof("[dryRun] arbitrage IOC orders: %+v", iocOrders)
 		return false, nil
 	}
 
@@ -1981,6 +2117,11 @@ func (s *Strategy) spreadMakerHedge(ctx context.Context, sig float64) error {
 		}
 
 		if !hasOrder || !keptOrder {
+			if s.DryRun {
+				s.logger.Infof("[dryRun] spread maker order: %+v", makerOrderForm)
+				return nil
+			}
+
 			spreadMakerCounterMetrics.With(s.metricsLabels).Inc()
 			s.logger.Infof("spreadMaker: placing new spread maker order: %+v...", makerOrderForm)
 
@@ -2035,13 +2176,7 @@ func (s *Strategy) hedge(ctx context.Context) {
 		uncoveredPosition.String(), s.positionExposure.String(),
 	)
 
-	lastPrice := s.lastPrice.Get()
 	sig := s.lastSmoothedAggregatedSignal.Get()
-
-	if lastPrice.IsZero() {
-		s.logger.Warnf("last price is zero, skip hedging")
-	}
-
 	if s.SpreadMaker != nil && s.SpreadMaker.Enabled {
 		if err := s.spreadMakerHedge(ctx, sig); err != nil {
 			s.logger.WithError(err).Errorf("spreadMaker: unable to place spread maker order")
@@ -2071,6 +2206,11 @@ func (s *Strategy) hedge(ctx context.Context) {
 	qty := hedgeDelta.Abs()
 
 	// check dust quantity
+	lastPrice := s.lastPrice.Get()
+	if lastPrice.IsZero() {
+		s.logger.Warnf("last price is zero, hedge quantity is %s", qty.String())
+	}
+
 	if lastPrice.Sign() > 0 && s.hedgeMarket.IsDustQuantity(qty, lastPrice) {
 		s.logger.Debugf("hedge quantity %s is dust, skip hedging", qty.String())
 		return
@@ -2163,6 +2303,11 @@ func (s *Strategy) directHedge(
 		s.hedgeErrorRateReservation = nil
 	}
 
+	if s.DryRun {
+		s.logger.Infof("[dryRun] hedge order: %s %s @ %s", side.String(), quantity.String(), price.String())
+		return nil, nil
+	}
+
 	bbgo.Notify("Submitting %s hedge order %s %v", s.Symbol, side.String(), quantity)
 
 	submitOrders := []types.SubmitOrder{
@@ -2212,6 +2357,8 @@ func (s *Strategy) directHedge(
 }
 
 func (s *Strategy) tradeRecover(ctx context.Context) {
+	defer s.logger.Info("trade recover worker exited")
+
 	s.wg.Add(1)
 	defer s.wg.Done()
 
@@ -2287,6 +2434,12 @@ func (s *Strategy) Defaults() error {
 	// configure default values
 	if s.UpdateInterval == 0 {
 		s.UpdateInterval = types.Duration(time.Second)
+	}
+
+	if s.AdaptiveQuoteInterval != nil && s.AdaptiveQuoteInterval.Enabled {
+		if err := s.AdaptiveQuoteInterval.Defaults(); err != nil {
+			return err
+		}
 	}
 
 	if s.HedgeInterval == 0 {
@@ -2378,6 +2531,7 @@ func (s *Strategy) Defaults() error {
 	s.circuitBreakerAlertLimiter = rate.NewLimiter(rate.Every(3*time.Minute), 2)
 	s.reportProfitStatsRateLimiter = rate.NewLimiter(rate.Every(3*time.Minute), 1)
 	s.hedgeErrorLimiter = rate.NewLimiter(rate.Every(1*time.Minute), 1)
+	s.cooldownLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 1)
 
 	// Set SourceSymbol to Symbol if not set
 	if s.SourceSymbol == "" {
@@ -2446,10 +2600,18 @@ func (s *Strategy) Validate() error {
 		return errors.New("hedge session is required")
 	}
 
+	if s.AdaptiveQuoteInterval != nil && s.AdaptiveQuoteInterval.Enabled {
+		if err := s.AdaptiveQuoteInterval.Validate(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
 func (s *Strategy) quoteWorker(ctx context.Context) {
+	defer s.logger.Info("quote worker exited")
+
 	s.wg.Add(1)
 	defer s.wg.Done()
 
@@ -2466,6 +2628,9 @@ func (s *Strategy) quoteWorker(ctx context.Context) {
 	defer ticker.Stop()
 
 	defer func() {
+		if s.DryRun {
+			return
+		}
 		if err := s.activeMakerOrders.GracefulCancel(ctx, s.makerSession.Exchange); err != nil {
 			s.logger.WithError(err).Errorf("can not cancel %s orders", s.Symbol)
 		}
@@ -2492,11 +2657,21 @@ func (s *Strategy) quoteWorker(ctx context.Context) {
 				}
 			}
 
+			// adapt the next quote interval to market volatility (ATR).
+			// this only reschedules the ticker; the fast-cancel path above
+			// (marketTradeC) is driven by market-trade events and is unaffected.
+			if s.AdaptiveQuoteInterval != nil && s.AdaptiveQuoteInterval.Enabled {
+				next := s.AdaptiveQuoteInterval.NextInterval(s.UpdateInterval.Duration())
+				ticker.Reset(timejitter.Milliseconds(next, 200))
+			}
+
 		}
 	}
 }
 
 func (s *Strategy) accountUpdater(ctx context.Context) {
+	defer s.logger.Info("account updater worker exited")
+
 	s.wg.Add(1)
 	defer s.wg.Done()
 
@@ -2524,6 +2699,8 @@ func (s *Strategy) accountUpdater(ctx context.Context) {
 }
 
 func (s *Strategy) houseCleanWorker(ctx context.Context) {
+	defer s.logger.Info("house clean worker exited")
+
 	s.wg.Add(1)
 	defer s.wg.Done()
 
@@ -2554,6 +2731,8 @@ func (s *Strategy) getUncoveredPosition() fixedpoint.Value {
 }
 
 func (s *Strategy) hedgeWorker(ctx context.Context) {
+	defer s.logger.Info("hedge worker exited")
+
 	s.wg.Add(1)
 	defer s.wg.Done()
 
@@ -2663,6 +2842,10 @@ func (s *Strategy) CrossRun(
 
 	s.simpleHedgeMode = s.isSimpleHedgeMode()
 
+	if s.DryRun {
+		s.logger.Warnf("xmaker is running in DRY-RUN mode: no real orders will be submitted")
+	}
+
 	if s.UseSandbox {
 		balances := types.BalanceMap{
 			s.hedgeMarket.BaseCurrency:  types.NewBalance(s.hedgeMarket.BaseCurrency, fixedpoint.NewFromFloat(50.0)),
@@ -2731,7 +2914,9 @@ func (s *Strategy) CrossRun(
 		)
 	}
 
-	if err := tradingutil.UniversalCancelAllOrders(ctx, s.makerSession.Exchange, s.Symbol, nil); err != nil {
+	if s.DryRun {
+		s.logger.Infof("[dryRun] skip canceling all %s orders on startup", s.Symbol)
+	} else if err := tradingutil.UniversalCancelAllOrders(ctx, s.makerSession.Exchange, s.Symbol, nil); err != nil {
 		s.logger.WithError(err).Warnf("unable to cancel all orders: %v", err)
 	}
 
@@ -2808,18 +2993,32 @@ func (s *Strategy) CrossRun(
 	}
 
 	if s.SpreadMaker != nil && s.SpreadMaker.Enabled {
+		s.SpreadMaker.dryRun = s.DryRun
 		if err := s.SpreadMaker.Bind(s.tradingCtx, s.makerSession, s.Symbol); err != nil {
 			return err
 		}
 	}
 
 	// allocate required isolated streams to the connectors
-	if (s.FastCancel != nil && s.FastCancel.Enabled) || (s.EnableSignalMargin && s.SignalConfigList != nil && len(s.SignalConfigList.Signals) > 0) {
+	adaptiveQuoteIntervalEnabled := s.AdaptiveQuoteInterval != nil && s.AdaptiveQuoteInterval.Enabled
+	if (s.FastCancel != nil && s.FastCancel.Enabled) ||
+		(s.EnableSignalMargin && s.SignalConfigList != nil && len(s.SignalConfigList.Signals) > 0) ||
+		adaptiveQuoteIntervalEnabled {
 		s.marketTradeStream = bbgo.NewMarketTradeStream(s.hedgeSession, s.SourceSymbol)
 		s.marketTradeStream.OnMarketTrade(func(trade types.Trade) {
 			s.lastPrice.Set(trade.Price)
 		})
 		s.connectorManager.Add(s.marketTradeStream)
+	}
+
+	// the adaptive quote interval derives its realized volatility from the source
+	// market-trade stream allocated above, so it must be bound after that stream exists.
+	if adaptiveQuoteIntervalEnabled {
+		s.AdaptiveQuoteInterval.Bind(s.marketTradeStream, s.SourceSymbol, s.logger, s.metricsLabels)
+
+		s.logger.Infof("adaptive quote interval enabled: realizedVolatility(lambda=%s, warmup=%d), interval range [%s, %s]",
+			s.AdaptiveQuoteInterval.Lambda.String(), s.AdaptiveQuoteInterval.Warmup,
+			s.AdaptiveQuoteInterval.MinInterval.Duration(), s.AdaptiveQuoteInterval.MaxInterval.Duration())
 	}
 
 	if s.FastCancel != nil && s.FastCancel.Enabled {
@@ -2880,28 +3079,30 @@ func (s *Strategy) CrossRun(
 		)
 	}
 
-	for _, signalConfig := range s.SignalConfigList.Signals {
-		sigProvider := signalConfig.Signal
-		if setter, ok := sigProvider.(signal.StreamBookSetter); ok {
-			s.logger.Infof("setting stream book on signal %T", sigProvider)
-			setter.SetStreamBook(s.sourceBook)
-		}
+	if s.SignalConfigList != nil {
+		for _, signalConfig := range s.SignalConfigList.Signals {
+			sigProvider := signalConfig.Signal
+			if setter, ok := sigProvider.(signal.StreamBookSetter); ok {
+				s.logger.Infof("setting stream book on signal %T", sigProvider)
+				setter.SetStreamBook(s.sourceBook)
+			}
 
-		if setter, ok := sigProvider.(signal.MarketTradeStreamSetter); ok {
-			s.logger.Infof("setting market trade stream on signal %T", sigProvider)
-			setter.SetMarketTradeStream(s.marketTradeStream)
-		}
+			if setter, ok := sigProvider.(signal.MarketTradeStreamSetter); ok {
+				s.logger.Infof("setting market trade stream on signal %T", sigProvider)
+				setter.SetMarketTradeStream(s.marketTradeStream)
+			}
 
-		// pass logger to the signal provider
-		if setter, ok := sigProvider.(interface {
-			SetLogger(logger logrus.FieldLogger)
-		}); ok {
-			setter.SetLogger(s.logger.WithField("component", "signal"))
-		}
+			// pass logger to the signal provider
+			if setter, ok := sigProvider.(interface {
+				SetLogger(logger logrus.FieldLogger)
+			}); ok {
+				setter.SetLogger(s.logger.WithField("component", "signal"))
+			}
 
-		s.logger.Infof("binding session on signal %T", sigProvider)
-		if err := sigProvider.Bind(s.tradingCtx, s.hedgeSession, s.SourceSymbol); err != nil {
-			return err
+			s.logger.Infof("binding session on signal %T", sigProvider)
+			if err := sigProvider.Bind(s.tradingCtx, s.hedgeSession, s.SourceSymbol); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -3030,6 +3231,36 @@ func (s *Strategy) CrossRun(
 		s.tradeCollector.BindStream(s.hedgeSession.UserDataStream)
 	}
 
+	// setup borrowable asset workers
+	var borrowableMarkets []*HedgeMarket
+	if s.SplitHedge != nil && s.SplitHedge.Enabled {
+		for _, hedgeMarket := range s.SplitHedge.hedgeMarketInstances {
+			if !hedgeMarket.session.Margin {
+				continue
+			}
+			borrowableMarkets = append(borrowableMarkets, hedgeMarket)
+		}
+	} else if s.SyntheticHedge != nil && s.SyntheticHedge.Enabled {
+		for _, hedgeMarket := range []*HedgeMarket{s.SyntheticHedge.sourceMarket, s.SyntheticHedge.fiatMarket} {
+			if !hedgeMarket.session.Margin {
+				continue
+			}
+			borrowableMarkets = append(borrowableMarkets, hedgeMarket)
+		}
+	} else if s.hedgeSession.Margin {
+		addBorrowableAssets(
+			s.hedgeSession,
+			s.hedgeMarket,
+		)
+	}
+	for _, hedgeMarket := range borrowableMarkets {
+		market := hedgeMarket.market
+		addBorrowableAssets(
+			hedgeMarket.session,
+			market,
+		)
+	}
+
 	s.sourceUserDataConnectivity = s.hedgeSession.UserDataConnectivity
 	s.sourceMarketDataConnectivity = s.hedgeSession.MarketDataConnectivity
 
@@ -3115,7 +3346,9 @@ func (s *Strategy) gracefulShutDown(shutdownCtx context.Context) {
 	}
 
 	// make sure all orders are cancelled
-	if err := tradingutil.UniversalCancelAllOrders(shutdownCtx, s.makerSession.Exchange, s.Symbol, nil); err != nil {
+	if s.DryRun {
+		s.logger.Infof("[dryRun] skip canceling all %s orders on shutdown", s.Symbol)
+	} else if err := tradingutil.UniversalCancelAllOrders(shutdownCtx, s.makerSession.Exchange, s.Symbol, nil); err != nil {
 		s.logger.WithError(err).Errorf("graceful cancel order error")
 	}
 

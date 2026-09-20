@@ -123,6 +123,29 @@ YAML config files (e.g., `bbgo.yaml`) define exchange sessions and strategy para
 
 Supports MySQL and SQLite via rockhopper migrations. Migration SQL files are in `migrations/` and compiled Go packages in `pkg/migrations/`.
 
+## Exchange Development
+
+An exchange adapter has two halves. Read the matching guide before touching either:
+
+- **REST** — `doc/development/exchange-api-layer-guide.md`. The `pkg/exchange/<name>/<name>api`
+  package layering rule, `requestgen` request builders (`go:generate` flags, `param` tag
+  semantics, response wrappers, rate limiters), and the RestClient/auth contract.
+- **WebSocket** — `doc/development/exchange-stream-guide.md`. `types.StandardStream` (the
+  shared WebSocket client every exchange embeds): lifecycle, parser/dispatcher pipeline,
+  subscription mapping, auth patterns, reconnect-safety rules, and exchange registration.
+
+Both use `pkg/exchange/{okex,binance,coinbase}` as reference implementations. See also
+`doc/development/adding-new-exchange.md` for the end-to-end checklist.
+
+Exchange-specific notes, to read before extending that adapter:
+
+- **Backpack** — `doc/development/exchange-backpack.md`. ed25519 signing and the per-endpoint
+  "instruction" binding, the spot/perp symbol collapse, order-id and timestamp quirks, order
+  book side ordering, the WebSocket envelope, and what a futures/perp PR has to change.
+
+Generated files (`*_requestgen.go`, `*_callbacks.go`) are committed — re-run
+`go generate ./pkg/exchange/<name>/...` and commit the result when you change their inputs.
+
 ## Strategy Development
 
 1. Create package under `pkg/strategy/<name>/`
